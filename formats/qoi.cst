@@ -1,13 +1,12 @@
 // =======================================================
 // caustic-image/formats/qoi.cst
-// QOI decoder (Quite OK Image, https://qoiformat.org). A byte-oriented codec:
-// run-length + a 64-entry colour cache + small per-channel deltas. No external
-// compression — a good first real decoder that exercises Image/Buf end to end.
+// QOI codec (Quite OK Image, https://qoiformat.org): run-length + a 64-entry
+// colour cache + small per-channel deltas. No external compression.
 //
-//   qoi_decode(src, src_len, out) -> 0, or a negative errno; fills *out.
-//
-// This is exactly the "colour-cache" case of the CSIF MODULAR codec, so the
-// logic gets reused there later.
+// The op-stream logic is factored into qoi_tile_{decode,encode}, which operate
+// on raw interleaved pixels of a known count — this is exactly the CSIF QOI
+// codec seam (§5.2), reused by csif/. The file-format qoi_{decode,encode} wrap
+// them with the 14-byte "qoif" header (and 8-byte end marker on encode).
 // =======================================================
 
 use "../core/errno.cst"  as errno;
@@ -25,33 +24,12 @@ fn _wrap(d as i64) as i64 {
     return ((d + 128) & 255) - 128;
 }
 
-fn qoi_decode(src as *u8, src_len as i64, out as *image.Image) as i64 {
+// Decode `npx` pixels (channels bytes each) of a QOI op stream into `dst`.
+// Reads until the pixel count is satisfied; trailing bytes are ignored.
+fn qoi_tile_decode(src as *u8, src_len as i64, npx as i64, channels as i64, dst as *u8) as i64 {
     let is buf.Buf as bf;
     buf.buf_init(&bf, src, src_len);
 
-    // Header: "qoif", width(be32), height(be32), channels(u8), colorspace(u8).
-    if (buf.buf_u8(&bf) != 113) { return errno.I_BADMAGIC; }   // 'q'
-    if (buf.buf_u8(&bf) != 111) { return errno.I_BADMAGIC; }   // 'o'
-    if (buf.buf_u8(&bf) != 105) { return errno.I_BADMAGIC; }   // 'i'
-    if (buf.buf_u8(&bf) != 102) { return errno.I_BADMAGIC; }   // 'f'
-    let is i64 as w = buf.buf_u32be(&bf);
-    let is i64 as h = buf.buf_u32be(&bf);
-    let is i64 as channels = buf.buf_u8(&bf);
-    let is i64 as colorspace = buf.buf_u8(&bf);
-    if (w < 0) { return errno.I_CORRUPT; }
-    if (h < 0) { return errno.I_CORRUPT; }
-    if (colorspace < 0) { return errno.I_CORRUPT; }
-    if (channels != 3) { if (channels != 4) { return errno.I_UNSUPPORTED; } }
-
-    let is i64 as fmt with mut = pixfmt.FMT_RGBA8;
-    if (channels == 3) { fmt = pixfmt.FMT_RGB8; }
-
-    let is i64 as rc = image.image_init(out, w, h, fmt);
-    if (rc < 0) { return rc; }
-    let is i64 as bpp = channels;
-    let is i64 as npx = w * h;
-
-    // Colour cache (64 entries) and running pixel state.
     let is [64]i64 as ir;
     let is [64]i64 as ig;
     let is [64]i64 as ib;
@@ -65,7 +43,6 @@ fn qoi_decode(src as *u8, src_len as i64, out as *image.Image) as i64 {
     let is i64 as pa with mut = 255;
     let is i64 as run with mut = 0;
 
-    let is *u8 as dst = out.pixels;
     let is i64 as i with mut = 0;
     while (i < npx) {
         if (run > 0) {
@@ -73,14 +50,14 @@ fn qoi_decode(src as *u8, src_len as i64, out as *image.Image) as i64 {
         } else {
             let is i64 as b8 = buf.buf_u8(&bf);
             if (b8 < 0) { return errno.I_CORRUPT; }
-            if (b8 == 254) {                       // QOI_OP_RGB
+            if (b8 == 254) {
                 let is i64 as r = buf.buf_u8(&bf);
                 let is i64 as g = buf.buf_u8(&bf);
                 let is i64 as b = buf.buf_u8(&bf);
                 if (b < 0) { return errno.I_CORRUPT; }
                 pr = r; pg = g; pb = b;
             } else {
-                if (b8 == 255) {                   // QOI_OP_RGBA
+                if (b8 == 255) {
                     let is i64 as r = buf.buf_u8(&bf);
                     let is i64 as g = buf.buf_u8(&bf);
                     let is i64 as b = buf.buf_u8(&bf);
@@ -88,29 +65,25 @@ fn qoi_decode(src as *u8, src_len as i64, out as *image.Image) as i64 {
                     if (a < 0) { return errno.I_CORRUPT; }
                     pr = r; pg = g; pb = b; pa = a;
                 } else {
-                    let is i64 as tag = b8 & 192;   // 0xC0
-                    if (tag == 0) {                // QOI_OP_INDEX
+                    let is i64 as tag = b8 & 192;
+                    if (tag == 0) {
                         let is i64 as idx = b8 & 63;
                         pr = ir[idx]; pg = ig[idx]; pb = ib[idx]; pa = ia[idx];
                     } else {
-                        if (tag == 64) {           // QOI_OP_DIFF
+                        if (tag == 64) {
                             let is i64 as dr = ((b8 >> 4) & 3) - 2;
                             let is i64 as dg = ((b8 >> 2) & 3) - 2;
                             let is i64 as db = (b8 & 3) - 2;
-                            pr = (pr + dr) & 255;
-                            pg = (pg + dg) & 255;
-                            pb = (pb + db) & 255;
+                            pr = (pr + dr) & 255; pg = (pg + dg) & 255; pb = (pb + db) & 255;
                         } else {
-                            if (tag == 128) {      // QOI_OP_LUMA
+                            if (tag == 128) {
                                 let is i64 as b2 = buf.buf_u8(&bf);
                                 if (b2 < 0) { return errno.I_CORRUPT; }
                                 let is i64 as dg = (b8 & 63) - 32;
                                 let is i64 as dr = ((b2 >> 4) & 15) - 8 + dg;
                                 let is i64 as db = (b2 & 15) - 8 + dg;
-                                pr = (pr + dr) & 255;
-                                pg = (pg + dg) & 255;
-                                pb = (pb + db) & 255;
-                            } else {               // QOI_OP_RUN (tag == 192)
+                                pr = (pr + dr) & 255; pg = (pg + dg) & 255; pb = (pb + db) & 255;
+                            } else {
                                 run = b8 & 63;
                             }
                         }
@@ -120,35 +93,19 @@ fn qoi_decode(src as *u8, src_len as i64, out as *image.Image) as i64 {
             let is i64 as hh = _hash(pr, pg, pb, pa);
             ir[hh] = pr; ig[hh] = pg; ib[hh] = pb; ia[hh] = pa;
         }
-        let is i64 as base = i * bpp;
+        let is i64 as base = i * channels;
         dst[base] = cast(u8, pr);
         dst[base + 1] = cast(u8, pg);
         dst[base + 2] = cast(u8, pb);
-        if (bpp == 4) { dst[base + 3] = cast(u8, pa); }
+        if (channels == 4) { dst[base + 3] = cast(u8, pa); }
         i = i + 1;
     }
     return 0;
 }
 
-// Encode an RGB8/RGBA8 image as QOI into `out`. Returns out.len, or negative.
-fn qoi_encode(img as *image.Image, out as *cb.Bytes) as i64 {
-    let is i64 as channels with mut = 0;
-    if (img.fmt == pixfmt.FMT_RGB8)  { channels = 3; }
-    if (img.fmt == pixfmt.FMT_RGBA8) { channels = 4; }
-    if (channels == 0) { return errno.I_UNSUPPORTED; }
-
-    let is i64 as w = img.width;
-    let is i64 as h = img.height;
-    // header: "qoif", width(be32), height(be32), channels, colorspace(0)
-    cb.bytes_push(out, cast(u8, 113)); cb.bytes_push(out, cast(u8, 111));
-    cb.bytes_push(out, cast(u8, 105)); cb.bytes_push(out, cast(u8, 102));
-    cb.bytes_push(out, cast(u8, (w >> 24) & 255)); cb.bytes_push(out, cast(u8, (w >> 16) & 255));
-    cb.bytes_push(out, cast(u8, (w >> 8) & 255));  cb.bytes_push(out, cast(u8, w & 255));
-    cb.bytes_push(out, cast(u8, (h >> 24) & 255)); cb.bytes_push(out, cast(u8, (h >> 16) & 255));
-    cb.bytes_push(out, cast(u8, (h >> 8) & 255));  cb.bytes_push(out, cast(u8, h & 255));
-    cb.bytes_push(out, cast(u8, channels));
-    cb.bytes_push(out, cast(u8, 0));
-
+// Encode `npx` interleaved pixels (channels bytes each) as a QOI op stream
+// appended to `out` (no header, no end marker). Returns 0, or negative.
+fn qoi_tile_encode(src as *u8, npx as i64, channels as i64, out as *cb.Bytes) as i64 {
     let is [64]i64 as ir;
     let is [64]i64 as ig;
     let is [64]i64 as ib;
@@ -162,8 +119,6 @@ fn qoi_encode(img as *image.Image, out as *cb.Bytes) as i64 {
     let is i64 as pa with mut = 255;
     let is i64 as run with mut = 0;
 
-    let is *u8 as src = img.pixels;
-    let is i64 as npx = w * h;
     let is i64 as i with mut = 0;
     while (i < npx) {
         let is i64 as base = i * channels;
@@ -185,7 +140,7 @@ fn qoi_encode(img as *image.Image, out as *cb.Bytes) as i64 {
             let is i64 as hit with mut = 0;
             if (ir[hh] == r) { if (ig[hh] == g) { if (ib[hh] == b) { if (ia[hh] == a) { hit = 1; } } } }
             if (hit == 1) {
-                cb.bytes_push(out, cast(u8, hh));               // QOI_OP_INDEX
+                cb.bytes_push(out, cast(u8, hh));
             } else {
                 ir[hh] = r; ig[hh] = g; ib[hh] = b; ia[hh] = a;
                 if (a == pa) {
@@ -207,14 +162,14 @@ fn qoi_encode(img as *image.Image, out as *cb.Bytes) as i64 {
                             cb.bytes_push(out, cast(u8, 128 | (vg + 32)));
                             cb.bytes_push(out, cast(u8, ((vgr + 8) << 4) | (vgb + 8)));
                         } else {
-                            cb.bytes_push(out, cast(u8, 254));   // QOI_OP_RGB
+                            cb.bytes_push(out, cast(u8, 254));
                             cb.bytes_push(out, cast(u8, r));
                             cb.bytes_push(out, cast(u8, g));
                             cb.bytes_push(out, cast(u8, b));
                         }
                     }
                 } else {
-                    cb.bytes_push(out, cast(u8, 255));           // QOI_OP_RGBA
+                    cb.bytes_push(out, cast(u8, 255));
                     cb.bytes_push(out, cast(u8, r));
                     cb.bytes_push(out, cast(u8, g));
                     cb.bytes_push(out, cast(u8, b));
@@ -226,8 +181,54 @@ fn qoi_encode(img as *image.Image, out as *cb.Bytes) as i64 {
         i = i + 1;
     }
     if (run > 0) { cb.bytes_push(out, cast(u8, 192 | (run - 1))); }
+    return 0;
+}
 
-    // 8-byte end marker.
+// ---- file format (.qoi): 14-byte header + op stream + 8-byte end marker ----
+
+fn qoi_decode(src as *u8, src_len as i64, out as *image.Image) as i64 {
+    let is buf.Buf as bf;
+    buf.buf_init(&bf, src, src_len);
+    if (buf.buf_u8(&bf) != 113) { return errno.I_BADMAGIC; }
+    if (buf.buf_u8(&bf) != 111) { return errno.I_BADMAGIC; }
+    if (buf.buf_u8(&bf) != 105) { return errno.I_BADMAGIC; }
+    if (buf.buf_u8(&bf) != 102) { return errno.I_BADMAGIC; }
+    let is i64 as w = buf.buf_u32be(&bf);
+    let is i64 as h = buf.buf_u32be(&bf);
+    let is i64 as channels = buf.buf_u8(&bf);
+    let is i64 as colorspace = buf.buf_u8(&bf);
+    if (w < 0) { return errno.I_CORRUPT; }
+    if (h < 0) { return errno.I_CORRUPT; }
+    if (colorspace < 0) { return errno.I_CORRUPT; }
+    if (channels != 3) { if (channels != 4) { return errno.I_UNSUPPORTED; } }
+
+    let is i64 as fmt with mut = pixfmt.FMT_RGBA8;
+    if (channels == 3) { fmt = pixfmt.FMT_RGB8; }
+    let is i64 as rc = image.image_init(out, w, h, fmt);
+    if (rc < 0) { return rc; }
+    return qoi_tile_decode(buf.buf_here(&bf), buf.buf_remaining(&bf), w * h, channels, out.pixels);
+}
+
+fn qoi_encode(img as *image.Image, out as *cb.Bytes) as i64 {
+    let is i64 as channels with mut = 0;
+    if (img.fmt == pixfmt.FMT_RGB8)  { channels = 3; }
+    if (img.fmt == pixfmt.FMT_RGBA8) { channels = 4; }
+    if (channels == 0) { return errno.I_UNSUPPORTED; }
+
+    let is i64 as w = img.width;
+    let is i64 as h = img.height;
+    cb.bytes_push(out, cast(u8, 113)); cb.bytes_push(out, cast(u8, 111));
+    cb.bytes_push(out, cast(u8, 105)); cb.bytes_push(out, cast(u8, 102));
+    cb.bytes_push(out, cast(u8, (w >> 24) & 255)); cb.bytes_push(out, cast(u8, (w >> 16) & 255));
+    cb.bytes_push(out, cast(u8, (w >> 8) & 255));  cb.bytes_push(out, cast(u8, w & 255));
+    cb.bytes_push(out, cast(u8, (h >> 24) & 255)); cb.bytes_push(out, cast(u8, (h >> 16) & 255));
+    cb.bytes_push(out, cast(u8, (h >> 8) & 255));  cb.bytes_push(out, cast(u8, h & 255));
+    cb.bytes_push(out, cast(u8, channels));
+    cb.bytes_push(out, cast(u8, 0));
+
+    let is i64 as er = qoi_tile_encode(img.pixels, w * h, channels, out);
+    if (er < 0) { return er; }
+
     let is i64 as e with mut = 0;
     while (e < 7) { cb.bytes_push(out, cast(u8, 0)); e = e + 1; }
     cb.bytes_push(out, cast(u8, 1));

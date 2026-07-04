@@ -17,6 +17,7 @@
 use "../core/image.cst"  as image;
 use "../core/pixfmt.cst" as pixfmt;
 use "../core/buf.cst"    as buf;
+use "../formats/qoi.cst" as qoi;
 use "errno.cst"          as ce;
 use "caustic-compact/core/bytes.cst"    as cb;
 use "caustic-compact/core/checksum.cst" as checksum;
@@ -100,9 +101,9 @@ fn _pl_icol(p as *cb.Bytes) as void {
     _w8(p, 1);       // v_subsample
 }
 
-fn _pl_icod(p as *cb.Bytes) as void {
+fn _pl_icod(p as *cb.Bytes, codec_id as i64, ch as i64) as void {
     _w64(p, 0);      // item_id
-    _w16(p, 0);      // codec_id RAW
+    _w16(p, codec_id);
     _w16(p, 1);      // codec_version
     _w8(p, 1);       // is_lossless
     _w8(p, 0);       // color_transform NONE
@@ -115,27 +116,46 @@ fn _pl_icod(p as *cb.Bytes) as void {
     _w16(p, 3);                    // entropy_method_id raw
     _w8(p, 0);                     // sub_image_count
     _w8(p, 0);                     // reserved0
-    _w32(p, 8);                    // params_length
-    // RAW params (8 bytes): interleaved, byte-aligned, row_alignment 1.
-    _w8(p, 1); _w8(p, 0); _w8(p, 1); _wz(p, 5);
+    if (codec_id == 1) {
+        _w32(p, 4);                // QOI params_length
+        // has_alpha, channels_premul, reserved(u16)
+        let is i64 as has_alpha with mut = 0;
+        if (ch == 4) { has_alpha = 1; }
+        _w8(p, has_alpha); _w8(p, 0); _w16(p, 0);
+    } else {
+        _w32(p, 8);                // RAW params_length
+        // interleaved, byte-aligned, row_alignment 1.
+        _w8(p, 1); _w8(p, 0); _w8(p, 1); _wz(p, 5);
+    }
 }
 
-fn _pl_idat(p as *cb.Bytes, img as *image.Image, ch as i64) as void {
+fn _pl_idat(p as *cb.Bytes, img as *image.Image, codec_id as i64, ch as i64) as void {
     _w64(p, 0);      // item_id
     _w32(p, 0);      // idat_index
     _w32(p, 0);      // coord_kind WHOLE
     _w32(p, 0); _w32(p, 0); _w32(p, 0); _w32(p, 0);   // coords
-    // RAW codec bytes: interleaved UINT8 pixels, contiguous (stride == w*ch).
-    cb.bytes_append(p, img.pixels, img.stride * img.height);
+    if (codec_id == 1) {
+        qoi.qoi_tile_encode(img.pixels, img.width * img.height, ch, p);
+    } else {
+        // RAW codec bytes: interleaved UINT8 pixels, contiguous.
+        cb.bytes_append(p, img.pixels, img.stride * img.height);
+    }
 }
 
+// Encode with the RAW codec (codec 0) — works for any 8-bit format.
 fn csif_encode(img as *image.Image, out as *cb.Bytes) as i64 {
+    return csif_encode_ex(img, out, 0);
+}
+
+// Encode with an explicit codec: 0=RAW (any 8-bit), 1=QOI (RGB8/RGBA8 only).
+fn csif_encode_ex(img as *image.Image, out as *cb.Bytes, codec_id as i64) as i64 {
     let is [1]i64 as cmv;
     let is [1]i64 as chv;
     _fmt_axes(img.fmt, cast(*i64, &cmv), cast(*i64, &chv));
     let is i64 as cm = cmv[0];
     let is i64 as ch = chv[0];
     if (ch == 0) { return ce.E_CSIF_UNSUPPORTED_SAMPLE; }
+    if (codec_id == 1) { if (ch != 3) { if (ch != 4) { return ce.E_CSIF_UNSUPPORTED_SAMPLE; } } }
 
     // Build the six framed chunks.
     let is cb.Bytes as p = cb.bytes_new(4096);
@@ -148,8 +168,8 @@ fn csif_encode(img as *image.Image, out as *cb.Bytes) as i64 {
     cb.bytes_reset(&p); _pl_ilim(&p);          _emit_chunk(&c0, "ILIM", 11, p.ptr, p.len);
     cb.bytes_reset(&p); _pl_ihdr(&p, img, cm, ch); _emit_chunk(&c1, "IHDR", 19, p.ptr, p.len);
     cb.bytes_reset(&p); _pl_icol(&p);          _emit_chunk(&c2, "ICOL", 19, p.ptr, p.len);
-    cb.bytes_reset(&p); _pl_icod(&p);          _emit_chunk(&c3, "ICOD", 19, p.ptr, p.len);
-    cb.bytes_reset(&p); _pl_idat(&p, img, ch); _emit_chunk(&c4, "IDAT", 51, p.ptr, p.len);
+    cb.bytes_reset(&p); _pl_icod(&p, codec_id, ch); _emit_chunk(&c3, "ICOD", 19, p.ptr, p.len);
+    cb.bytes_reset(&p); _pl_idat(&p, img, codec_id, ch); _emit_chunk(&c4, "IDAT", 51, p.ptr, p.len);
     cb.bytes_reset(&p); _w64(&p, 0);           _emit_chunk(&c5, "IEND", 11, p.ptr, p.len);
 
     // Lay out offsets (8-byte aligned) after header + directory.
@@ -349,7 +369,8 @@ fn csif_decode(src as *u8, len as i64, out as *image.Image) as i64 {
     buf.buf_seek(&bf, icod_off);
     buf.buf_u64le(&bf);                       // item_id
     let is i64 as codec_id = buf.buf_u16le(&bf);
-    if (codec_id != 0) { return ce.E_CSIF_UNKNOWN_CODEC; }
+    if (codec_id != 0) { if (codec_id != 1) { return ce.E_CSIF_UNKNOWN_CODEC; } }
+    if (codec_id == 1) { if (component_count != 3) { if (component_count != 4) { return ce.E_CSIF_UNSUPPORTED_SAMPLE; } } }
 
     // Resolve the pixel format from color_model + component_count.
     let is i64 as fmt with mut = 0;
@@ -362,15 +383,21 @@ fn csif_decode(src as *u8, len as i64, out as *image.Image) as i64 {
     let is i64 as dchk = image.image_check_dims(w, h, fmt);
     if (dchk < 0) { return ce.E_CSIF_DIMS; }
 
-    // RAW decode: codec bytes are the interleaved pixels (after IDAT's 32B head).
-    let is i64 as pixbytes = idat_plen - 32;
-    let is i64 as need = w * h * component_count;
-    if (pixbytes != need) { return ce.E_CSIF_PAYLOAD_TRUNC; }
-
+    // Codec bytes begin after IDAT's 32-byte head.
+    let is i64 as codlen = idat_plen - 32;
+    if (codec_id == 0) {
+        if (codlen != w * h * component_count) { return ce.E_CSIF_PAYLOAD_TRUNC; }
+    }
     let is i64 as rc = image.image_init(out, w, h, fmt);
     if (rc < 0) { return rc; }
-    let is *u8 as srcpx = cast(*u8, cast(i64, src) + idat_off + 32);
-    let is i64 as i with mut = 0;
-    while (i < need) { out.pixels[i] = srcpx[i]; i = i + 1; }
+    let is *u8 as codbytes = cast(*u8, cast(i64, src) + idat_off + 32);
+    if (codec_id == 0) {
+        let is i64 as need = w * h * component_count;
+        let is i64 as i with mut = 0;
+        while (i < need) { out.pixels[i] = codbytes[i]; i = i + 1; }
+    } else {
+        let is i64 as qr = qoi.qoi_tile_decode(codbytes, codlen, w * h, component_count, out.pixels);
+        if (qr < 0) { image.image_free(out); return ce.E_CSIF_PAYLOAD_TRUNC; }
+    }
     return 0;
 }
