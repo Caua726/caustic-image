@@ -1,0 +1,184 @@
+// =======================================================
+// caustic-image/formats/tiff.cst
+// TIFF decoder — the common baseline: little/big-endian, a single IFD, 8-bit
+// samples, chunky (planar=1) strips, gray / RGB / RGBA, with Compression =
+// none (1), PackBits (32773), or DEFLATE (8 / 32946, via caustic-compact).
+// LZW and JPEG-in-TIFF (which need their own variants) are deferred.
+//
+// TIFF's per-file byte-order flag is the "parser-differential" hazard CSIF
+// rejects; we honour it here only for interop, reading every field through the
+// declared endianness.
+//   tiff_decode(src, src_len, out) -> 0, or negative errno.
+// =======================================================
+
+use "std/mem.cst" only bins, core as mem;
+use "../core/errno.cst"  as errno;
+use "../core/image.cst"  as image;
+use "../core/pixfmt.cst" as pixfmt;
+use "caustic-compact/core/bytes.cst"   as cb;
+use "caustic-compact/formats/zlib.cst" as zlib;
+
+fn _r16(p as *u8, o as i64, le as i64) as i64 {
+    if (le == 1) { return cast(i64, p[o]) | (cast(i64, p[o + 1]) << 8); }
+    return (cast(i64, p[o]) << 8) | cast(i64, p[o + 1]);
+}
+fn _r32(p as *u8, o as i64, le as i64) as i64 {
+    if (le == 1) {
+        return cast(i64, p[o]) | (cast(i64, p[o + 1]) << 8)
+            | (cast(i64, p[o + 2]) << 16) | (cast(i64, p[o + 3]) << 24);
+    }
+    return (cast(i64, p[o]) << 24) | (cast(i64, p[o + 1]) << 16)
+        | (cast(i64, p[o + 2]) << 8) | cast(i64, p[o + 3]);
+}
+fn _tsize(typ as i64) as i64 {
+    if (typ == 1) { return 1; }   // BYTE
+    if (typ == 3) { return 2; }   // SHORT
+    if (typ == 4) { return 4; }   // LONG
+    return 1;
+}
+// One scalar (count-1) tag value held in the 4-byte value field.
+fn _scalar(p as *u8, voff as i64, typ as i64, le as i64) as i64 {
+    if (typ == 3) { return _r16(p, voff, le); }
+    if (typ == 4) { return _r32(p, voff, le); }
+    return cast(i64, p[voff]);
+}
+// Element `idx` of an array tag (value field either inline or an offset).
+fn _elem(p as *u8, voff as i64, typ as i64, count as i64, idx as i64, le as i64) as i64 {
+    let is i64 as ts = _tsize(typ);
+    let is i64 as base with mut = voff;
+    if (count * ts > 4) { base = _r32(p, voff, le); }
+    let is i64 as o = base + idx * ts;
+    if (typ == 3) { return _r16(p, o, le); }
+    if (typ == 4) { return _r32(p, o, le); }
+    return cast(i64, p[o]);
+}
+
+// PackBits RLE into out[0..outcap). Returns bytes produced.
+fn _packbits(src as *u8, soff as i64, scnt as i64, out as *u8, outcap as i64) as i64 {
+    let is i64 as ip with mut = soff;
+    let is i64 as op with mut = 0;
+    let is i64 as end = soff + scnt;
+    while (ip < end) {
+        if (op >= outcap) { return op; }
+        let is i64 as n with mut = cast(i64, src[ip]); ip = ip + 1;
+        if (n >= 128) { n = n - 256; }
+        if (n >= 0) {
+            let is i64 as k with mut = 0;
+            while (k <= n) { if (op < outcap) { out[op] = src[ip]; op = op + 1; ip = ip + 1; } k = k + 1; }
+        } else {
+            if (n != 0 - 128) {
+                let is i64 as rep = cast(i64, src[ip]); ip = ip + 1;
+                let is i64 as cnt = 1 - n;
+                let is i64 as k with mut = 0;
+                while (k < cnt) { if (op < outcap) { out[op] = cast(u8, rep); op = op + 1; } k = k + 1; }
+            }
+        }
+    }
+    return op;
+}
+
+fn tiff_decode(src as *u8, src_len as i64, out as *image.Image) as i64 {
+    if (src_len < 8) { return errno.I_BADMAGIC; }
+    let is i64 as le with mut = 0;
+    if (cast(i64, src[0]) == 73) { if (cast(i64, src[1]) == 73) { le = 1; } }   // "II"
+    if (le == 0) {
+        if (cast(i64, src[0]) != 77) { return errno.I_BADMAGIC; }               // "MM"
+        if (cast(i64, src[1]) != 77) { return errno.I_BADMAGIC; }
+    }
+    if (_r16(src, 2, le) != 42) { return errno.I_BADMAGIC; }
+    let is i64 as ifd = _r32(src, 4, le);
+    if (ifd + 2 > src_len) { return errno.I_CORRUPT; }
+    let is i64 as nent = _r16(src, ifd, le);
+
+    let is i64 as width with mut = 0;
+    let is i64 as length with mut = 0;
+    let is i64 as comp with mut = 1;
+    let is i64 as photo with mut = 1;
+    let is i64 as spp with mut = 1;
+    let is i64 as rps with mut = 0;
+    let is i64 as planar with mut = 1;
+    let is i64 as bps with mut = 8;
+    let is i64 as so_v with mut = 0; let is i64 as so_t with mut = 0; let is i64 as so_c with mut = 0;
+    let is i64 as sc_v with mut = 0; let is i64 as sc_t with mut = 0; let is i64 as sc_c with mut = 0;
+
+    let is i64 as i with mut = 0;
+    while (i < nent) {
+        let is i64 as e = ifd + 2 + i * 12;
+        if (e + 12 > src_len) { return errno.I_CORRUPT; }
+        let is i64 as tag = _r16(src, e, le);
+        let is i64 as typ = _r16(src, e + 2, le);
+        let is i64 as count = _r32(src, e + 4, le);
+        let is i64 as vo = e + 8;
+        if (tag == 256) { width = _scalar(src, vo, typ, le); }
+        if (tag == 257) { length = _scalar(src, vo, typ, le); }
+        if (tag == 258) { bps = _elem(src, vo, typ, count, 0, le); }
+        if (tag == 259) { comp = _scalar(src, vo, typ, le); }
+        if (tag == 262) { photo = _scalar(src, vo, typ, le); }
+        if (tag == 277) { spp = _scalar(src, vo, typ, le); }
+        if (tag == 278) { rps = _scalar(src, vo, typ, le); }
+        if (tag == 284) { planar = _scalar(src, vo, typ, le); }
+        if (tag == 273) { so_v = vo; so_t = typ; so_c = count; }
+        if (tag == 279) { sc_v = vo; sc_t = typ; sc_c = count; }
+        i = i + 1;
+    }
+
+    if (bps != 8) { return errno.I_UNSUPPORTED; }
+    if (planar != 1) { return errno.I_UNSUPPORTED; }
+    if (so_c == 0) { return errno.I_CORRUPT; }
+    let is i64 as fmt with mut = 0;
+    if (spp == 1) { fmt = pixfmt.FMT_GRAY8; }
+    if (spp == 3) { fmt = pixfmt.FMT_RGB8; }
+    if (spp == 4) { fmt = pixfmt.FMT_RGBA8; }
+    if (fmt == 0) { return errno.I_UNSUPPORTED; }
+    if (comp != 1) { if (comp != 32773) { if (comp != 8) { if (comp != 32946) { return errno.I_UNSUPPORTED; } } } }
+
+    let is i64 as dchk = image.image_check_dims(width, length, fmt);
+    if (dchk < 0) { return dchk; }
+    if (rps < 1) { rps = length; }
+    let is i64 as nstrips = (length + rps - 1) / rps;
+    let is i64 as rowbytes = width * spp;
+
+    let is i64 as rc = image.image_init(out, width, length, fmt);
+    if (rc < 0) { return rc; }
+    let is *u8 as dst = out.pixels;
+
+    let is i64 as s with mut = 0;
+    while (s < nstrips) {
+        let is i64 as soff = _elem(src, so_v, so_t, so_c, s, le);
+        let is i64 as scnt = _elem(src, sc_v, sc_t, sc_c, s, le);
+        let is i64 as rows with mut = rps;
+        if (s * rps + rows > length) { rows = length - s * rps; }
+        let is i64 as need = rowbytes * rows;
+        let is i64 as drow0 = s * rps * rowbytes;
+
+        if (comp == 1) {
+            if (soff + need > src_len) { return errno.I_CORRUPT; }
+            let is i64 as k with mut = 0;
+            while (k < need) { dst[drow0 + k] = src[soff + k]; k = k + 1; }
+        } else {
+            if (comp == 32773) {
+                _packbits(src, soff, scnt, cast(*u8, cast(i64, dst) + drow0), need);
+            } else {
+                // DEFLATE (zlib) strip.
+                let is cb.Bytes as ob = cb.bytes_new(need + 64);
+                let is i64 as zr = zlib.zlib_decompress(cast(*u8, cast(i64, src) + soff), scnt, &ob);
+                if (zr < 0) { cb.bytes_free(&ob); return errno.I_CORRUPT; }
+                let is i64 as ncopy with mut = ob.len; if (ncopy > need) { ncopy = need; }
+                let is i64 as k with mut = 0;
+                while (k < ncopy) { dst[drow0 + k] = ob.ptr[k]; k = k + 1; }
+                cb.bytes_free(&ob);
+            }
+        }
+        s = s + 1;
+    }
+
+    // WhiteIsZero grayscale: invert to BlackIsZero.
+    if (photo == 0) {
+        if (spp == 1) {
+            let is i64 as k with mut = 0;
+            let is i64 as tot = rowbytes * length;
+            while (k < tot) { dst[k] = cast(u8, 255 - cast(i64, dst[k])); k = k + 1; }
+        }
+    }
+    return 0;
+}

@@ -15,12 +15,14 @@ use "formats/bmp.cst" as bmp;
 use "formats/qoi.cst" as qoi;
 use "formats/pnm.cst" as pnm;
 use "formats/jpeg.cst" as jpeg;
+use "formats/tiff.cst" as tiff;
 use "csif/container.cst" as csif;
 
 fn decode(src as *u8, src_len as i64, out as *image.Image) as i64 {
     let is i64 as f = sniff.sniff(src, src_len);
     if (f == sniff.SNIFF_PNG)  { return png.png_decode(src, src_len, out); }
     if (f == sniff.SNIFF_JPEG) { return jpeg.jpeg_decode(src, src_len, out); }
+    if (f == sniff.SNIFF_TIFF) { return tiff.tiff_decode(src, src_len, out); }
     if (f == sniff.SNIFF_GIF)  { return gif.gif_decode(src, src_len, out); }
     if (f == sniff.SNIFF_BMP)  { return bmp.bmp_decode(src, src_len, out); }
     if (f == sniff.SNIFF_QOI)  { return qoi.qoi_decode(src, src_len, out); }
