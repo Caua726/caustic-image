@@ -24,7 +24,8 @@ in Pillow/giflib/libpng.
 | JPEG | yes | — | baseline (Huffman, 4:4:4/4:2:2/4:2:0), matches libjpeg within a few levels |
 | TIFF | yes | — | II/MM, strips, uncompressed / PackBits / DEFLATE; 8-bit gray/RGB/RGBA |
 | CSIF | yes | yes | native flagship — see below |
-| WebP / AVIF | — | — | later phases |
+| WebP | yes | — | VP8L lossless: meta-Huffman, LZ77 2D, colour cache, all 4 transforms (VP8 lossy deferred) |
+| AVIF | — | — | later phases |
 
 ### CSIF (native flagship)
 

@@ -1,0 +1,633 @@
+// =======================================================
+// caustic-image/formats/webp.cst
+// WebP decoder — the VP8L (lossless) bitstream: canonical prefix codes with
+// meta-Huffman groups, LZ77 over pixels with the 2D distance map, a colour
+// cache, and the four transforms (predictor / cross-colour / subtract-green /
+// colour-indexing with pixel bundling), applied inverse in LIFO order.
+// Bit order is LSB-first, so caustic-compact's DEFLATE bit reader is reused.
+// VP8 (lossy) is a video intra frame and is deferred (loud I_UNSUPPORTED).
+//   webp_decode(src, src_len, out) -> 0, or negative errno.
+// =======================================================
+
+use "std/mem.cst" only bins, core as mem;
+use "../core/errno.cst"  as errno;
+use "../core/image.cst"  as image;
+use "../core/pixfmt.cst" as pixfmt;
+use "caustic-compact/core/bitreader.cst" as br;
+
+// kCodeToPlane (libwebp): 120 packed (yoffset<<4 | 8-xoffset) bytes.
+let is *u8 as _KP with imut = "\x18\x07\x17\x19\x28\x06\x27\x29\x16\x1a\x26\x2a\x38\x05\x37\x39\x15\x1b\x36\x3a\x25\x2b\x48\x04\x47\x49\x14\x1c\x35\x3b\x46\x4a\x24\x2c\x58\x45\x4b\x34\x3c\x03\x57\x59\x13\x1d\x56\x5a\x23\x2d\x44\x4c\x55\x5b\x33\x3d\x68\x02\x67\x69\x12\x1e\x66\x6a\x22\x2e\x54\x5c\x43\x4d\x65\x6b\x32\x3e\x78\x01\x77\x79\x53\x5d\x11\x1f\x64\x6c\x42\x4e\x76\x7a\x21\x2f\x75\x7b\x31\x3f\x63\x6d\x52\x5e\x00\x74\x7c\x41\x4f\x10\x20\x62\x6e\x30\x73\x7d\x51\x5f\x40\x72\x7e\x61\x6f\x50\x71\x7f\x60\x70";
+
+// kCodeLengthCodeOrder.
+let is *u8 as _CLO with imut = "\x11\x12\x00\x01\x02\x03\x04\x05\x10\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f";
+
+// ---- canonical prefix trees --------------------------------------------
+// Tree block layout (i64 units): [0..15] count-per-length, [16..31] first
+// code per length, [32..47] valptr per length, [48] single-symbol (or -1),
+// [64...] symbols sorted by (length, index).
+let is i64 as HDRT with imut = 64;
+
+fn _tree_from_lengths(t as *i64, lens as *i64, n as i64) as i64 {
+    let is i64 as l with mut = 0;
+    while (l < 16) { t[l] = 0; l = l + 1; }
+    let is i64 as total with mut = 0;
+    let is i64 as lastsym with mut = 0 - 1;
+    let is i64 as s with mut = 0;
+    while (s < n) {
+        let is i64 as ln = lens[s];
+        if (ln > 15) { return 0 - 1; }
+        if (ln > 0) { t[ln] = t[ln] + 1; total = total + 1; lastsym = s; }
+        s = s + 1;
+    }
+    if (total == 0) { return 0 - 1; }
+    if (total == 1) { t[48] = lastsym; return 0; }
+    t[48] = 0 - 1;
+    // first codes + valptrs.
+    let is i64 as code with mut = 0;
+    let is i64 as cum with mut = 0;
+    let is [16]i64 as vp;
+    l = 1;
+    while (l < 16) {
+        t[16 + l] = code;
+        t[32 + l] = cum;
+        vp[l] = cum;
+        code = (code + t[l]) << 1;
+        cum = cum + t[l];
+        l = l + 1;
+    }
+    // sorted symbols.
+    s = 0;
+    while (s < n) {
+        let is i64 as ln = lens[s];
+        if (ln > 0) { t[HDRT + vp[ln]] = s; vp[ln] = vp[ln] + 1; }
+        s = s + 1;
+    }
+    return 0;
+}
+
+fn _read_code(b as *br.BitReader, t as *i64) as i64 {
+    if (t[48] >= 0) { return t[48]; }
+    let is i64 as code with mut = 0;
+    let is i64 as l with mut = 1;
+    while (l < 16) {
+        code = (code << 1) | br.br_get(b, 1);
+        if (t[l] > 0) {
+            let is i64 as fc = t[16 + l];
+            if (code >= fc) { if (code < fc + t[l]) {
+                return t[HDRT + t[32 + l] + code - fc];
+            } }
+        }
+        l = l + 1;
+    }
+    return 0 - 1;
+}
+
+// ReadHuffmanCode: simple (1-2 explicit symbols) or code-length-coded.
+fn _read_htree(b as *br.BitReader, t as *i64, alphabet as i64, lens as *i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < alphabet) { lens[i] = 0; i = i + 1; }
+
+    if (br.br_get(b, 1) == 1) {                       // simple code
+        let is i64 as nsym = br.br_get(b, 1) + 1;
+        let is i64 as first8 = br.br_get(b, 1);
+        let is i64 as nb with mut = 1;
+        if (first8 == 1) { nb = 8; }
+        let is i64 as s0 = br.br_get(b, nb);
+        if (s0 < 0) { return 0 - 1; }
+        if (s0 >= alphabet) { return 0 - 1; }
+        lens[s0] = 1;
+        if (nsym == 2) {
+            let is i64 as s1 = br.br_get(b, 8);
+            if (s1 < 0) { return 0 - 1; }
+            if (s1 >= alphabet) { return 0 - 1; }
+            lens[s1] = 1;
+        }
+        return _tree_from_lengths(t, lens, alphabet);
+    }
+
+    // code-length code: up to 19 3-bit lengths in kCodeLengthCodeOrder.
+    let is [19]i64 as cl;
+    i = 0; while (i < 19) { cl[i] = 0; i = i + 1; }
+    let is i64 as ncodes = 4 + br.br_get(b, 4);
+    if (ncodes > 19) { return 0 - 1; }
+    i = 0;
+    while (i < ncodes) {
+        cl[cast(i64, _CLO[i])] = br.br_get(b, 3);
+        i = i + 1;
+    }
+    let is [96]i64 as clt;
+    if (_tree_from_lengths(cast(*i64, &clt), cast(*i64, &cl), 19) < 0) { return 0 - 1; }
+
+    let is i64 as max_symbol with mut = alphabet;
+    if (br.br_get(b, 1) == 1) {
+        let is i64 as lnbits = 2 + 2 * br.br_get(b, 3);
+        max_symbol = 2 + br.br_get(b, lnbits);
+        if (max_symbol > alphabet) { return 0 - 1; }
+    }
+
+    let is i64 as prev with mut = 8;
+    let is i64 as sym with mut = 0;
+    let is i64 as go with mut = 1;
+    while (go == 1) {
+        if (sym >= alphabet) { go = 0; }
+        else {
+            if (max_symbol == 0) { go = 0; }
+            else {
+                max_symbol = max_symbol - 1;
+                let is i64 as c = _read_code(b, cast(*i64, &clt));
+                if (c < 0) { return 0 - 1; }
+                if (c < 16) {
+                    lens[sym] = c;
+                    sym = sym + 1;
+                    if (c != 0) { prev = c; }
+                } else {
+                    let is i64 as rep with mut = 0;
+                    let is i64 as fill with mut = 0;
+                    if (c == 16) { rep = 3 + br.br_get(b, 2); fill = prev; }
+                    else { if (c == 17) { rep = 3 + br.br_get(b, 3); }
+                    else { rep = 11 + br.br_get(b, 7); } }
+                    if (sym + rep > alphabet) { return 0 - 1; }
+                    let is i64 as k with mut = 0;
+                    while (k < rep) { lens[sym] = fill; sym = sym + 1; k = k + 1; }
+                }
+            }
+        }
+    }
+    return _tree_from_lengths(t, lens, alphabet);
+}
+
+// length/distance prefix values (extra bits inline).
+fn _prefix_val(b as *br.BitReader, sym as i64) as i64 {
+    if (sym < 4) { return sym + 1; }
+    let is i64 as eb = (sym - 2) >> 1;
+    let is i64 as off = (2 + (sym & 1)) << eb;
+    return off + br.br_get(b, eb) + 1;
+}
+
+fn _plane_dist(plane as i64, w as i64) as i64 {
+    if (plane > 120) { return plane - 120; }
+    let is i64 as c = cast(i64, _KP[plane - 1]);
+    let is i64 as d = (c >> 4) * w + (8 - (c & 15));
+    if (d < 1) { return 1; }
+    return d;
+}
+
+fn _sub(sz as i64, bits as i64) as i64 {
+    return (sz + (1 << bits) - 1) >> bits;
+}
+
+// ---- pixel decode (shared by main + auxiliary streams) ------------------
+// groups: ngroups tree groups; meta (or 0): entropy image selecting the group.
+fn _decode_pixels(b as *br.BitReader, w as i64, h as i64,
+                  groups as *i64, gstride as i64, green_alpha as i64,
+                  meta as *i64, metaw as i64, metabits as i64,
+                  cache as *i64, cachebits as i64, out as *i64) as i64 {
+    let is i64 as off_red = HDRT + green_alpha;
+    let is i64 as off_blue = off_red + HDRT + 256;
+    let is i64 as off_alpha = off_blue + HDRT + 256;
+    let is i64 as off_dist = off_alpha + HDRT + 256;
+    let is i64 as npx = w * h;
+    let is i64 as cshift = 32 - cachebits;
+
+    let is i64 as p with mut = 0;
+    let is i64 as x with mut = 0;
+    let is i64 as y with mut = 0;
+    while (p < npx) {
+        let is i64 as gbase with mut = 0;
+        if (cast(i64, meta) != 0) {
+            let is i64 as m = meta[(y >> metabits) * metaw + (x >> metabits)];
+            gbase = ((m >> 8) & 65535) * gstride;
+        }
+        let is *i64 as gt = cast(*i64, cast(i64, groups) + gbase * 8);
+        let is i64 as sym = _read_code(b, gt);
+        if (sym < 0) { return errno.I_CORRUPT; }
+
+        if (sym < 256) {
+            let is i64 as r = _read_code(b, cast(*i64, cast(i64, gt) + off_red * 8));
+            let is i64 as bl = _read_code(b, cast(*i64, cast(i64, gt) + off_blue * 8));
+            let is i64 as al = _read_code(b, cast(*i64, cast(i64, gt) + off_alpha * 8));
+            if (al < 0) { return errno.I_CORRUPT; }
+            let is i64 as px = (al << 24) | (r << 16) | (sym << 8) | bl;
+            out[p] = px;
+            if (cachebits > 0) {
+                cache[((px * 506832829) & 0xFFFFFFFF) >> cshift] = px;
+            }
+            p = p + 1; x = x + 1; if (x == w) { x = 0; y = y + 1; }
+        } else {
+            if (sym < 280) {
+                let is i64 as len = _prefix_val(b, sym - 256);
+                let is i64 as ds = _read_code(b, cast(*i64, cast(i64, gt) + off_dist * 8));
+                if (ds < 0) { return errno.I_CORRUPT; }
+                let is i64 as dist = _plane_dist(_prefix_val(b, ds), w);
+                if (dist > p) { return errno.I_CORRUPT; }
+                if (p + len > npx) { return errno.I_CORRUPT; }
+                let is i64 as k with mut = 0;
+                while (k < len) {
+                    let is i64 as px = out[p - dist];
+                    out[p] = px;
+                    if (cachebits > 0) {
+                        cache[((px * 506832829) & 0xFFFFFFFF) >> cshift] = px;
+                    }
+                    p = p + 1; x = x + 1; if (x == w) { x = 0; y = y + 1; }
+                    k = k + 1;
+                }
+            } else {
+                let is i64 as ci = sym - 280;
+                if (cachebits == 0) { return errno.I_CORRUPT; }
+                if (ci >= (1 << cachebits)) { return errno.I_CORRUPT; }
+                let is i64 as px = cache[ci];
+                out[p] = px;
+                cache[((px * 506832829) & 0xFFFFFFFF) >> cshift] = px;
+                p = p + 1; x = x + 1; if (x == w) { x = 0; y = y + 1; }
+            }
+        }
+    }
+    return 0;
+}
+
+// Decode an auxiliary (non-level-0) image stream: optional colour cache, one
+// tree group, pixels. Returns the address of a w*h i64 ARGB buffer, or 0.
+fn _decode_substream(b as *br.BitReader, w as i64, h as i64) as i64 {
+    let is i64 as cachebits with mut = 0;
+    let is *i64 as cache with mut = cast(*i64, 0);
+    if (br.br_get(b, 1) == 1) {
+        cachebits = br.br_get(b, 4);
+        if (cachebits < 1) { return 0; }
+        if (cachebits > 11) { return 0; }
+        cache = cast(*i64, mem.core.mmap_anon((1 << cachebits) * 8));
+        if (cast(i64, cache) <= 0) { return 0; }
+    }
+    // green alphabet = 256 literals + 24 length codes + cache entries.
+    let is i64 as ga with mut = 280;
+    if (cachebits > 0) { ga = 280 + (1 << cachebits); }
+    let is i64 as gstride = (HDRT + ga) + 3 * (HDRT + 256) + (HDRT + 40);
+    let is *i64 as grp = cast(*i64, mem.core.mmap_anon(gstride * 8));
+    let is *i64 as lens = cast(*i64, mem.core.mmap_anon(ga * 8));
+    if (cast(i64, lens) <= 0) { return 0; }
+
+    let is i64 as ok with mut = 0;
+    ok = _read_htree(b, grp, ga, lens);
+    if (ok >= 0) { ok = _read_htree(b, cast(*i64, cast(i64, grp) + (HDRT + ga) * 8), 256, lens); }
+    if (ok >= 0) { ok = _read_htree(b, cast(*i64, cast(i64, grp) + (HDRT + ga + HDRT + 256) * 8), 256, lens); }
+    if (ok >= 0) { ok = _read_htree(b, cast(*i64, cast(i64, grp) + (HDRT + ga + 2 * (HDRT + 256)) * 8), 256, lens); }
+    if (ok >= 0) { ok = _read_htree(b, cast(*i64, cast(i64, grp) + (HDRT + ga + 3 * (HDRT + 256)) * 8), 40, lens); }
+    if (ok < 0) { return 0; }
+
+    let is *i64 as buf = cast(*i64, mem.core.mmap_anon(w * h * 8));
+    if (cast(i64, buf) <= 0) { return 0; }
+    let is i64 as rc = _decode_pixels(b, w, h, grp, gstride, ga,
+        cast(*i64, 0), 0, 0, cache, cachebits, buf);
+    mem.core.munmap(cast(*u8, grp), gstride * 8);
+    mem.core.munmap(cast(*u8, lens), ga * 8);
+    if (cachebits > 0) { mem.core.munmap(cast(*u8, cache), (1 << cachebits) * 8); }
+    if (rc < 0) { mem.core.munmap(cast(*u8, buf), w * h * 8); return 0; }
+    return cast(i64, buf);
+}
+
+// ---- inverse transforms --------------------------------------------------
+fn _avg2c(a as i64, bb as i64, s as i64) as i64 {
+    return (((a >> s) & 255) + ((bb >> s) & 255)) >> 1;
+}
+fn _avg2(a as i64, bb as i64) as i64 {
+    return (_avg2c(a, bb, 24) << 24) | (_avg2c(a, bb, 16) << 16)
+         | (_avg2c(a, bb, 8) << 8) | _avg2c(a, bb, 0);
+}
+fn _clamp255(v as i64) as i64 {
+    if (v < 0) { return 0; }
+    if (v > 255) { return 255; }
+    return v;
+}
+fn _cas_full(l as i64, t as i64, tl as i64) as i64 {
+    let is i64 as r with mut = 0;
+    let is i64 as s with mut = 0;
+    while (s < 32) {
+        let is i64 as v = _clamp255(((l >> s) & 255) + ((t >> s) & 255) - ((tl >> s) & 255));
+        r = r | (v << s);
+        s = s + 8;
+    }
+    return r;
+}
+fn _cas_half(l as i64, t as i64, tl as i64) as i64 {
+    let is i64 as ave = _avg2(l, t);
+    let is i64 as r with mut = 0;
+    let is i64 as s with mut = 0;
+    while (s < 32) {
+        let is i64 as a = (ave >> s) & 255;
+        let is i64 as d = a - ((tl >> s) & 255);
+        // C-style trunc-toward-zero halving of a possibly negative delta.
+        let is i64 as hd with mut = d / 2;
+        let is i64 as v = _clamp255(a + hd);
+        r = r | (v << s);
+        s = s + 8;
+    }
+    return r;
+}
+fn _absv(v as i64) as i64 { if (v < 0) { return 0 - v; } return v; }
+fn _select(t as i64, l as i64, tl as i64) as i64 {
+    let is i64 as pa with mut = 0;    // Σ |L-TL| - |T-TL|
+    let is i64 as s with mut = 0;
+    while (s < 32) {
+        pa = pa + _absv(((l >> s) & 255) - ((tl >> s) & 255))
+                - _absv(((t >> s) & 255) - ((tl >> s) & 255));
+        s = s + 8;
+    }
+    if (pa <= 0) { return t; }
+    return l;
+}
+fn _addpx(a as i64, bb as i64) as i64 {
+    let is i64 as r with mut = 0;
+    let is i64 as s with mut = 0;
+    while (s < 32) {
+        r = r | (((((a >> s) & 255) + ((bb >> s) & 255)) & 255) << s);
+        s = s + 8;
+    }
+    return r;
+}
+fn _s8(v as i64) as i64 { if (v >= 128) { return v - 256; } return v; }
+fn _ctdelta(t as i64, c as i64) as i64 { return (_s8(t) * _s8(c)) >> 5; }
+
+fn _inv_predictor(buf as *i64, w as i64, h as i64, data as *i64, bits as i64) as void {
+    let is i64 as tw = _sub(w, bits);
+    let is i64 as p with mut = 0;
+    let is i64 as y with mut = 0;
+    while (y < h) {
+        let is i64 as x with mut = 0;
+        while (x < w) {
+            let is i64 as pred with mut = 0;
+            if (p == 0) { pred = 255 << 24; }
+            else { if (y == 0) { pred = buf[p - 1]; }
+            else { if (x == 0) { pred = buf[p - w]; }
+            else {
+                let is i64 as mode = (data[(y >> bits) * tw + (x >> bits)] >> 8) & 255;
+                let is i64 as l = buf[p - 1];
+                let is i64 as t = buf[p - w];
+                let is i64 as tl = buf[p - w - 1];
+                let is i64 as tr = buf[p - w + 1];
+                if (mode == 0) { pred = 255 << 24; }
+                else { if (mode == 1) { pred = l; }
+                else { if (mode == 2) { pred = t; }
+                else { if (mode == 3) { pred = tr; }
+                else { if (mode == 4) { pred = tl; }
+                else { if (mode == 5) { pred = _avg2(_avg2(l, tr), t); }
+                else { if (mode == 6) { pred = _avg2(l, tl); }
+                else { if (mode == 7) { pred = _avg2(l, t); }
+                else { if (mode == 8) { pred = _avg2(tl, t); }
+                else { if (mode == 9) { pred = _avg2(t, tr); }
+                else { if (mode == 10) { pred = _avg2(_avg2(l, tl), _avg2(t, tr)); }
+                else { if (mode == 11) { pred = _select(t, l, tl); }
+                else { if (mode == 12) { pred = _cas_full(l, t, tl); }
+                else { pred = _cas_half(l, t, tl); } }}}}}}}}}}}}
+            } } }
+            buf[p] = _addpx(buf[p], pred);
+            p = p + 1;
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+}
+
+fn _inv_color(buf as *i64, w as i64, h as i64, data as *i64, bits as i64) as void {
+    let is i64 as tw = _sub(w, bits);
+    let is i64 as p with mut = 0;
+    let is i64 as y with mut = 0;
+    while (y < h) {
+        let is i64 as x with mut = 0;
+        while (x < w) {
+            let is i64 as cte = data[(y >> bits) * tw + (x >> bits)];
+            let is i64 as g2r = cte & 255;
+            let is i64 as g2b = (cte >> 8) & 255;
+            let is i64 as r2b = (cte >> 16) & 255;
+            let is i64 as px = buf[p];
+            let is i64 as g = (px >> 8) & 255;
+            let is i64 as r = (((px >> 16) & 255) + _ctdelta(g2r, g)) & 255;
+            let is i64 as bl with mut = ((px & 255) + _ctdelta(g2b, g)) & 255;
+            bl = (bl + _ctdelta(r2b, r)) & 255;
+            buf[p] = (px & (255 << 24)) | (r << 16) | (g << 8) | bl;
+            p = p + 1;
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+}
+
+fn _inv_subgreen(buf as *i64, n as i64) as void {
+    let is i64 as p with mut = 0;
+    while (p < n) {
+        let is i64 as px = buf[p];
+        let is i64 as g = (px >> 8) & 255;
+        let is i64 as r = (((px >> 16) & 255) + g) & 255;
+        let is i64 as bl = ((px & 255) + g) & 255;
+        buf[p] = (px & (255 << 24)) | (r << 16) | (g << 8) | bl;
+        p = p + 1;
+    }
+}
+
+// ---- top level ------------------------------------------------------------
+fn webp_decode(src as *u8, src_len as i64, out as *image.Image) as i64 {
+    if (src_len < 20) { return errno.I_BADMAGIC; }
+    // RIFF container: "RIFF" size "WEBP" then fourcc chunks.
+    if (cast(i64, src[0]) != 82) { return errno.I_BADMAGIC; }
+    if (cast(i64, src[8]) != 87) { return errno.I_BADMAGIC; }    // 'W'
+    let is i64 as pos with mut = 12;
+    let is i64 as vp8l_off with mut = 0 - 1;
+    let is i64 as vp8l_len with mut = 0;
+    while (pos + 8 <= src_len) {
+        let is i64 as f0 = cast(i64, src[pos]);
+        let is i64 as f1 = cast(i64, src[pos + 1]);
+        let is i64 as f2 = cast(i64, src[pos + 2]);
+        let is i64 as f3 = cast(i64, src[pos + 3]);
+        let is i64 as csz = cast(i64, src[pos + 4]) | (cast(i64, src[pos + 5]) << 8)
+            | (cast(i64, src[pos + 6]) << 16) | (cast(i64, src[pos + 7]) << 24);
+        if (f0 == 86) { if (f1 == 80) { if (f2 == 56) {
+            if (f3 == 76) { vp8l_off = pos + 8; vp8l_len = csz; pos = src_len; }   // "VP8L"
+            else { if (f3 == 32) { return errno.I_UNSUPPORTED; } }                 // "VP8 " lossy
+        } } }
+        if (pos < src_len) { pos = pos + 8 + csz + (csz & 1); }
+    }
+    if (vp8l_off < 0) { return errno.I_UNSUPPORTED; }
+    if (vp8l_off + vp8l_len > src_len) { return errno.I_CORRUPT; }
+    if (cast(i64, src[vp8l_off]) != 47) { return errno.I_CORRUPT; }    // 0x2f signature
+
+    let is br.BitReader as b;
+    br.br_init(&b, cast(*u8, cast(i64, src) + vp8l_off + 1), vp8l_len - 1);
+    let is i64 as w = br.br_get(&b, 14) + 1;
+    let is i64 as h = br.br_get(&b, 14) + 1;
+    br.br_get(&b, 1);                                  // alpha hint
+    if (br.br_get(&b, 3) != 0) { return errno.I_UNSUPPORTED; }   // version
+
+    if (image.image_check_dims(w, h, pixfmt.FMT_RGBA8) < 0) { return errno.I_DIMS; }
+
+    // ---- transforms (level 0 only; each type at most once) ----
+    let is [4]i64 as ttype;
+    let is [4]i64 as tbits;
+    let is [4]i64 as tdata;
+    let is [4]i64 as torigw;
+    let is [4]i64 as tpalsz;
+    let is i64 as ntrans with mut = 0;
+    let is i64 as cur_w with mut = w;
+    while (br.br_get(&b, 1) == 1) {
+        if (ntrans >= 4) { return errno.I_CORRUPT; }
+        let is i64 as tt = br.br_get(&b, 2);
+        ttype[ntrans] = tt;
+        tbits[ntrans] = 0; tdata[ntrans] = 0; torigw[ntrans] = cur_w; tpalsz[ntrans] = 0;
+        if (tt <= 1) {                                  // predictor / cross-colour
+            let is i64 as tb = br.br_get(&b, 3) + 2;
+            tbits[ntrans] = tb;
+            let is i64 as d = _decode_substream(&b, _sub(cur_w, tb), _sub(h, tb));
+            if (d == 0) { return errno.I_CORRUPT; }
+            tdata[ntrans] = d;
+        } else {
+            if (tt == 3) {                              // colour indexing
+                let is i64 as n = br.br_get(&b, 8) + 1;
+                let is i64 as d = _decode_substream(&b, n, 1);
+                if (d == 0) { return errno.I_CORRUPT; }
+                // delta-coded palette: accumulate per channel.
+                let is *i64 as pal = cast(*i64, d);
+                let is i64 as i with mut = 1;
+                while (i < n) { pal[i] = _addpx(pal[i], pal[i - 1]); i = i + 1; }
+                let is i64 as xb with mut = 0;
+                if (n <= 2) { xb = 3; } else { if (n <= 4) { xb = 2; } else { if (n <= 16) { xb = 1; } } }
+                tbits[ntrans] = xb;
+                tdata[ntrans] = d;
+                tpalsz[ntrans] = n;
+                cur_w = _sub(cur_w, xb);
+            }
+            // tt == 2 (subtract green): no data
+        }
+        ntrans = ntrans + 1;
+    }
+
+    // ---- colour cache ----
+    let is i64 as cachebits with mut = 0;
+    let is *i64 as cache with mut = cast(*i64, 0);
+    if (br.br_get(&b, 1) == 1) {
+        cachebits = br.br_get(&b, 4);
+        if (cachebits < 1) { return errno.I_CORRUPT; }
+        if (cachebits > 11) { return errno.I_CORRUPT; }
+        cache = cast(*i64, mem.core.mmap_anon((1 << cachebits) * 8));
+        if (cast(i64, cache) <= 0) { return errno.I_OOM; }
+    }
+
+    // ---- meta-Huffman (entropy image) ----
+    let is *i64 as meta with mut = cast(*i64, 0);
+    let is i64 as metaw with mut = 0;
+    let is i64 as metabits with mut = 0;
+    let is i64 as ngroups with mut = 1;
+    if (br.br_get(&b, 1) == 1) {
+        metabits = br.br_get(&b, 3) + 2;
+        metaw = _sub(cur_w, metabits);
+        let is i64 as mh = _sub(h, metabits);
+        let is i64 as d = _decode_substream(&b, metaw, mh);
+        if (d == 0) { return errno.I_CORRUPT; }
+        meta = cast(*i64, d);
+        let is i64 as i with mut = 0;
+        let is i64 as mn = metaw * mh;
+        while (i < mn) {
+            let is i64 as gi = (meta[i] >> 8) & 65535;
+            if (gi + 1 > ngroups) { ngroups = gi + 1; }
+            i = i + 1;
+        }
+        if (ngroups > 1024) { return errno.I_UNSUPPORTED; }
+    }
+
+    // ---- tree groups ----
+    let is i64 as ga with mut = 280;
+    if (cachebits > 0) { ga = 280 + (1 << cachebits); }
+    let is i64 as gstride = (HDRT + ga) + 3 * (HDRT + 256) + (HDRT + 40);
+    let is *i64 as groups = cast(*i64, mem.core.mmap_anon(ngroups * gstride * 8));
+    let is *i64 as lens = cast(*i64, mem.core.mmap_anon(ga * 8));
+    if (cast(i64, lens) <= 0) { return errno.I_OOM; }
+    let is i64 as g with mut = 0;
+    while (g < ngroups) {
+        let is *i64 as gt = cast(*i64, cast(i64, groups) + g * gstride * 8);
+        if (_read_htree(&b, gt, ga, lens) < 0) { return errno.I_CORRUPT; }
+        if (_read_htree(&b, cast(*i64, cast(i64, gt) + (HDRT + ga) * 8), 256, lens) < 0) { return errno.I_CORRUPT; }
+        if (_read_htree(&b, cast(*i64, cast(i64, gt) + (HDRT + ga + HDRT + 256) * 8), 256, lens) < 0) { return errno.I_CORRUPT; }
+        if (_read_htree(&b, cast(*i64, cast(i64, gt) + (HDRT + ga + 2 * (HDRT + 256)) * 8), 256, lens) < 0) { return errno.I_CORRUPT; }
+        if (_read_htree(&b, cast(*i64, cast(i64, gt) + (HDRT + ga + 3 * (HDRT + 256)) * 8), 40, lens) < 0) { return errno.I_CORRUPT; }
+        g = g + 1;
+    }
+
+    // ---- pixel data (at the possibly palette-packed width) ----
+    let is *i64 as buf with mut = cast(*i64, mem.core.mmap_anon(cur_w * h * 8));
+    if (cast(i64, buf) <= 0) { return errno.I_OOM; }
+    let is i64 as rc = _decode_pixels(&b, cur_w, h, groups, gstride, ga,
+        meta, metaw, metabits, cache, cachebits, buf);
+    mem.core.munmap(cast(*u8, groups), ngroups * gstride * 8);
+    mem.core.munmap(cast(*u8, lens), ga * 8);
+    if (cachebits > 0) { mem.core.munmap(cast(*u8, cache), (1 << cachebits) * 8); }
+    if (cast(i64, meta) != 0) { mem.core.munmap(cast(*u8, meta), metaw * _sub(h, metabits) * 8); }
+    if (rc < 0) { return rc; }
+
+    // ---- inverse transforms, LIFO ----
+    let is i64 as bw with mut = cur_w;
+    let is i64 as ti with mut = ntrans - 1;
+    while (ti >= 0) {
+        let is i64 as tt = ttype[ti];
+        if (tt == 0) { _inv_predictor(buf, bw, h, cast(*i64, tdata[ti]), tbits[ti]); }
+        else { if (tt == 1) { _inv_color(buf, bw, h, cast(*i64, tdata[ti]), tbits[ti]); }
+        else { if (tt == 2) { _inv_subgreen(buf, bw * h); }
+        else {
+            // colour indexing: unpack bundled indices, expand to the palette.
+            let is i64 as ow = torigw[ti];
+            let is i64 as xb = tbits[ti];
+            let is *i64 as pal = cast(*i64, tdata[ti]);
+            let is i64 as psz = tpalsz[ti];
+            let is *i64 as nb = cast(*i64, mem.core.mmap_anon(ow * h * 8));
+            if (cast(i64, nb) <= 0) { return errno.I_OOM; }
+            let is i64 as bpp = 8 >> xb;
+            let is i64 as msk = (1 << bpp) - 1;
+            let is i64 as smask = (1 << xb) - 1;
+            let is i64 as y2 with mut = 0;
+            while (y2 < h) {
+                let is i64 as x2 with mut = 0;
+                while (x2 < ow) {
+                    let is i64 as pk = buf[y2 * bw + (x2 >> xb)];
+                    let is i64 as idx = ((pk >> 8) >> ((x2 & smask) * bpp)) & msk;
+                    let is i64 as px with mut = 0;
+                    if (idx < psz) { px = pal[idx]; }
+                    nb[y2 * ow + x2] = px;
+                    x2 = x2 + 1;
+                }
+                y2 = y2 + 1;
+            }
+            mem.core.munmap(cast(*u8, buf), bw * h * 8);
+            buf = nb;
+            bw = ow;
+        } } }
+        ti = ti - 1;
+    }
+    // free transform data buffers
+    ti = 0;
+    while (ti < ntrans) {
+        if (tdata[ti] != 0) {
+            let is i64 as tt = ttype[ti];
+            if (tt <= 1) {
+                let is i64 as tb = tbits[ti];
+                mem.core.munmap(cast(*u8, tdata[ti]), _sub(torigw[ti], tb) * _sub(h, tb) * 8);
+            } else {
+                mem.core.munmap(cast(*u8, tdata[ti]), tpalsz[ti] * 8);
+            }
+        }
+        ti = ti + 1;
+    }
+
+    if (bw != w) { return errno.I_CORRUPT; }
+
+    // ---- ARGB -> RGBA8 Image ----
+    let is i64 as ir = image.image_init(out, w, h, pixfmt.FMT_RGBA8);
+    if (ir < 0) { return ir; }
+    let is *u8 as dst = out.pixels;
+    let is i64 as p2 with mut = 0;
+    let is i64 as n2 = w * h;
+    while (p2 < n2) {
+        let is i64 as px = buf[p2];
+        dst[p2 * 4]     = cast(u8, (px >> 16) & 255);
+        dst[p2 * 4 + 1] = cast(u8, (px >> 8) & 255);
+        dst[p2 * 4 + 2] = cast(u8, px & 255);
+        dst[p2 * 4 + 3] = cast(u8, (px >> 24) & 255);
+        p2 = p2 + 1;
+    }
+    mem.core.munmap(cast(*u8, buf), bw * h * 8);
+    return 0;
+}
