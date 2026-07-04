@@ -22,8 +22,9 @@ in Pillow/giflib/libpng.
 | PNG  | yes | yes | 8/16-bit, colour types 0/2/3/4/6, all filters, Adam7 interlace; encode 8-bit non-interlaced |
 | GIF  | yes | yes | decode first frame + de-interlace; encode exact-palette (≤256 colours) |
 | JPEG | yes | — | baseline (Huffman, 4:4:4/4:2:2/4:2:0), matches libjpeg within a few levels |
+| TIFF | yes | — | II/MM, strips, uncompressed / PackBits / DEFLATE; 8-bit gray/RGB/RGBA |
 | CSIF | yes | yes | native flagship — see below |
-| WebP / TIFF / AVIF | — | — | later phases |
+| WebP / AVIF | — | — | later phases |
 
 ### CSIF (native flagship)
 

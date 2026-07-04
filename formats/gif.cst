@@ -17,6 +17,26 @@ use "../core/buf.cst"    as buf;
 use "caustic-compact/core/bytes.cst"   as cb;
 use "caustic-compact/formats/lzw.cst"  as lzw;
 
+// ---- animation model ----
+struct GifAnim {
+    width as i64;
+    height as i64;
+    count as i64;      // number of frames
+    frames as i64;     // address of count * (width*height*4) RGBA8 bytes
+    delays as i64;     // address of count i64 (delay in centiseconds)
+}
+
+// RGBA8 pixel buffer of frame `i`.
+fn gif_anim_frame(a as *GifAnim, i as i64) as *u8 {
+    return cast(*u8, a.frames + i * a.width * a.height * 4);
+}
+fn gif_anim_free(a as *GifAnim) as void {
+    let is i64 as fsize = a.width * a.height * 4;
+    if (a.frames > 0) { mem.core.munmap(cast(*u8, a.frames), a.count * fsize); }
+    if (a.delays > 0) { mem.core.munmap(cast(*u8, a.delays), a.count * 8); }
+    a.frames = 0; a.delays = 0; a.count = 0;
+}
+
 // Skip a chain of GIF sub-blocks (…[len][len bytes]… terminated by a 0 length).
 fn _skip_subblocks(bf as *buf.Buf) as void {
     let is i64 as go with mut = 1;
@@ -280,4 +300,195 @@ fn gif_encode(img as *image.Image, out as *cb.Bytes) as i64 {
 
     cb.bytes_push(out, cast(u8, 59));   // ';' trailer
     return out.len;
+}
+
+// Count image descriptors, skipping their data (for sizing the frame buffer).
+fn _count_images(src as *u8, len as i64, start as i64) as i64 {
+    let is buf.Buf as bf;
+    buf.buf_init(&bf, src, len);
+    buf.buf_seek(&bf, start);
+    let is i64 as count with mut = 0;
+    let is i64 as go with mut = 1;
+    while (go == 1) {
+        let is i64 as blk = buf.buf_u8(&bf);
+        if (blk < 0) { go = 0; }
+        else {
+            if (blk == 59) { go = 0; }
+            else {
+                if (blk == 33) { buf.buf_u8(&bf); _skip_subblocks(&bf); }
+                else {
+                    if (blk == 44) {
+                        count = count + 1;
+                        buf.buf_skip(&bf, 8);
+                        let is i64 as ip = buf.buf_u8(&bf);
+                        if ((ip & 128) != 0) { buf.buf_skip(&bf, (1 << ((ip & 7) + 1)) * 3); }
+                        buf.buf_u8(&bf);
+                        _skip_subblocks(&bf);
+                    } else { go = 0; }
+                }
+            }
+        }
+    }
+    return count;
+}
+
+// Decode all frames of an animated GIF, compositing onto an RGBA8 canvas with
+// transparency + disposal. Fills *out; returns 0 or a negative errno.
+fn gif_decode_anim(src as *u8, src_len as i64, out as *GifAnim) as i64 {
+    let is buf.Buf as bf;
+    buf.buf_init(&bf, src, src_len);
+    if (buf.buf_u8(&bf) != 71) { return errno.I_BADMAGIC; }
+    if (buf.buf_u8(&bf) != 73) { return errno.I_BADMAGIC; }
+    if (buf.buf_u8(&bf) != 70) { return errno.I_BADMAGIC; }
+    buf.buf_skip(&bf, 3);
+    let is i64 as sw = buf.buf_u16le(&bf);
+    let is i64 as sh = buf.buf_u16le(&bf);
+    let is i64 as packed = buf.buf_u8(&bf);
+    buf.buf_u8(&bf); buf.buf_u8(&bf);
+    let is *u8 as gct with mut = cast(*u8, 0);
+    let is i64 as gsz with mut = 0;
+    if ((packed & 128) != 0) {
+        gsz = 1 << ((packed & 7) + 1);
+        gct = buf.buf_here(&bf);
+        buf.buf_skip(&bf, gsz * 3);
+    }
+    let is i64 as data_start = bf.pos;
+
+    let is i64 as count = _count_images(src, src_len, data_start);
+    if (count < 1) { return errno.I_CORRUPT; }
+    if (image.image_check_dims(sw, sh, pixfmt.FMT_RGBA8) < 0) { return errno.I_DIMS; }
+    let is i64 as fsize = sw * sh * 4;
+    let is *u8 as frames = mem.core.mmap_anon(count * fsize);
+    let is *i64 as delays = cast(*i64, mem.core.mmap_anon(count * 8));
+    let is *u8 as canvas = mem.core.mmap_anon(fsize);
+    let is *u8 as saved = mem.core.mmap_anon(fsize);
+    if (cast(i64, saved) <= 0) { return errno.I_OOM; }
+    mem.core.memset(canvas, cast(i32, 0), fsize);
+
+    buf.buf_seek(&bf, data_start);
+    let is i64 as fi with mut = 0;
+    let is i64 as tflag with mut = 0;
+    let is i64 as tindex with mut = 0 - 1;
+    let is i64 as disp with mut = 0;
+    let is i64 as delay with mut = 0;
+    let is i64 as go with mut = 1;
+    while (go == 1) {
+        let is i64 as blk = buf.buf_u8(&bf);
+        if (blk < 0) { go = 0; }
+        else { if (blk == 59) { go = 0; }
+        else {
+        if (blk == 33) {
+            let is i64 as label = buf.buf_u8(&bf);
+            if (label == 249) {
+                let is i64 as n = buf.buf_u8(&bf);
+                if (n >= 4) {
+                    let is i64 as gp = buf.buf_u8(&bf);
+                    delay = buf.buf_u16le(&bf);
+                    tindex = buf.buf_u8(&bf);
+                    tflag = gp & 1;
+                    disp = (gp >> 2) & 7;
+                    buf.buf_skip(&bf, n - 4);
+                } else { buf.buf_skip(&bf, n); }
+                _skip_subblocks(&bf);
+            } else { _skip_subblocks(&bf); }
+        } else {
+        if (blk == 44) {
+            let is i64 as left = buf.buf_u16le(&bf);
+            let is i64 as top = buf.buf_u16le(&bf);
+            let is i64 as iw = buf.buf_u16le(&bf);
+            let is i64 as ih = buf.buf_u16le(&bf);
+            let is i64 as ip = buf.buf_u8(&bf);
+            let is i64 as interlace = (ip >> 6) & 1;
+            let is *u8 as tab with mut = gct;
+            let is i64 as tsz with mut = gsz;
+            if ((ip & 128) != 0) { tsz = 1 << ((ip & 7) + 1); tab = buf.buf_here(&bf); buf.buf_skip(&bf, tsz * 3); }
+            let is i64 as mcs = buf.buf_u8(&bf);
+            let is cb.Bytes as comp = cb.bytes_new(1024);
+            let is i64 as more with mut = 1;
+            while (more == 1) {
+                let is i64 as bl = buf.buf_u8(&bf);
+                if (bl <= 0) { more = 0; }
+                else { cb.bytes_append(&comp, buf.buf_here(&bf), bl); buf.buf_skip(&bf, bl); }
+            }
+            let is cb.Bytes as idx = cb.bytes_new(iw * ih + 16);
+            lzw.lzw_gif_decode(comp.ptr, comp.len, mcs, &idx);
+            cb.bytes_free(&comp);
+            let is *u8 as ip2 = idx.ptr;
+
+            if (disp == 3) { mem.core.memcpy(saved, canvas, fsize); }
+
+            // Composite indices onto the canvas (respecting interlace + transparency).
+            let is i64 as s with mut = 0;
+            let is i64 as np with mut = 1;
+            if (interlace != 0) { np = 4; }
+            let is i64 as pass with mut = 0;
+            while (pass < np) {
+                let is i64 as start with mut = 0;
+                let is i64 as step with mut = 1;
+                if (interlace != 0) {
+                    if (pass == 0) { start = 0; step = 8; }
+                    if (pass == 1) { start = 4; step = 8; }
+                    if (pass == 2) { start = 2; step = 4; }
+                    if (pass == 3) { start = 1; step = 2; }
+                }
+                let is i64 as row with mut = start;
+                while (row < ih) {
+                    let is i64 as cy = top + row;
+                    let is i64 as x with mut = 0;
+                    while (x < iw) {
+                        let is i64 as v = cast(i64, ip2[s]);
+                        s = s + 1;
+                        let is i64 as skip with mut = 0;
+                        if (tflag != 0) { if (v == tindex) { skip = 1; } }
+                        if (skip == 0) {
+                            let is i64 as cx = left + x;
+                            if (cx >= 0) { if (cx < sw) { if (cy >= 0) { if (cy < sh) {
+                                let is i64 as r with mut = 0; let is i64 as g with mut = 0; let is i64 as b with mut = 0;
+                                if (v < tsz) { r = cast(i64, tab[v*3]); g = cast(i64, tab[v*3+1]); b = cast(i64, tab[v*3+2]); }
+                                let is i64 as bpos = (cy * sw + cx) * 4;
+                                canvas[bpos] = cast(u8, r); canvas[bpos+1] = cast(u8, g);
+                                canvas[bpos+2] = cast(u8, b); canvas[bpos+3] = cast(u8, 255);
+                            }}}}
+                        }
+                        x = x + 1;
+                    }
+                    row = row + step;
+                }
+                pass = pass + 1;
+            }
+            cb.bytes_free(&idx);
+
+            // Snapshot this frame, then apply disposal for the next.
+            mem.core.memcpy(cast(*u8, cast(i64, frames) + fi * fsize), canvas, fsize);
+            delays[fi] = delay;
+            fi = fi + 1;
+            if (disp == 2) {
+                let is i64 as ry with mut = 0;
+                while (ry < ih) {
+                    let is i64 as cy = top + ry;
+                    if (cy >= 0) { if (cy < sh) {
+                        let is i64 as rx with mut = 0;
+                        while (rx < iw) {
+                            let is i64 as cx = left + rx;
+                            if (cx >= 0) { if (cx < sw) {
+                                let is i64 as bpos = (cy * sw + cx) * 4;
+                                canvas[bpos]=cast(u8,0); canvas[bpos+1]=cast(u8,0); canvas[bpos+2]=cast(u8,0); canvas[bpos+3]=cast(u8,0);
+                            }}
+                            rx = rx + 1;
+                        }
+                    }}
+                    ry = ry + 1;
+                }
+            }
+            if (disp == 3) { mem.core.memcpy(canvas, saved, fsize); }
+            tflag = 0; tindex = 0 - 1; disp = 0; delay = 0;
+        } else { go = 0; }
+        } } }
+    }
+
+    out.width = sw; out.height = sh; out.count = count;
+    out.frames = cast(i64, frames); out.delays = cast(i64, delays);
+    mem.core.munmap(canvas, fsize);
+    mem.core.munmap(saved, fsize);
+    return 0;
 }
