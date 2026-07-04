@@ -19,7 +19,7 @@ in Pillow/giflib/libpng.
 | BMP  | yes | yes | uncompressed BI_RGB 24/32-bit, top-down & bottom-up |
 | PNM  | yes | yes | P1–P6 decode; P5/P6 encode; 8-bit samples |
 | TGA  | yes | yes | decode uncompressed+RLE 24/32/gray; encode uncompressed (no magic → decode when named) |
-| PNG  | yes | yes | 8-bit, colour types 0/2/3/4/6; all filters + per-row heuristic; non-interlaced |
+| PNG  | yes | yes | 8/16-bit, colour types 0/2/3/4/6, all filters, Adam7 interlace; encode 8-bit non-interlaced |
 | GIF  | yes | yes | decode first frame + de-interlace; encode exact-palette (≤256 colours) |
 | JPEG | yes | — | baseline (Huffman, 4:4:4/4:2:2/4:2:0), matches libjpeg within a few levels |
 | CSIF | yes | yes | native flagship — see below |

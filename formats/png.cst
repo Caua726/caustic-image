@@ -58,6 +58,12 @@ fn _type_is(t0 as i64, t1 as i64, t2 as i64, t3 as i64,
     return 1;
 }
 
+// Pixels of an Adam7 pass along one axis: ceil((total - start) / step), >= 0.
+fn _pass_dim(total as i64, start as i64, step as i64) as i64 {
+    if (start >= total) { return 0; }
+    return (total - start + step - 1) / step;
+}
+
 fn png_decode(src as *u8, src_len as i64, out as *image.Image) as i64 {
     let is buf.Buf as bf;
     buf.buf_init(&bf, src, src_len);
@@ -134,111 +140,156 @@ fn png_decode(src as *u8, src_len as i64, out as *image.Image) as i64 {
     }
 
     if (have_ihdr == 0) { cb.bytes_free(&idat); return errno.I_CORRUPT; }
-    if (interlace != 0) { cb.bytes_free(&idat); return errno.I_UNSUPPORTED; }   // Adam7 deferred
-    if (bitdepth != 8)  { cb.bytes_free(&idat); return errno.I_UNSUPPORTED; }   // 1/2/4/16 deferred
+    if (bitdepth != 8) { if (bitdepth != 16) { cb.bytes_free(&idat); return errno.I_UNSUPPORTED; } }  // 1/2/4 deferred
+    let is i64 as bps = bitdepth / 8;   // bytes per sample (1, or 2 for 16-bit)
 
-    // Raw (pre-output) channel count and destination format.
+    // Raw channel count.
     let is i64 as chan with mut = 0;
-    let is i64 as fmt with mut = 0;
-    if (colortype == 0) { chan = 1; fmt = pixfmt.FMT_GRAY8; }
-    else { if (colortype == 2) { chan = 3; fmt = pixfmt.FMT_RGB8; }
-    else { if (colortype == 3) { chan = 1; fmt = pixfmt.FMT_RGB8; if (has_trns == 1) { fmt = pixfmt.FMT_RGBA8; } }
-    else { if (colortype == 4) { chan = 2; fmt = pixfmt.FMT_GRAYA8; }
-    else { if (colortype == 6) { chan = 4; fmt = pixfmt.FMT_RGBA8; }
+    if (colortype == 0) { chan = 1; }
+    else { if (colortype == 2) { chan = 3; }
+    else { if (colortype == 3) { chan = 1; }
+    else { if (colortype == 4) { chan = 2; }
+    else { if (colortype == 6) { chan = 4; }
     else { cb.bytes_free(&idat); return errno.I_UNSUPPORTED; } }}}}
+
+    // Destination format.
+    let is i64 as fmt with mut = 0;
+    if (colortype == 3) {
+        if (bitdepth != 8) { cb.bytes_free(&idat); return errno.I_UNSUPPORTED; }   // palette is <=8-bit
+        fmt = pixfmt.FMT_RGB8; if (has_trns == 1) { fmt = pixfmt.FMT_RGBA8; }
+    } else {
+        if (bitdepth == 8) {
+            if (colortype == 0) { fmt = pixfmt.FMT_GRAY8; }
+            if (colortype == 2) { fmt = pixfmt.FMT_RGB8; }
+            if (colortype == 4) { fmt = pixfmt.FMT_GRAYA8; }
+            if (colortype == 6) { fmt = pixfmt.FMT_RGBA8; }
+        } else {
+            if (colortype == 0) { fmt = pixfmt.FMT_GRAY16; }
+            if (colortype == 2) { fmt = pixfmt.FMT_RGB16; }
+            if (colortype == 4) { fmt = pixfmt.FMT_GRAYA16; }
+            if (colortype == 6) { fmt = pixfmt.FMT_RGBA16; }
+        }
+    }
 
     let is i64 as dchk = image.image_check_dims(w, h, fmt);
     if (dchk < 0) { cb.bytes_free(&idat); return dchk; }
     if (colortype == 3) { if (plte_count < 1) { cb.bytes_free(&idat); return errno.I_CORRUPT; } }
 
-    let is i64 as bpp = chan;                 // filter left-offset (8-bit)
-    let is i64 as stride = w * bpp;           // decompressed bytes per scanline
-    let is i64 as full = 1 + stride;          // + filter-type byte
-    let is i64 as expect = full * h;
+    let is i64 as bpp = chan * bps;   // filter left-offset (bytes per pixel)
 
-    // Inflate the concatenated IDAT (a zlib stream) into filtered scanlines.
+    // Adam7 pass geometry (a single full-image "pass" when non-interlaced).
+    let is i64 as npass with mut = 1;
+    if (interlace == 1) { npass = 7; }
+    let is [7]i64 as pxs; let is [7]i64 as pys; let is [7]i64 as pxstep; let is [7]i64 as pystep;
+    pxs[0] = 0; pys[0] = 0; pxstep[0] = 1; pystep[0] = 1;
+    if (interlace == 1) {
+        pxs[0]=0; pys[0]=0; pxstep[0]=8; pystep[0]=8;
+        pxs[1]=4; pys[1]=0; pxstep[1]=8; pystep[1]=8;
+        pxs[2]=0; pys[2]=4; pxstep[2]=4; pystep[2]=8;
+        pxs[3]=2; pys[3]=0; pxstep[3]=4; pystep[3]=4;
+        pxs[4]=0; pys[4]=2; pxstep[4]=2; pystep[4]=4;
+        pxs[5]=1; pys[5]=0; pxstep[5]=2; pystep[5]=2;
+        pxs[6]=0; pys[6]=1; pxstep[6]=1; pystep[6]=2;
+    }
+
+    // Expected decompressed size = Σ passes  ph*(1 + pw*bpp).
+    let is i64 as expect with mut = 0;
+    let is i64 as pc with mut = 0;
+    while (pc < npass) {
+        let is i64 as pw = _pass_dim(w, pxs[pc], pxstep[pc]);
+        let is i64 as ph = _pass_dim(h, pys[pc], pystep[pc]);
+        if (pw > 0) { if (ph > 0) { expect = expect + ph * (1 + pw * bpp); } }
+        pc = pc + 1;
+    }
+
     let is cb.Bytes as raw = cb.bytes_new(expect + 64);
     let is i64 as zr = zlib.zlib_decompress(idat.ptr, idat.len, &raw);
     cb.bytes_free(&idat);
     if (zr < 0) { cb.bytes_free(&raw); return errno.I_CORRUPT; }
     if (raw.len < expect) { cb.bytes_free(&raw); return errno.I_CORRUPT; }
 
-    // ---- unfilter in place (row references already-reconstructed bytes) ----
-    let is *u8 as rp = raw.ptr;
-    let is i64 as y with mut = 0;
-    while (y < h) {
-        let is i64 as rowstart = y * full;
-        let is i64 as ft = cast(i64, rp[rowstart]);
-        let is i64 as cur = rowstart + 1;                 // start of data bytes
-        let is i64 as prev = cur - full;                  // start of prev row's data
-        let is i64 as i with mut = 0;
-        while (i < stride) {
-            let is i64 as x = cast(i64, rp[cur + i]);
-            let is i64 as a with mut = 0;
-            if (i >= bpp) { a = cast(i64, rp[cur + i - bpp]); }
-            let is i64 as b with mut = 0;
-            if (y > 0) { b = cast(i64, rp[prev + i]); }
-            let is i64 as c with mut = 0;
-            if (y > 0) { if (i >= bpp) { c = cast(i64, rp[prev + i - bpp]); } }
-            let is i64 as recon with mut = x;
-            if (ft == 1) { recon = x + a; }
-            else { if (ft == 2) { recon = x + b; }
-            else { if (ft == 3) { recon = x + ((a + b) >> 1); }
-            else { if (ft == 4) { recon = x + _paeth(a, b, c); } } } }
-            rp[cur + i] = cast(u8, recon & 255);
-            i = i + 1;
-        }
-        y = y + 1;
-    }
-
-    // ---- materialise the Image ----
     let is i64 as rc = image.image_init(out, w, h, fmt);
     if (rc < 0) { cb.bytes_free(&raw); return rc; }
     let is *u8 as dst = out.pixels;
+    let is i64 as obpp = pixfmt.fmt_bpp(fmt);
+    let is *u8 as rp = raw.ptr;
 
-    if (colortype == 3) {
-        // Palette expansion (index -> RGB, plus alpha from tRNS).
-        let is i64 as obpp = pixfmt.fmt_bpp(fmt);
-        let is i64 as yy with mut = 0;
-        while (yy < h) {
-            let is i64 as srow = yy * full + 1;
-            let is i64 as drow = yy * out.stride;
-            let is i64 as x with mut = 0;
-            while (x < w) {
-                let is i64 as idx = cast(i64, rp[srow + x]);
-                let is i64 as r with mut = 0;
-                let is i64 as g with mut = 0;
-                let is i64 as b with mut = 0;
-                if (idx < plte_count) {
-                    r = cast(i64, plte_ptr[idx * 3]);
-                    g = cast(i64, plte_ptr[idx * 3 + 1]);
-                    b = cast(i64, plte_ptr[idx * 3 + 2]);
+    let is i64 as roff with mut = 0;
+    let is i64 as pass with mut = 0;
+    while (pass < npass) {
+        let is i64 as pw = _pass_dim(w, pxs[pass], pxstep[pass]);
+        let is i64 as ph = _pass_dim(h, pys[pass], pystep[pass]);
+        if (pw > 0) { if (ph > 0) {
+            let is i64 as stride = pw * bpp;
+            let is i64 as full = 1 + stride;
+            // unfilter this pass in place (row refs already-reconstructed bytes)
+            let is i64 as ry with mut = 0;
+            while (ry < ph) {
+                let is i64 as rowstart = roff + ry * full;
+                let is i64 as ft = cast(i64, rp[rowstart]);
+                let is i64 as cur = rowstart + 1;
+                let is i64 as prev = cur - full;
+                let is i64 as i with mut = 0;
+                while (i < stride) {
+                    let is i64 as xv = cast(i64, rp[cur + i]);
+                    let is i64 as a with mut = 0; if (i >= bpp) { a = cast(i64, rp[cur + i - bpp]); }
+                    let is i64 as b with mut = 0; if (ry > 0) { b = cast(i64, rp[prev + i]); }
+                    let is i64 as c with mut = 0; if (ry > 0) { if (i >= bpp) { c = cast(i64, rp[prev + i - bpp]); } }
+                    let is i64 as recon with mut = xv;
+                    if (ft == 1) { recon = xv + a; }
+                    else { if (ft == 2) { recon = xv + b; }
+                    else { if (ft == 3) { recon = xv + ((a + b) >> 1); }
+                    else { if (ft == 4) { recon = xv + _paeth(a, b, c); } } } }
+                    rp[cur + i] = cast(u8, recon & 255);
+                    i = i + 1;
                 }
-                let is i64 as di = drow + x * obpp;
-                dst[di] = cast(u8, r);
-                dst[di + 1] = cast(u8, g);
-                dst[di + 2] = cast(u8, b);
-                if (obpp == 4) {
-                    let is i64 as al with mut = 255;
-                    if (idx < trns_len) { al = cast(i64, trns_ptr[idx]); }
-                    dst[di + 3] = cast(u8, al);
-                }
-                x = x + 1;
+                ry = ry + 1;
             }
-            yy = yy + 1;
-        }
-    } else {
-        // Direct-copy formats: decompressed stride == output stride.
-        let is i64 as yy with mut = 0;
-        while (yy < h) {
-            let is i64 as srow = yy * full + 1;
-            let is *u8 as sptr = cast(*u8, cast(i64, rp) + srow);
-            let is *u8 as dptr = image.image_row(out, yy);
-            mem.core.memcpy(dptr, sptr, stride);
-            yy = yy + 1;
-        }
+            // scatter the pass's pixels to their interlaced positions
+            let is i64 as sy with mut = 0;
+            while (sy < ph) {
+                let is i64 as iy = pys[pass] + sy * pystep[pass];
+                let is i64 as srow = roff + sy * full + 1;
+                let is i64 as sx with mut = 0;
+                while (sx < pw) {
+                    let is i64 as ix = pxs[pass] + sx * pxstep[pass];
+                    let is i64 as sb = srow + sx * bpp;
+                    let is i64 as di = iy * out.stride + ix * obpp;
+                    if (colortype == 3) {
+                        let is i64 as idx = cast(i64, rp[sb]);
+                        let is i64 as r with mut = 0; let is i64 as g with mut = 0; let is i64 as b with mut = 0;
+                        if (idx < plte_count) {
+                            r = cast(i64, plte_ptr[idx * 3]);
+                            g = cast(i64, plte_ptr[idx * 3 + 1]);
+                            b = cast(i64, plte_ptr[idx * 3 + 2]);
+                        }
+                        dst[di] = cast(u8, r); dst[di + 1] = cast(u8, g); dst[di + 2] = cast(u8, b);
+                        if (obpp == 4) {
+                            let is i64 as al with mut = 255;
+                            if (idx < trns_len) { al = cast(i64, trns_ptr[idx]); }
+                            dst[di + 3] = cast(u8, al);
+                        }
+                    } else {
+                        if (bps == 1) {
+                            let is i64 as k with mut = 0;
+                            while (k < bpp) { dst[di + k] = rp[sb + k]; k = k + 1; }
+                        } else {
+                            let is i64 as k with mut = 0;
+                            while (k < chan) {
+                                dst[di + k * 2]     = rp[sb + k * 2 + 1];   // 16-bit BE -> native LE
+                                dst[di + k * 2 + 1] = rp[sb + k * 2];
+                                k = k + 1;
+                            }
+                        }
+                    }
+                    sx = sx + 1;
+                }
+                sy = sy + 1;
+            }
+            roff = roff + ph * full;
+        } }
+        pass = pass + 1;
     }
-
     cb.bytes_free(&raw);
     return 0;
 }

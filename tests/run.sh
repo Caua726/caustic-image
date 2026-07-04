@@ -40,6 +40,7 @@ run_case test_pnm            tests/test_pnm.cst
 run_case test_tga            tests/test_tga.cst
 run_case test_png            tests/test_png.cst
 run_case test_png_filters    tests/test_png_filters.cst
+run_case test_png_adv        tests/test_png_adv.cst
 run_case test_gif            tests/test_gif.cst
 run_case test_gif_interlace  tests/test_gif_interlace.cst
 run_case test_limit          tests/test_limit.cst
