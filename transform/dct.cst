@@ -20,6 +20,39 @@ fn dct_build_cx(cx as *i64) as void {
     cx[56]=5793; cx[57]=0-8035; cx[58]=7568; cx[59]=0-6811; cx[60]=5793; cx[61]=0-4551; cx[62]=3135; cx[63]=0-1598;
 }
 
+// Forward 8x8 DCT. `blk` = 64 level-shifted samples (natural order, already
+// -128, as i64); `coef` receives 64 integer coefficients (natural order). Same
+// Q13 constants and >>28 scaling as the inverse (round-half-up).
+fn fdct8x8(blk as *i64, cx as *i64, coef as *i64) as void {
+    let is [64]i64 as tmp;
+    // rows: tmp[y*8+u] = Σx blk[y*8+x] * cx[x*8+u]  (Q13)
+    let is i64 as y with mut = 0;
+    while (y < 8) {
+        let is i64 as u with mut = 0;
+        while (u < 8) {
+            let is i64 as s with mut = 0;
+            let is i64 as x with mut = 0;
+            while (x < 8) { s = s + blk[y * 8 + x] * cx[x * 8 + u]; x = x + 1; }
+            tmp[y * 8 + u] = s;
+            u = u + 1;
+        }
+        y = y + 1;
+    }
+    // columns: coef[v*8+u] = (Σy tmp[y*8+u] * cx[y*8+v]) >> 28  (round)
+    let is i64 as u2 with mut = 0;
+    while (u2 < 8) {
+        let is i64 as v with mut = 0;
+        while (v < 8) {
+            let is i64 as s with mut = 0;
+            let is i64 as yy with mut = 0;
+            while (yy < 8) { s = s + tmp[yy * 8 + u2] * cx[yy * 8 + v]; yy = yy + 1; }
+            coef[v * 8 + u2] = (s + 134217728) >> 28;
+            v = v + 1;
+        }
+        u2 = u2 + 1;
+    }
+}
+
 fn idct8x8(coef as *i64, cx as *i64, out64 as *u8) as void {
     let is [64]i64 as tmp;
     // rows: tmp[v*8+x] = Σu coef[v*8+u] * cx[x*8+u]   (Q13)

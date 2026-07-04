@@ -19,6 +19,7 @@ use "../core/pixfmt.cst" as pixfmt;
 use "../core/buf.cst"    as buf;
 use "../formats/qoi.cst" as qoi;
 use "modular.cst"        as modular;
+use "dctc.cst"           as dctc;
 use "errno.cst"          as ce;
 use "caustic-compact/core/bytes.cst"    as cb;
 use "caustic-compact/core/checksum.cst" as checksum;
@@ -106,7 +107,9 @@ fn _pl_icod(p as *cb.Bytes, codec_id as i64, ch as i64) as void {
     _w64(p, 0);      // item_id
     _w16(p, codec_id);
     _w16(p, 1);      // codec_version
-    _w8(p, 1);       // is_lossless
+    let is i64 as lossless with mut = 1;
+    if (codec_id == 3) { lossless = 0; }   // DCT is lossy
+    _w8(p, lossless);
     _w8(p, 0);       // color_transform NONE
     _w8(p, 0);       // supercompress_id
     _w8(p, 0);       // cross_tile_prediction
@@ -115,7 +118,7 @@ fn _pl_icod(p as *cb.Bytes, codec_id as i64, ch as i64) as void {
     _w32(p, 1); _w32(p, 1);        // n_resolution_levels, n_quality_layers
     _w32(p, 0);                    // progression_order NONE
     let is i64 as em with mut = 3;         // entropy_method_id: raw
-    if (codec_id == 2) { em = 0; }         // MODULAR uses rANS
+    if (codec_id >= 2) { em = 0; }         // MODULAR/DCT use rANS
     _w16(p, em);
     _w8(p, 0);                     // sub_image_count
     _w8(p, 0);                     // reserved0
@@ -126,11 +129,13 @@ fn _pl_icod(p as *cb.Bytes, codec_id as i64, ch as i64) as void {
         if (ch == 4) { has_alpha = 1; }
         _w8(p, has_alpha); _w8(p, 0); _w16(p, 0);
     } else {
-        if (codec_id == 2) {
-            _w32(p, 0);            // MODULAR-lite: no params (MED predictor + rANS)
-        } else {
-            _w32(p, 8);            // RAW params_length
-            _w8(p, 1); _w8(p, 0); _w8(p, 1); _wz(p, 5);
+        if (codec_id == 2) { _w32(p, 0); }         // MODULAR-lite: no params
+        else {
+            if (codec_id == 3) { _w32(p, 0); }     // DCT-lite: fixed quant, no params
+            else {
+                _w32(p, 8);        // RAW params_length
+                _w8(p, 1); _w8(p, 0); _w8(p, 1); _wz(p, 5);
+            }
         }
     }
 }
@@ -146,8 +151,12 @@ fn _pl_idat(p as *cb.Bytes, img as *image.Image, codec_id as i64, ch as i64) as 
         if (codec_id == 2) {
             modular.modular_encode(img, p);
         } else {
-            // RAW codec bytes: interleaved UINT8 pixels, contiguous.
-            cb.bytes_append(p, img.pixels, img.stride * img.height);
+            if (codec_id == 3) {
+                dctc.dct_encode(img, p);
+            } else {
+                // RAW codec bytes: interleaved UINT8 pixels, contiguous.
+                cb.bytes_append(p, img.pixels, img.stride * img.height);
+            }
         }
     }
 }
@@ -379,7 +388,7 @@ fn csif_decode(src as *u8, len as i64, out as *image.Image) as i64 {
     buf.buf_seek(&bf, icod_off);
     buf.buf_u64le(&bf);                       // item_id
     let is i64 as codec_id = buf.buf_u16le(&bf);
-    if (codec_id != 0) { if (codec_id != 1) { if (codec_id != 2) { return ce.E_CSIF_UNKNOWN_CODEC; } } }
+    if (codec_id != 0) { if (codec_id != 1) { if (codec_id != 2) { if (codec_id != 3) { return ce.E_CSIF_UNKNOWN_CODEC; } } } }
     if (codec_id == 1) { if (component_count != 3) { if (component_count != 4) { return ce.E_CSIF_UNSUPPORTED_SAMPLE; } } }
 
     // Resolve the pixel format from color_model + component_count.
@@ -410,8 +419,13 @@ fn csif_decode(src as *u8, len as i64, out as *image.Image) as i64 {
             let is i64 as qr = qoi.qoi_tile_decode(codbytes, codlen, w * h, component_count, out.pixels);
             if (qr < 0) { image.image_free(out); return ce.E_CSIF_PAYLOAD_TRUNC; }
         } else {
-            let is i64 as mr = modular.modular_decode(codbytes, codlen, w, h, component_count, out.pixels);
-            if (mr < 0) { image.image_free(out); return ce.E_CSIF_PAYLOAD_TRUNC; }
+            if (codec_id == 2) {
+                let is i64 as mr = modular.modular_decode(codbytes, codlen, w, h, component_count, out.pixels);
+                if (mr < 0) { image.image_free(out); return ce.E_CSIF_PAYLOAD_TRUNC; }
+            } else {
+                let is i64 as dr = dctc.dct_decode(codbytes, codlen, w, h, component_count, out.pixels);
+                if (dr < 0) { image.image_free(out); return ce.E_CSIF_PAYLOAD_TRUNC; }
+            }
         }
     }
     return 0;

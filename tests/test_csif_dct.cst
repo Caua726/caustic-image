@@ -1,0 +1,54 @@
+// test_csif_dct — the CSIF DCT codec (lossy) reconstructs a smooth image
+// within a bounded error and compresses well below RAW.
+use "../core/image.cst"  as image;
+use "../core/pixfmt.cst" as pixfmt;
+use "../csif/container.cst" as csif;
+use "caustic-compact/core/bytes.cst" as cb;
+
+fn main() as i64 {
+    let is i64 as w = 48;
+    let is i64 as h = 40;
+    let is image.Image as a;
+    if (image.image_init(&a, w, h, pixfmt.FMT_RGB8) != 0) { return 1; }
+    let is *u8 as p = a.pixels;
+    let is i64 as y with mut = 0;
+    while (y < h) {
+        let is i64 as x with mut = 0;
+        while (x < w) {
+            let is i64 as di = (y * w + x) * 3;
+            p[di]     = cast(u8, 30 + (x + y) * 2);   // smooth, no 8-bit wrap
+            p[di + 1] = cast(u8, 20 + x * 3);
+            p[di + 2] = cast(u8, 25 + y * 4);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+
+    let is cb.Bytes as e = cb.bytes_new(4096);
+    if (csif.csif_encode_ex(&a, &e, 3) < 0) { return 2; }
+    let is image.Image as b;
+    if (csif.csif_decode(e.ptr, e.len, &b) < 0) { return 3; }
+    if (b.width != w) { return 4; }
+    if (b.fmt != pixfmt.FMT_RGB8) { return 5; }
+
+    // Bounded reconstruction error (lossy).
+    let is i64 as n = w * h * 3;
+    let is i64 as i with mut = 0;
+    let is i64 as maxd with mut = 0;
+    while (i < n) {
+        let is i64 as d with mut = cast(i64, a.pixels[i]) - cast(i64, b.pixels[i]);
+        if (d < 0) { d = 0 - d; }
+        if (d > maxd) { maxd = d; }
+        i = i + 1;
+    }
+    if (maxd > 20) { return 100 + maxd; }
+
+    // Must compress well below RAW.
+    let is cb.Bytes as e_raw = cb.bytes_new(4096);
+    csif.csif_encode_ex(&a, &e_raw, 0);
+    if (e.len >= e_raw.len) { return 6; }
+
+    cb.bytes_free(&e); cb.bytes_free(&e_raw);
+    image.image_free(&a); image.image_free(&b);
+    return 0;
+}

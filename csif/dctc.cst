@@ -1,0 +1,193 @@
+// =======================================================
+// caustic-image/csif/dctc.cst
+// CSIF codec 3 — DCT (lossy). Per channel, per 8x8 block: level-shift, forward
+// DCT (shared toolkit), quantize by a fixed table (JPEG luma, natural order),
+// zigzag, DC-difference; the quantized coefficients are zigzag-signed +
+// LEB128-packed and entropy-coded by the shared rANS. Decode dequantizes and
+// runs the inverse DCT. 8-bit channels, single tile.
+//
+// Honest scope: fixed quality/quant table, one table for all channels, no
+// chroma transform. Adaptive quant, RDO, and per-channel tables come later.
+//   dct_encode(img, out) -> 0, or negative.
+//   dct_decode(src, len, w, h, channels, out_pixels) -> 0, or negative.
+// =======================================================
+
+use "std/mem.cst" only bins, core as mem;
+use "../core/errno.cst"  as errno;
+use "../core/image.cst"  as image;
+use "../core/pixfmt.cst" as pixfmt;
+use "../transform/dct.cst" as dct;
+use "caustic-compact/entropy/rans.cst" as rans;
+use "caustic-compact/core/bytes.cst"   as cb;
+
+fn _build_q(q as *i64) as void {
+    q[0]=16;q[1]=11;q[2]=10;q[3]=16;q[4]=24;q[5]=40;q[6]=51;q[7]=61;
+    q[8]=12;q[9]=12;q[10]=14;q[11]=19;q[12]=26;q[13]=58;q[14]=60;q[15]=55;
+    q[16]=14;q[17]=13;q[18]=16;q[19]=24;q[20]=40;q[21]=57;q[22]=69;q[23]=56;
+    q[24]=14;q[25]=17;q[26]=22;q[27]=29;q[28]=51;q[29]=87;q[30]=80;q[31]=62;
+    q[32]=18;q[33]=22;q[34]=37;q[35]=56;q[36]=68;q[37]=109;q[38]=103;q[39]=77;
+    q[40]=24;q[41]=35;q[42]=55;q[43]=64;q[44]=81;q[45]=104;q[46]=113;q[47]=92;
+    q[48]=49;q[49]=64;q[50]=78;q[51]=87;q[52]=103;q[53]=121;q[54]=120;q[55]=101;
+    q[56]=72;q[57]=92;q[58]=95;q[59]=98;q[60]=112;q[61]=100;q[62]=103;q[63]=99;
+}
+
+fn _build_zz(zz as *i64) as void {
+    let is *u8 as z with imut = "\x00\x01\x08\x10\x09\x02\x03\x0a\x11\x18\x20\x19\x12\x0b\x04\x05\x0c\x13\x1a\x21\x28\x30\x29\x22\x1b\x14\x0d\x06\x07\x0e\x15\x1c\x23\x2a\x31\x38\x39\x32\x2b\x24\x1d\x16\x0f\x17\x1e\x25\x2c\x33\x3a\x3b\x34\x2d\x26\x1f\x27\x2e\x35\x3c\x3d\x36\x2f\x37\x3e\x3f";
+    let is i64 as i with mut = 0;
+    while (i < 64) { zz[i] = cast(i64, z[i]); i = i + 1; }
+}
+
+fn _quant(f as i64, q as i64) as i64 {
+    if (f >= 0) { return (f + (q >> 1)) / q; }
+    return 0 - (((0 - f) + (q >> 1)) / q);
+}
+fn _zu(v as i64) as i64 { return (v << 1) ^ (v >> 63); }        // signed -> unsigned zigzag
+fn _uz(u as i64) as i64 { return (u >> 1) ^ (0 - (u & 1)); }    // inverse
+
+fn _leb(out as *cb.Bytes, u as i64) as void {
+    let is i64 as x with mut = u;
+    while (x >= 128) { cb.bytes_push(out, cast(u8, (x & 127) | 128)); x = x >> 7; }
+    cb.bytes_push(out, cast(u8, x));
+}
+// LEB128 read at position pos[0]; advances pos[0].
+fn _unleb(buf as *u8, pos as *i64) as i64 {
+    let is i64 as result with mut = 0;
+    let is i64 as shift with mut = 0;
+    let is i64 as go with mut = 1;
+    while (go == 1) {
+        let is i64 as b = cast(i64, buf[pos[0]]);
+        pos[0] = pos[0] + 1;
+        result = result | ((b & 127) << shift);
+        if ((b & 128) == 0) { go = 0; }
+        shift = shift + 7;
+    }
+    return result;
+}
+
+fn _w32(o as *cb.Bytes, v as i64) as void {
+    cb.bytes_push(o, cast(u8, v & 255)); cb.bytes_push(o, cast(u8, (v >> 8) & 255));
+    cb.bytes_push(o, cast(u8, (v >> 16) & 255)); cb.bytes_push(o, cast(u8, (v >> 24) & 255));
+}
+
+fn _channels(fmt as i64) as i64 {
+    if (fmt == pixfmt.FMT_GRAY8)  { return 1; }
+    if (fmt == pixfmt.FMT_GRAYA8) { return 2; }
+    if (fmt == pixfmt.FMT_RGB8)   { return 3; }
+    if (fmt == pixfmt.FMT_RGBA8)  { return 4; }
+    return 0;
+}
+
+fn dct_encode(img as *image.Image, out as *cb.Bytes) as i64 {
+    let is i64 as ch = _channels(img.fmt);
+    if (ch == 0) { return errno.I_UNSUPPORTED; }
+    let is i64 as w = img.width;
+    let is i64 as h = img.height;
+    let is [64]i64 as cx; dct.dct_build_cx(cast(*i64, &cx));
+    let is [64]i64 as q;  _build_q(cast(*i64, &q));
+    let is [64]i64 as zz; _build_zz(cast(*i64, &zz));
+
+    let is i64 as bxn = (w + 7) / 8;
+    let is i64 as byn = (h + 7) / 8;
+    let is *u8 as px = img.pixels;
+    let is cb.Bytes as coefb = cb.bytes_new(4096);
+    let is [4]i64 as prevdc; let is i64 as pi with mut = 0; while (pi < 4) { prevdc[pi] = 0; pi = pi + 1; }
+
+    let is i64 as c with mut = 0;
+    while (c < ch) {
+        let is i64 as by with mut = 0;
+        while (by < byn) {
+            let is i64 as bx with mut = 0;
+            while (bx < bxn) {
+                let is [64]i64 as blk;
+                let is i64 as yy with mut = 0;
+                while (yy < 8) {
+                    let is i64 as xx with mut = 0;
+                    while (xx < 8) {
+                        let is i64 as sx with mut = bx * 8 + xx; if (sx >= w) { sx = w - 1; }
+                        let is i64 as sy with mut = by * 8 + yy; if (sy >= h) { sy = h - 1; }
+                        blk[yy * 8 + xx] = cast(i64, px[(sy * w + sx) * ch + c]) - 128;
+                        xx = xx + 1;
+                    }
+                    yy = yy + 1;
+                }
+                let is [64]i64 as F; dct.fdct8x8(cast(*i64, &blk), cast(*i64, &cx), cast(*i64, &F));
+                // quantize (natural) then walk in zigzag order, DC-difference
+                let is i64 as i with mut = 0;
+                while (i < 64) {
+                    let is i64 as nat = zz[i];
+                    let is i64 as qv with mut = _quant(F[nat], q[nat]);
+                    if (i == 0) { let is i64 as d = qv - prevdc[c]; prevdc[c] = qv; qv = d; }
+                    _leb(&coefb, _zu(qv));
+                    i = i + 1;
+                }
+                bx = bx + 1;
+            }
+            by = by + 1;
+        }
+        c = c + 1;
+    }
+
+    _w32(out, coefb.len);
+    let is i64 as rc = rans.rans_encode(coefb.ptr, coefb.len, out);
+    cb.bytes_free(&coefb);
+    if (rc < 0) { return errno.I_OOM; }
+    return 0;
+}
+
+fn dct_decode(src as *u8, len as i64, w as i64, h as i64, ch as i64, out as *u8) as i64 {
+    if (len < 4) { return errno.I_CORRUPT; }
+    let is i64 as sym_count = cast(i64, src[0]) | (cast(i64, src[1]) << 8)
+        | (cast(i64, src[2]) << 16) | (cast(i64, src[3]) << 24);
+    let is *u8 as dec = mem.core.mmap_anon(sym_count + 1);
+    if (cast(i64, dec) <= 0) { return errno.I_OOM; }
+    if (rans.rans_decode(cast(*u8, cast(i64, src) + 4), len - 4, sym_count, dec) < 0) {
+        mem.core.munmap(dec, sym_count + 1); return errno.I_CORRUPT;
+    }
+
+    let is [64]i64 as cx; dct.dct_build_cx(cast(*i64, &cx));
+    let is [64]i64 as q;  _build_q(cast(*i64, &q));
+    let is [64]i64 as zz; _build_zz(cast(*i64, &zz));
+    let is i64 as bxn = (w + 7) / 8;
+    let is i64 as byn = (h + 7) / 8;
+    let is [4]i64 as prevdc; let is i64 as pj with mut = 0; while (pj < 4) { prevdc[pj] = 0; pj = pj + 1; }
+    let is [1]i64 as posv; posv[0] = 0;
+    let is *i64 as pos = cast(*i64, &posv);
+
+    let is i64 as c with mut = 0;
+    while (c < ch) {
+        let is i64 as by with mut = 0;
+        while (by < byn) {
+            let is i64 as bx with mut = 0;
+            while (bx < bxn) {
+                let is [64]i64 as F; let is i64 as z with mut = 0; while (z < 64) { F[z] = 0; z = z + 1; }
+                let is i64 as i with mut = 0;
+                while (i < 64) {
+                    let is i64 as qv with mut = _uz(_unleb(dec, pos));
+                    if (i == 0) { qv = qv + prevdc[c]; prevdc[c] = qv; }
+                    let is i64 as nat = zz[i];
+                    F[nat] = qv * q[nat];
+                    i = i + 1;
+                }
+                let is [64]u8 as blk; dct.idct8x8(cast(*i64, &F), cast(*i64, &cx), cast(*u8, &blk));
+                let is i64 as yy with mut = 0;
+                while (yy < 8) {
+                    let is i64 as dy = by * 8 + yy;
+                    if (dy < h) {
+                        let is i64 as xx with mut = 0;
+                        while (xx < 8) {
+                            let is i64 as dx = bx * 8 + xx;
+                            if (dx < w) { out[(dy * w + dx) * ch + c] = blk[yy * 8 + xx]; }
+                            xx = xx + 1;
+                        }
+                    }
+                    yy = yy + 1;
+                }
+                bx = bx + 1;
+            }
+            by = by + 1;
+        }
+        c = c + 1;
+    }
+    mem.core.munmap(dec, sym_count + 1);
+    return 0;
+}
