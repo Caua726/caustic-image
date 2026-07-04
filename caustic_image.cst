@@ -24,6 +24,8 @@ use "formats/tga.cst"  as tga;
 use "formats/qoi.cst"  as qoi;
 use "formats/gif.cst"  as gif;
 use "formats/png.cst"  as png;
+use "formats/jpeg.cst" as jpeg;
+use "transform/dct.cst" as dct;
 use "csif/errno.cst"     as csif_errno;
 use "csif/container.cst" as csif;
 use "decode.cst"       as decode;

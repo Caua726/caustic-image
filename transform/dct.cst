@@ -1,0 +1,60 @@
+// =======================================================
+// caustic-image/transform/dct.cst
+// 8x8 inverse DCT, fixed-point (Q13 cosine constants), separable (rows then
+// columns). Shared by the JPEG decoder and (later) the CSIF DCT codec.
+//   dct_build_cx(cx)          — fill the 64-entry constant table once.
+//   idct8x8(coef, cx, out64)  — coef: 64 dequantized coefficients (natural
+//                               order, v*8+u); out64: 64 clamped u8 samples.
+// The forward transform's 1/4 scaling and the two Q13 factors combine to a
+// single >>28 with round-half-up, then a +128 level shift and 0..255 clamp.
+// =======================================================
+
+fn dct_build_cx(cx as *i64) as void {
+    cx[0]=5793; cx[1]=8035; cx[2]=7568; cx[3]=6811; cx[4]=5793; cx[5]=4551; cx[6]=3135; cx[7]=1598;
+    cx[8]=5793; cx[9]=6811; cx[10]=3135; cx[11]=0-1598; cx[12]=0-5793; cx[13]=0-8035; cx[14]=0-7568; cx[15]=0-4551;
+    cx[16]=5793; cx[17]=4551; cx[18]=0-3135; cx[19]=0-8035; cx[20]=0-5793; cx[21]=1598; cx[22]=7568; cx[23]=6811;
+    cx[24]=5793; cx[25]=1598; cx[26]=0-7568; cx[27]=0-4551; cx[28]=5793; cx[29]=6811; cx[30]=0-3135; cx[31]=0-8035;
+    cx[32]=5793; cx[33]=0-1598; cx[34]=0-7568; cx[35]=4551; cx[36]=5793; cx[37]=0-6811; cx[38]=0-3135; cx[39]=8035;
+    cx[40]=5793; cx[41]=0-4551; cx[42]=0-3135; cx[43]=8035; cx[44]=0-5793; cx[45]=0-1598; cx[46]=7568; cx[47]=0-6811;
+    cx[48]=5793; cx[49]=0-6811; cx[50]=3135; cx[51]=1598; cx[52]=0-5793; cx[53]=8035; cx[54]=0-7568; cx[55]=4551;
+    cx[56]=5793; cx[57]=0-8035; cx[58]=7568; cx[59]=0-6811; cx[60]=5793; cx[61]=0-4551; cx[62]=3135; cx[63]=0-1598;
+}
+
+fn idct8x8(coef as *i64, cx as *i64, out64 as *u8) as void {
+    let is [64]i64 as tmp;
+    // rows: tmp[v*8+x] = Σu coef[v*8+u] * cx[x*8+u]   (Q13)
+    let is i64 as v with mut = 0;
+    while (v < 8) {
+        let is i64 as x with mut = 0;
+        while (x < 8) {
+            let is i64 as s with mut = 0;
+            let is i64 as u with mut = 0;
+            while (u < 8) {
+                s = s + coef[v * 8 + u] * cx[x * 8 + u];
+                u = u + 1;
+            }
+            tmp[v * 8 + x] = s;
+            x = x + 1;
+        }
+        v = v + 1;
+    }
+    // columns: g = Σv tmp[v*8+x] * cx[y*8+v]  (Q26); sample = (g>>28 rounded) + 128
+    let is i64 as x2 with mut = 0;
+    while (x2 < 8) {
+        let is i64 as y with mut = 0;
+        while (y < 8) {
+            let is i64 as s with mut = 0;
+            let is i64 as vv with mut = 0;
+            while (vv < 8) {
+                s = s + tmp[vv * 8 + x2] * cx[y * 8 + vv];
+                vv = vv + 1;
+            }
+            let is i64 as val with mut = ((s + 134217728) >> 28) + 128;   // +1<<27 round
+            if (val < 0) { val = 0; }
+            if (val > 255) { val = 255; }
+            out64[y * 8 + x2] = cast(u8, val);
+            y = y + 1;
+        }
+        x2 = x2 + 1;
+    }
+}
