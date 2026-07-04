@@ -1,0 +1,104 @@
+// test_ops — property tests for the image operations:
+// flips/rotations are involutions, crop matches direct indexing, conversions
+// through wider forms are exact, same-size resizes are identity, and nearest
+// 2x up + 2x down round-trips.
+use "../core/image.cst"  as image;
+use "../core/pixfmt.cst" as pixfmt;
+use "../ops/ops.cst"     as ops;
+use "rt.cst" as rt;
+
+fn eq(a as *image.Image, b as *image.Image) as i64 { return rt.pixels_equal(a, b); }
+
+fn main() as i64 {
+    let is image.Image as a;
+    if (rt.make_image(&a, 11, 7, pixfmt.FMT_RGBA8) != 0) { return 1; }
+
+    // flip_h twice = identity
+    let is image.Image as f1; let is image.Image as f2;
+    ops.op_flip_h(&a, &f1); ops.op_flip_h(&f1, &f2);
+    if (eq(&a, &f2) != 0) { return 10; }
+    image.image_free(&f1); image.image_free(&f2);
+
+    // flip_v twice = identity
+    ops.op_flip_v(&a, &f1); ops.op_flip_v(&f1, &f2);
+    if (eq(&a, &f2) != 0) { return 11; }
+    image.image_free(&f1); image.image_free(&f2);
+
+    // rotate 90 then 270 = identity; rotate 180 twice = identity
+    ops.op_rotate(&a, 1, &f1); ops.op_rotate(&f1, 3, &f2);
+    if (eq(&a, &f2) != 0) { return 12; }
+    if (f1.width != a.height) { return 13; }
+    image.image_free(&f1); image.image_free(&f2);
+    ops.op_rotate(&a, 2, &f1); ops.op_rotate(&f1, 2, &f2);
+    if (eq(&a, &f2) != 0) { return 14; }
+    image.image_free(&f1); image.image_free(&f2);
+
+    // crop matches direct indexing
+    let is image.Image as cr;
+    if (ops.op_crop(&a, 3, 2, 5, 4, &cr) != 0) { return 20; }
+    let is i64 as y with mut = 0;
+    while (y < 4) {
+        let is i64 as x with mut = 0;
+        while (x < 5) {
+            let is i64 as so = (y + 2) * a.stride + (x + 3) * 4;
+            let is i64 as db = y * cr.stride + x * 4;
+            let is i64 as c with mut = 0;
+            while (c < 4) {
+                if (a.pixels[so + c] != cr.pixels[db + c]) { return 21; }
+                c = c + 1;
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    image.image_free(&cr);
+    // out-of-bounds crop is rejected
+    if (ops.op_crop(&a, 8, 0, 5, 4, &cr) >= 0) { return 22; }
+
+    // conversions: RGBA8 -> RGB16 -> RGBA8? (drops alpha) — use RGB8 base
+    let is image.Image as rgb;
+    if (rt.make_image(&rgb, 9, 6, pixfmt.FMT_RGB8) != 0) { return 30; }
+    let is image.Image as c1; let is image.Image as c2;
+    ops.op_convert(&rgb, pixfmt.FMT_RGB16, &c1);   // 8 -> 16 (v*257)
+    ops.op_convert(&c1, pixfmt.FMT_RGB8, &c2);     // 16 -> 8 (high byte) — exact
+    if (eq(&rgb, &c2) != 0) { return 31; }
+    image.image_free(&c1); image.image_free(&c2);
+    // GRAY8 -> RGB8 -> GRAY8 exact (replicate then luma of equal channels)
+    let is image.Image as g;
+    if (rt.make_image(&g, 9, 6, pixfmt.FMT_GRAY8) != 0) { return 32; }
+    ops.op_convert(&g, pixfmt.FMT_RGB8, &c1);
+    ops.op_convert(&c1, pixfmt.FMT_GRAY8, &c2);
+    if (eq(&g, &c2) != 0) { return 33; }
+    image.image_free(&c1); image.image_free(&c2);
+
+    // same-size resizes are identity
+    ops.op_resize_nearest(&a, 11, 7, &f1);
+    if (eq(&a, &f1) != 0) { return 40; }
+    image.image_free(&f1);
+    ops.op_resize_bilinear(&a, 11, 7, &f1);
+    if (eq(&a, &f1) != 0) { return 41; }
+    image.image_free(&f1);
+
+    // nearest 2x up then 2x down = identity (even dims)
+    let is image.Image as e;
+    if (rt.make_image(&e, 8, 6, pixfmt.FMT_RGB8) != 0) { return 50; }
+    ops.op_resize_nearest(&e, 16, 12, &f1);
+    ops.op_resize_nearest(&f1, 8, 6, &f2);
+    if (eq(&e, &f2) != 0) { return 51; }
+    image.image_free(&f1); image.image_free(&f2);
+
+    // premultiply: (200, 100, 50, 128) -> (100, 50, 25, 128)
+    let is image.Image as pm;
+    if (image.image_init(&pm, 1, 1, pixfmt.FMT_RGBA8) != 0) { return 60; }
+    pm.pixels[0] = cast(u8, 200); pm.pixels[1] = cast(u8, 100);
+    pm.pixels[2] = cast(u8, 50);  pm.pixels[3] = cast(u8, 128);
+    ops.op_premultiply(&pm);
+    if (cast(i64, pm.pixels[0]) != 100) { return 61; }
+    if (cast(i64, pm.pixels[1]) != 50)  { return 62; }
+    if (cast(i64, pm.pixels[2]) != 25)  { return 63; }
+    if (cast(i64, pm.pixels[3]) != 128) { return 64; }
+    image.image_free(&pm);
+
+    image.image_free(&a); image.image_free(&rgb); image.image_free(&g); image.image_free(&e);
+    return 0;
+}

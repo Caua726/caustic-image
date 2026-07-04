@@ -1,0 +1,246 @@
+// =======================================================
+// caustic-image/ops/ops.cst
+// Core image operations: pixel-format conversion, crop, flips, quarter-turn
+// rotations, nearest + bilinear resize, and alpha premultiply. Every op writes
+// a fresh Image (the source is untouched) and validates geometry through the
+// same ILIM guard as the decoders.
+//
+// Channel model for conversion: pixels pass through a normalized 16-bit RGBA
+// working form. 8->16 replicates the byte (v*257); 16->8 takes the high byte.
+// RGB->gray uses integer BT.601 luma ((77r + 150g + 29b) >> 8).
+// =======================================================
+
+use "std/mem.cst" only bins, core as mem;
+use "../core/errno.cst"  as errno;
+use "../core/image.cst"  as image;
+use "../core/pixfmt.cst" as pixfmt;
+
+// Read pixel (x,y) as 16-bit r,g,b,a into px[0..3].
+fn _get(img as *image.Image, x as i64, y as i64, px as *i64) as void {
+    let is i64 as ch = pixfmt.fmt_channels(img.fmt);
+    let is i64 as dp = pixfmt.fmt_depth(img.fmt);
+    let is *u8 as p = img.pixels;
+    let is i64 as bpp = pixfmt.fmt_bpp(img.fmt);
+    let is i64 as o = y * img.stride + x * bpp;
+    let is [4]i64 as v;
+    let is i64 as i with mut = 0;
+    while (i < ch) {
+        if (dp == 8) { v[i] = cast(i64, p[o + i]) * 257; }
+        else { v[i] = cast(i64, p[o + i * 2]) | (cast(i64, p[o + i * 2 + 1]) << 8); }
+        i = i + 1;
+    }
+    // expand to rgba
+    if (ch == 1) { px[0] = v[0]; px[1] = v[0]; px[2] = v[0]; px[3] = 65535; }
+    else { if (ch == 2) { px[0] = v[0]; px[1] = v[0]; px[2] = v[0]; px[3] = v[1]; }
+    else { if (ch == 3) { px[0] = v[0]; px[1] = v[1]; px[2] = v[2]; px[3] = 65535; }
+    else { px[0] = v[0]; px[1] = v[1]; px[2] = v[2]; px[3] = v[3]; } } }
+}
+
+// Write 16-bit r,g,b,a px[0..3] into pixel (x,y) of img's format.
+fn _put(img as *image.Image, x as i64, y as i64, px as *i64) as void {
+    let is i64 as ch = pixfmt.fmt_channels(img.fmt);
+    let is i64 as dp = pixfmt.fmt_depth(img.fmt);
+    let is *u8 as p = img.pixels;
+    let is i64 as bpp = pixfmt.fmt_bpp(img.fmt);
+    let is i64 as o = y * img.stride + x * bpp;
+    let is [4]i64 as v;
+    // collapse from rgba
+    if (ch <= 2) { v[0] = (77 * px[0] + 150 * px[1] + 29 * px[2]) >> 8; v[1] = px[3]; }
+    else { v[0] = px[0]; v[1] = px[1]; v[2] = px[2]; v[3] = px[3]; }
+    let is i64 as i with mut = 0;
+    while (i < ch) {
+        if (dp == 8) { p[o + i] = cast(u8, v[i] >> 8); }
+        else { p[o + i * 2] = cast(u8, v[i] & 255); p[o + i * 2 + 1] = cast(u8, (v[i] >> 8) & 255); }
+        i = i + 1;
+    }
+}
+
+// Convert to another pixel format (any -> any of the FMT_* set).
+fn op_convert(src as *image.Image, fmt as i64, out as *image.Image) as i64 {
+    let is i64 as rc = image.image_init(out, src.width, src.height, fmt);
+    if (rc < 0) { return rc; }
+    let is [4]i64 as px;
+    let is *i64 as pp = cast(*i64, &px);
+    let is i64 as y with mut = 0;
+    while (y < src.height) {
+        let is i64 as x with mut = 0;
+        while (x < src.width) {
+            _get(src, x, y, pp);
+            _put(out, x, y, pp);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return 0;
+}
+
+// Crop the rectangle (cx, cy, cw, ch) — must lie inside the source.
+fn op_crop(src as *image.Image, cx as i64, cy as i64, cw as i64, chh as i64, out as *image.Image) as i64 {
+    if (cx < 0) { return errno.I_BADPARAM; }
+    if (cy < 0) { return errno.I_BADPARAM; }
+    if (cx + cw > src.width) { return errno.I_BADPARAM; }
+    if (cy + chh > src.height) { return errno.I_BADPARAM; }
+    let is i64 as rc = image.image_init(out, cw, chh, src.fmt);
+    if (rc < 0) { return rc; }
+    let is i64 as bpp = pixfmt.fmt_bpp(src.fmt);
+    let is i64 as y with mut = 0;
+    while (y < chh) {
+        mem.core.memcpy(image.image_row(out, y),
+            cast(*u8, cast(i64, src.pixels) + (cy + y) * src.stride + cx * bpp),
+            cw * bpp);
+        y = y + 1;
+    }
+    return 0;
+}
+
+fn op_flip_h(src as *image.Image, out as *image.Image) as i64 {
+    let is i64 as rc = image.image_init(out, src.width, src.height, src.fmt);
+    if (rc < 0) { return rc; }
+    let is i64 as bpp = pixfmt.fmt_bpp(src.fmt);
+    let is i64 as y with mut = 0;
+    while (y < src.height) {
+        let is i64 as x with mut = 0;
+        while (x < src.width) {
+            mem.core.memcpy(
+                cast(*u8, cast(i64, out.pixels) + y * out.stride + (src.width - 1 - x) * bpp),
+                cast(*u8, cast(i64, src.pixels) + y * src.stride + x * bpp),
+                bpp);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return 0;
+}
+
+fn op_flip_v(src as *image.Image, out as *image.Image) as i64 {
+    let is i64 as rc = image.image_init(out, src.width, src.height, src.fmt);
+    if (rc < 0) { return rc; }
+    let is i64 as y with mut = 0;
+    while (y < src.height) {
+        mem.core.memcpy(image.image_row(out, src.height - 1 - y),
+            image.image_row(src, y), src.stride);
+        y = y + 1;
+    }
+    return 0;
+}
+
+// Rotate by quarter turns: quarters = 1 (90° cw), 2 (180°), 3 (270° cw).
+fn op_rotate(src as *image.Image, quarters as i64, out as *image.Image) as i64 {
+    let is i64 as q = quarters & 3;
+    let is i64 as ow with mut = src.width;
+    let is i64 as oh with mut = src.height;
+    if ((q & 1) == 1) { ow = src.height; oh = src.width; }
+    let is i64 as rc = image.image_init(out, ow, oh, src.fmt);
+    if (rc < 0) { return rc; }
+    let is i64 as bpp = pixfmt.fmt_bpp(src.fmt);
+    let is i64 as y with mut = 0;
+    while (y < src.height) {
+        let is i64 as x with mut = 0;
+        while (x < src.width) {
+            let is i64 as dx with mut = x;
+            let is i64 as dy with mut = y;
+            if (q == 1) { dx = src.height - 1 - y; dy = x; }
+            else { if (q == 2) { dx = src.width - 1 - x; dy = src.height - 1 - y; }
+            else { if (q == 3) { dx = y; dy = src.width - 1 - x; } } }
+            mem.core.memcpy(
+                cast(*u8, cast(i64, out.pixels) + dy * out.stride + dx * bpp),
+                cast(*u8, cast(i64, src.pixels) + y * src.stride + x * bpp),
+                bpp);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return 0;
+}
+
+fn op_resize_nearest(src as *image.Image, nw as i64, nh as i64, out as *image.Image) as i64 {
+    if (nw < 1) { return errno.I_BADPARAM; }
+    if (nh < 1) { return errno.I_BADPARAM; }
+    let is i64 as rc = image.image_init(out, nw, nh, src.fmt);
+    if (rc < 0) { return rc; }
+    let is i64 as bpp = pixfmt.fmt_bpp(src.fmt);
+    let is i64 as y with mut = 0;
+    while (y < nh) {
+        let is i64 as sy = y * src.height / nh;
+        let is i64 as x with mut = 0;
+        while (x < nw) {
+            let is i64 as sx = x * src.width / nw;
+            mem.core.memcpy(
+                cast(*u8, cast(i64, out.pixels) + y * out.stride + x * bpp),
+                cast(*u8, cast(i64, src.pixels) + sy * src.stride + sx * bpp),
+                bpp);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return 0;
+}
+
+// Bilinear resize in 16.16 fixed point over the normalized RGBA form.
+fn op_resize_bilinear(src as *image.Image, nw as i64, nh as i64, out as *image.Image) as i64 {
+    if (nw < 1) { return errno.I_BADPARAM; }
+    if (nh < 1) { return errno.I_BADPARAM; }
+    let is i64 as rc = image.image_init(out, nw, nh, src.fmt);
+    if (rc < 0) { return rc; }
+    let is [4]i64 as p00; let is [4]i64 as p10; let is [4]i64 as p01; let is [4]i64 as p11;
+    let is [4]i64 as po;
+    // centre-aligned sampling: sx = (x + .5) * sw/nw - .5 in 16.16
+    let is i64 as xr = (src.width << 16) / nw;
+    let is i64 as yr = (src.height << 16) / nh;
+    let is i64 as y with mut = 0;
+    while (y < nh) {
+        let is i64 as fy with mut = ((y * 2 + 1) * yr - 65536) / 2;
+        if (fy < 0) { fy = 0; }
+        let is i64 as sy with mut = fy >> 16;
+        let is i64 as wy = fy & 65535;
+        if (sy > src.height - 1) { sy = src.height - 1; }
+        let is i64 as sy1 with mut = sy + 1;
+        if (sy1 > src.height - 1) { sy1 = src.height - 1; }
+        let is i64 as x with mut = 0;
+        while (x < nw) {
+            let is i64 as fx with mut = ((x * 2 + 1) * xr - 65536) / 2;
+            if (fx < 0) { fx = 0; }
+            let is i64 as sx with mut = fx >> 16;
+            let is i64 as wx = fx & 65535;
+            if (sx > src.width - 1) { sx = src.width - 1; }
+            let is i64 as sx1 with mut = sx + 1;
+            if (sx1 > src.width - 1) { sx1 = src.width - 1; }
+            _get(src, sx, sy, cast(*i64, &p00));
+            _get(src, sx1, sy, cast(*i64, &p10));
+            _get(src, sx, sy1, cast(*i64, &p01));
+            _get(src, sx1, sy1, cast(*i64, &p11));
+            let is i64 as c with mut = 0;
+            while (c < 4) {
+                let is i64 as top = p00[c] * (65536 - wx) + p10[c] * wx;      // 16.16 * 16-bit
+                let is i64 as bot = p01[c] * (65536 - wx) + p11[c] * wx;
+                po[c] = ((top >> 16) * (65536 - wy) + (bot >> 16) * wy + 32768) >> 16;
+                c = c + 1;
+            }
+            _put(out, x, y, cast(*i64, &po));
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return 0;
+}
+
+// Premultiply alpha in place (RGBA8 / GRAYA8; no-op for alphaless formats).
+fn op_premultiply(img as *image.Image) as i64 {
+    let is i64 as ch = pixfmt.fmt_channels(img.fmt);
+    if (ch != 2) { if (ch != 4) { return 0; } }
+    if (pixfmt.fmt_depth(img.fmt) != 8) { return errno.I_UNSUPPORTED; }
+    let is *u8 as p = img.pixels;
+    let is i64 as n = img.width * img.height;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is i64 as o = i * ch;
+        let is i64 as a = cast(i64, p[o + ch - 1]);
+        let is i64 as c with mut = 0;
+        while (c < ch - 1) {
+            p[o + c] = cast(u8, (cast(i64, p[o + c]) * a + 127) / 255);
+            c = c + 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
