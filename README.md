@@ -21,7 +21,24 @@ in Pillow/giflib/libpng.
 | TGA  | yes | yes | decode uncompressed+RLE 24/32/gray; encode uncompressed (no magic → decode when named) |
 | PNG  | yes | yes | 8-bit, colour types 0/2/3/4/6; all filters + per-row heuristic; non-interlaced |
 | GIF  | yes | yes | decode first frame + de-interlace; encode exact-palette (≤256 colours) |
-| JPEG / WebP / TIFF / AVIF / CSIF | — | — | later phases |
+| JPEG | yes | — | baseline (Huffman, 4:4:4/4:2:2/4:2:0), matches libjpeg within a few levels |
+| CSIF | yes | yes | native flagship — see below |
+| WebP / TIFF / AVIF | — | — | later phases |
+
+### CSIF (native flagship)
+
+A byte-exact container (64-byte header + CRC, chunk directory, TLV chunks with per-chunk CRC, mandatory
+ILIM resource limits, IHDR geometry, ICOL/CICP colour with "Unspecified" banned) carrying a codec registry:
+
+| Codec | Kind | Notes |
+|---|---|---|
+| RAW (0)     | lossless | identity |
+| QOI (1)     | lossless | the QOI op-stream as a tile codec |
+| MODULAR (2) | lossless | subtract-green + MED predictor + rANS entropy |
+| DCT (3)     | lossy    | forward DCT + quantise + rANS |
+
+Decode is fail-loud: bad magic/CRC/geometry/colour/codec each return a distinct numbered error
+(exercised by a corruption corpus). rANS lives in `caustic-compact/entropy`.
 
 Every decoder validates dimensions in widened arithmetic **before allocating** (`image_check_dims`,
 the ILIM posture), so a malformed header can never trigger an allocation overflow.
