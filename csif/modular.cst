@@ -1,0 +1,113 @@
+// =======================================================
+// caustic-image/csif/modular.cst
+// CSIF codec 2 — MODULAR (lossless), lite subset: a per-channel MED predictor
+// (LOCO-I / JPEG-LS median) over already-reconstructed causal neighbours, with
+// the wrapped residual stream entropy-coded by the shared rANS substrate
+// (caustic-compact/entropy). 8-bit channels, single tile.
+//
+// Honest scope: this implements predict + entropy. The full MODULAR (reversible
+// colour transforms, palette, Squeeze, MA decision tree, LZ layer, near-lossless)
+// is sequenced for later — codec_version 1 declares this subset.
+//
+//   modular_encode(img, out) -> 0, or negative.
+//   modular_decode(src, len, w, h, channels, out_pixels) -> 0, or negative.
+// =======================================================
+
+use "std/mem.cst" only bins, core as mem;
+use "../core/errno.cst"  as errno;
+use "../core/image.cst"  as image;
+use "../core/pixfmt.cst" as pixfmt;
+use "caustic-compact/entropy/rans.cst" as rans;
+use "caustic-compact/core/bytes.cst"   as cb;
+
+// MED / LOCO-I median predictor over left(a) up(b) up-left(c).
+fn _med(a as i64, b as i64, c as i64) as i64 {
+    let is i64 as mx with mut = a; if (b > a) { mx = b; }
+    let is i64 as mn with mut = a; if (b < a) { mn = b; }
+    if (c >= mx) { return mn; }
+    if (c <= mn) { return mx; }
+    return a + b - c;
+}
+
+fn _channels(fmt as i64) as i64 {
+    if (fmt == pixfmt.FMT_GRAY8)  { return 1; }
+    if (fmt == pixfmt.FMT_GRAYA8) { return 2; }
+    if (fmt == pixfmt.FMT_RGB8)   { return 3; }
+    if (fmt == pixfmt.FMT_RGBA8)  { return 4; }
+    return 0;
+}
+
+fn modular_encode(img as *image.Image, out as *cb.Bytes) as i64 {
+    let is i64 as ch = _channels(img.fmt);
+    if (ch == 0) { return errno.I_UNSUPPORTED; }
+    let is i64 as w = img.width;
+    let is i64 as h = img.height;
+    let is i64 as rowb = w * ch;
+    let is i64 as n = ch * w * h;
+    let is *u8 as syms = mem.core.mmap_anon(n + 1);
+    if (cast(i64, syms) <= 0) { return errno.I_OOM; }
+    let is *u8 as px = img.pixels;
+
+    let is i64 as idx with mut = 0;
+    let is i64 as c with mut = 0;
+    while (c < ch) {
+        let is i64 as y with mut = 0;
+        while (y < h) {
+            let is i64 as x with mut = 0;
+            while (x < w) {
+                let is i64 as base = (y * w + x) * ch + c;
+                let is i64 as a with mut = 0;
+                if (x > 0) { a = cast(i64, px[base - ch]); }
+                let is i64 as b with mut = 0;
+                if (y > 0) { b = cast(i64, px[base - rowb]); }
+                let is i64 as ul with mut = 0;
+                if (x > 0) { if (y > 0) { ul = cast(i64, px[base - rowb - ch]); } }
+                let is i64 as pred = _med(a, b, ul);
+                syms[idx] = cast(u8, (cast(i64, px[base]) - pred) & 255);
+                idx = idx + 1;
+                x = x + 1;
+            }
+            y = y + 1;
+        }
+        c = c + 1;
+    }
+
+    let is i64 as rc = rans.rans_encode(syms, n, out);
+    mem.core.munmap(syms, n + 1);
+    if (rc < 0) { return errno.I_OOM; }
+    return 0;
+}
+
+fn modular_decode(src as *u8, len as i64, w as i64, h as i64, ch as i64, out as *u8) as i64 {
+    let is i64 as rowb = w * ch;
+    let is i64 as n = ch * w * h;
+    let is *u8 as syms = mem.core.mmap_anon(n + 1);
+    if (cast(i64, syms) <= 0) { return errno.I_OOM; }
+    if (rans.rans_decode(src, len, n, syms) < 0) { mem.core.munmap(syms, n + 1); return errno.I_CORRUPT; }
+
+    let is i64 as idx with mut = 0;
+    let is i64 as c with mut = 0;
+    while (c < ch) {
+        let is i64 as y with mut = 0;
+        while (y < h) {
+            let is i64 as x with mut = 0;
+            while (x < w) {
+                let is i64 as base = (y * w + x) * ch + c;
+                let is i64 as a with mut = 0;
+                if (x > 0) { a = cast(i64, out[base - ch]); }
+                let is i64 as b with mut = 0;
+                if (y > 0) { b = cast(i64, out[base - rowb]); }
+                let is i64 as ul with mut = 0;
+                if (x > 0) { if (y > 0) { ul = cast(i64, out[base - rowb - ch]); } }
+                let is i64 as pred = _med(a, b, ul);
+                out[base] = cast(u8, (pred + cast(i64, syms[idx])) & 255);
+                idx = idx + 1;
+                x = x + 1;
+            }
+            y = y + 1;
+        }
+        c = c + 1;
+    }
+    mem.core.munmap(syms, n + 1);
+    return 0;
+}

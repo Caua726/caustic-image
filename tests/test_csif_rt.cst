@@ -46,5 +46,21 @@ fn main() as i64 {
     if (roundtrip_codec(13, 9, pixfmt.FMT_RGB8, 1)  != 0) { return 70; }
     if (roundtrip_codec(13, 9, pixfmt.FMT_RGBA8, 1) != 0) { return 80; }
     if (roundtrip_codec(64, 48, pixfmt.FMT_RGB8, 1) != 0) { return 90; }
+    // MODULAR codec (MED predictor + rANS) — every 8-bit format.
+    if (roundtrip_codec(13, 9, pixfmt.FMT_RGB8, 2)   != 0) { return 100; }
+    if (roundtrip_codec(13, 9, pixfmt.FMT_RGBA8, 2)  != 0) { return 110; }
+    if (roundtrip_codec(13, 9, pixfmt.FMT_GRAY8, 2)  != 0) { return 120; }
+    if (roundtrip_codec(13, 9, pixfmt.FMT_GRAYA8, 2) != 0) { return 130; }
+    if (roundtrip_codec(20, 16, pixfmt.FMT_RGB8, 2)  != 0) { return 140; }
+
+    // MODULAR must beat RAW on a low-entropy image.
+    let is image.Image as ga;
+    if (rt.make_lowcolor(&ga, 40, 30) != 0) { return 150; }
+    let is cb.Bytes as e_raw = cb.bytes_new(4096);
+    let is cb.Bytes as e_mod = cb.bytes_new(4096);
+    csif.csif_encode_ex(&ga, &e_raw, 0);
+    csif.csif_encode_ex(&ga, &e_mod, 2);
+    if (e_mod.len >= e_raw.len) { return 160; }
+    cb.bytes_free(&e_raw); cb.bytes_free(&e_mod); image.image_free(&ga);
     return 0;
 }

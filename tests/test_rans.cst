@@ -1,0 +1,50 @@
+// test_rans — static rANS (caustic-compact) encode->decode must reproduce the
+// symbol stream exactly for skewed, near-uniform, constant, and tiny inputs;
+// and a skewed stream must actually shrink.
+use "std/mem.cst" only bins, core as mem;
+use "caustic-compact/entropy/rans.cst" as rans;
+use "caustic-compact/core/bytes.cst"   as cb;
+
+fn fill(syms as *u8, n as i64, kind as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is i64 as v with mut = 0;
+        if (kind == 0) { if ((i % 17) == 0) { v = i % 7; } else { v = 0; } }   // skewed
+        if (kind == 1) { v = (i * 13) & 255; }                                  // near-uniform
+        if (kind == 2) { v = 42; }                                             // constant
+        if (kind == 3) { if ((i & 1) == 0) { v = 3; } else { v = 200; } }      // two symbols
+        syms[i] = cast(u8, v);
+        i = i + 1;
+    }
+}
+
+fn roundtrip(n as i64, kind as i64, expect_compress as i64) as i64 {
+    let is *u8 as syms = mem.core.mmap_anon(n + 1);
+    fill(syms, n, kind);
+    let is cb.Bytes as enc = cb.bytes_new(1024);
+    if (rans.rans_encode(syms, n, &enc) < 0) { return 1; }
+    let is *u8 as dec = mem.core.mmap_anon(n + 1);
+    if (rans.rans_decode(enc.ptr, enc.len, n, dec) < 0) { return 2; }
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        if (dec[i] != syms[i]) { return 3; }
+        i = i + 1;
+    }
+    let is i64 as elen = enc.len;
+    cb.bytes_free(&enc);
+    mem.core.munmap(syms, n + 1);
+    mem.core.munmap(dec, n + 1);
+    // A low-entropy stream, large enough to amortise the 524B table, must shrink.
+    if (expect_compress == 1) { if (elen >= n) { return 4; } }
+    return 0;
+}
+
+fn main() as i64 {
+    if (roundtrip(4000, 0, 1) != 0) { return 10; }   // skewed -> compresses
+    if (roundtrip(4000, 1, 0) != 0) { return 20; }   // near-uniform -> just correct
+    if (roundtrip(4000, 2, 1) != 0) { return 30; }   // constant -> compresses hard
+    if (roundtrip(4000, 3, 1) != 0) { return 40; }   // two symbols -> compresses
+    if (roundtrip(1, 2, 0)    != 0) { return 50; }   // tiny
+    if (roundtrip(37, 0, 0)   != 0) { return 60; }
+    return 0;
+}

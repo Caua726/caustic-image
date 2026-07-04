@@ -7,6 +7,7 @@
 # holding both repos) is on the compiler's module search path, so we pass it
 # via --path as an absolute path.
 set -u
+ulimit -c 0 2>/dev/null || true         # don't litter core dumps on a crash
 cd "$(dirname "$0")/.."                 # repo root: .../caustic-image
 ROOT="$(cd .. && pwd)"                  # workspace root: .../Projetos-Pessoais
 mkdir -p build
@@ -46,6 +47,7 @@ run_case test_qoi_rt         tests/test_qoi_rt.cst
 run_case test_encode_rt      tests/test_encode_rt.cst
 run_case test_csif_rt        tests/test_csif_rt.cst
 run_case test_csif_corrupt   tests/test_csif_corrupt.cst
+run_case test_rans           tests/test_rans.cst
 
 if [ "$fail" -eq 0 ]; then echo "all green"; else echo "FAILURES"; fi
 exit $fail
