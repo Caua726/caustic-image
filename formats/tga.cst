@@ -1,0 +1,193 @@
+// =======================================================
+// caustic-image/formats/tga.cst
+// TGA decoder — uncompressed and RLE, true-color (24/32-bit BGRA) and 8-bit
+// grayscale. Rows are bottom-up unless the descriptor's top-down bit is set.
+// TGA has no leading magic, so it is decoded only when named explicitly.
+// Colour-mapped images and 16-bit (5-5-5) are deferred.
+//   tga_decode(src, src_len, out) -> 0, or negative errno; fills *out.
+// =======================================================
+
+use "../core/errno.cst"  as errno;
+use "../core/image.cst"  as image;
+use "../core/pixfmt.cst" as pixfmt;
+use "../core/buf.cst"    as buf;
+use "caustic-compact/core/bytes.cst" as cb;
+
+fn _t16(out as *cb.Bytes, v as i64) as void {
+    cb.bytes_push(out, cast(u8, v & 255));
+    cb.bytes_push(out, cast(u8, (v >> 8) & 255));
+}
+
+// Read one source pixel (ibpp bytes) into px[0..3] = r,g,b,a.
+fn _src_px(bf as *buf.Buf, ibpp as i64, is_gray as i64, px as *i64) as i64 {
+    if (buf.buf_remaining(bf) < ibpp) { return errno.I_CORRUPT; }
+    if (is_gray == 1) {
+        let is i64 as v = buf.buf_u8(bf);
+        px[0] = v; px[1] = v; px[2] = v; px[3] = 255;
+        return 0;
+    }
+    let is i64 as b = buf.buf_u8(bf);
+    let is i64 as g = buf.buf_u8(bf);
+    let is i64 as r = buf.buf_u8(bf);
+    let is i64 as a with mut = 255;
+    if (ibpp == 4) { a = buf.buf_u8(bf); }
+    px[0] = r; px[1] = g; px[2] = b; px[3] = a;
+    return 0;
+}
+
+// Write pixel `p` (in stream order) to its destination row, flipping unless
+// the image is top-down.
+fn _emit_px(out as *image.Image, p as i64, top_down as i64, obpp as i64, px as *i64) as void {
+    let is i64 as w = out.width;
+    let is i64 as srow = p / w;
+    let is i64 as col = p - srow * w;
+    let is i64 as drow with mut = srow;
+    if (top_down == 0) { drow = out.height - 1 - srow; }
+    let is i64 as di = drow * out.stride + col * obpp;
+    let is *u8 as dst = out.pixels;
+    dst[di] = cast(u8, px[0]);
+    if (obpp == 1) { return; }
+    dst[di + 1] = cast(u8, px[1]);
+    dst[di + 2] = cast(u8, px[2]);
+    if (obpp == 4) { dst[di + 3] = cast(u8, px[3]); }
+}
+
+fn tga_decode(src as *u8, src_len as i64, out as *image.Image) as i64 {
+    let is buf.Buf as bf;
+    buf.buf_init(&bf, src, src_len);
+
+    let is i64 as id_len = buf.buf_u8(&bf);
+    let is i64 as cmap_type = buf.buf_u8(&bf);
+    let is i64 as img_type = buf.buf_u8(&bf);
+    if (id_len < 0) { return errno.I_EOF; }
+    if (cmap_type != 0) { return errno.I_UNSUPPORTED; }       // colour-mapped deferred
+    buf.buf_skip(&bf, 5);                                     // colour-map spec
+    buf.buf_skip(&bf, 4);                                     // x/y origin
+    let is i64 as w = buf.buf_u16le(&bf);
+    let is i64 as h = buf.buf_u16le(&bf);
+    let is i64 as depth = buf.buf_u8(&bf);
+    let is i64 as descriptor = buf.buf_u8(&bf);
+    if (descriptor < 0) { return errno.I_EOF; }
+    let is i64 as top_down = (descriptor >> 5) & 1;
+
+    let is i64 as is_gray with mut = 0;
+    if (img_type == 3)  { is_gray = 1; }
+    if (img_type == 11) { is_gray = 1; }
+    let is i64 as is_rle with mut = 0;
+    if (img_type == 10) { is_rle = 1; }
+    if (img_type == 11) { is_rle = 1; }
+    // valid image types: 2/10 true-color, 3/11 gray
+    if (img_type != 2) { if (img_type != 10) { if (img_type != 3) { if (img_type != 11) {
+        return errno.I_UNSUPPORTED; }}}}
+
+    let is i64 as fmt with mut = 0;
+    let is i64 as obpp with mut = 0;
+    let is i64 as ibpp with mut = 0;
+    if (is_gray == 1) {
+        if (depth != 8) { return errno.I_UNSUPPORTED; }
+        fmt = pixfmt.FMT_GRAY8; obpp = 1; ibpp = 1;
+    } else {
+        if (depth == 24) { fmt = pixfmt.FMT_RGB8;  obpp = 3; ibpp = 3; }
+        else {
+            if (depth == 32) { fmt = pixfmt.FMT_RGBA8; obpp = 4; ibpp = 4; }
+            else { return errno.I_UNSUPPORTED; }
+        }
+    }
+
+    let is i64 as rc = image.image_init(out, w, h, fmt);
+    if (rc < 0) { return rc; }
+    buf.buf_skip(&bf, id_len);                                // image ID field
+
+    let is i64 as npx = w * h;
+    let is [4]i64 as px;
+    let is *i64 as pxp = cast(*i64, &px);
+
+    if (is_rle == 0) {
+        let is i64 as p with mut = 0;
+        while (p < npx) {
+            if (_src_px(&bf, ibpp, is_gray, pxp) < 0) { return errno.I_CORRUPT; }
+            _emit_px(out, p, top_down, obpp, pxp);
+            p = p + 1;
+        }
+        return 0;
+    }
+
+    // RLE: packets of a 1-byte header; high bit = run, low 7 = count-1.
+    let is i64 as p with mut = 0;
+    while (p < npx) {
+        let is i64 as hdr = buf.buf_u8(&bf);
+        if (hdr < 0) { return errno.I_CORRUPT; }
+        let is i64 as count = (hdr & 127) + 1;
+        if ((hdr & 128) != 0) {
+            if (_src_px(&bf, ibpp, is_gray, pxp) < 0) { return errno.I_CORRUPT; }
+            let is i64 as c with mut = 0;
+            while (c < count) {
+                if (p >= npx) { return 0; }
+                _emit_px(out, p, top_down, obpp, pxp);
+                p = p + 1;
+                c = c + 1;
+            }
+        } else {
+            let is i64 as c with mut = 0;
+            while (c < count) {
+                if (p >= npx) { return 0; }
+                if (_src_px(&bf, ibpp, is_gray, pxp) < 0) { return errno.I_CORRUPT; }
+                _emit_px(out, p, top_down, obpp, pxp);
+                p = p + 1;
+                c = c + 1;
+            }
+        }
+    }
+    return 0;
+}
+
+// Encode as an uncompressed TGA (bottom-up): RGB8->24-bit, RGBA8->32-bit,
+// GRAY8->8-bit grayscale. Returns out.len, or negative.
+fn tga_encode(img as *image.Image, out as *cb.Bytes) as i64 {
+    let is i64 as ibpp with mut = 0;
+    let is i64 as depth with mut = 0;
+    let is i64 as img_type with mut = 2;
+    let is i64 as is_gray with mut = 0;
+    if (img.fmt == pixfmt.FMT_RGB8)  { ibpp = 3; depth = 24; }
+    if (img.fmt == pixfmt.FMT_RGBA8) { ibpp = 4; depth = 32; }
+    if (img.fmt == pixfmt.FMT_GRAY8) { ibpp = 1; depth = 8; img_type = 3; is_gray = 1; }
+    if (ibpp == 0) { return errno.I_UNSUPPORTED; }
+
+    let is i64 as w = img.width;
+    let is i64 as h = img.height;
+    let is i64 as descriptor with mut = 0;
+    if (ibpp == 4) { descriptor = 8; }     // 8 alpha bits, bottom-up
+
+    // 18-byte header.
+    cb.bytes_push(out, cast(u8, 0));       // id length
+    cb.bytes_push(out, cast(u8, 0));       // no colour map
+    cb.bytes_push(out, cast(u8, img_type));
+    cb.bytes_push(out, cast(u8, 0)); cb.bytes_push(out, cast(u8, 0));   // colour map spec
+    cb.bytes_push(out, cast(u8, 0)); cb.bytes_push(out, cast(u8, 0));
+    cb.bytes_push(out, cast(u8, 0));
+    _t16(out, 0); _t16(out, 0);            // x/y origin
+    _t16(out, w); _t16(out, h);
+    cb.bytes_push(out, cast(u8, depth));
+    cb.bytes_push(out, cast(u8, descriptor));
+
+    let is *u8 as src = img.pixels;
+    let is i64 as y with mut = 0;
+    while (y < h) {
+        let is i64 as srow = (h - 1 - y) * img.stride;   // bottom-up
+        let is i64 as x with mut = 0;
+        while (x < w) {
+            let is i64 as si = srow + x * ibpp;
+            if (is_gray == 1) {
+                cb.bytes_push(out, src[si]);
+            } else {
+                cb.bytes_push(out, src[si + 2]);   // B
+                cb.bytes_push(out, src[si + 1]);   // G
+                cb.bytes_push(out, src[si]);       // R
+                if (ibpp == 4) { cb.bytes_push(out, src[si + 3]); }
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return out.len;
+}

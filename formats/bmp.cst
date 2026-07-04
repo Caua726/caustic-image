@@ -1,0 +1,153 @@
+// =======================================================
+// caustic-image/formats/bmp.cst
+// BMP decoder — the uncompressed BI_RGB case: 24-bit BGR -> RGB8 and 32-bit
+// BGRA -> RGBA8, rows bottom-up (or top-down when height is negative). Pixel
+// data is located by the file header's data-offset, never by scanning.
+// Palettes, 16-bit, and RLE4/RLE8 are handled in a later phase.
+//   bmp_decode(src, src_len, out) -> 0, or negative errno; fills *out.
+// =======================================================
+
+use "../core/errno.cst"  as errno;
+use "../core/image.cst"  as image;
+use "../core/pixfmt.cst" as pixfmt;
+use "../core/buf.cst"    as buf;
+use "caustic-compact/core/bytes.cst" as cb;
+
+fn _p16(out as *cb.Bytes, v as i64) as void {
+    cb.bytes_push(out, cast(u8, v & 255));
+    cb.bytes_push(out, cast(u8, (v >> 8) & 255));
+}
+fn _p32(out as *cb.Bytes, v as i64) as void {
+    cb.bytes_push(out, cast(u8, v & 255));
+    cb.bytes_push(out, cast(u8, (v >> 8) & 255));
+    cb.bytes_push(out, cast(u8, (v >> 16) & 255));
+    cb.bytes_push(out, cast(u8, (v >> 24) & 255));
+}
+
+// Interpret an unsigned 32-bit value as signed two's-complement.
+fn _s32(v as i64) as i64 {
+    if (v >= 2147483648) { return v - 4294967296; }
+    return v;
+}
+
+fn bmp_decode(src as *u8, src_len as i64, out as *image.Image) as i64 {
+    let is buf.Buf as bf;
+    buf.buf_init(&bf, src, src_len);
+
+    if (buf.buf_u8(&bf) != 66) { return errno.I_BADMAGIC; }   // 'B'
+    if (buf.buf_u8(&bf) != 77) { return errno.I_BADMAGIC; }   // 'M'
+    buf.buf_u32le(&bf);                                       // file size (ignored)
+    buf.buf_u32le(&bf);                                       // reserved
+    let is i64 as data_off = buf.buf_u32le(&bf);
+    if (data_off < 0) { return errno.I_CORRUPT; }
+
+    let is i64 as dib_size = buf.buf_u32le(&bf);
+    if (dib_size < 40) { return errno.I_UNSUPPORTED; }        // need BITMAPINFOHEADER
+    let is i64 as w = _s32(buf.buf_u32le(&bf));
+    let is i64 as h_raw = _s32(buf.buf_u32le(&bf));
+    buf.buf_u16le(&bf);                                       // planes
+    let is i64 as bitcount = buf.buf_u16le(&bf);
+    let is i64 as compression = buf.buf_u32le(&bf);
+    if (compression != 0) { return errno.I_UNSUPPORTED; }     // BI_RGB only for now
+
+    let is i64 as top_down with mut = 0;
+    let is i64 as h with mut = h_raw;
+    if (h_raw < 0) { top_down = 1; h = 0 - h_raw; }
+
+    let is i64 as fmt with mut = 0;
+    let is i64 as obpp with mut = 0;
+    if (bitcount == 24) { fmt = pixfmt.FMT_RGB8;  obpp = 3; }
+    else {
+        if (bitcount == 32) { fmt = pixfmt.FMT_RGBA8; obpp = 4; }
+        else { return errno.I_UNSUPPORTED; }
+    }
+
+    let is i64 as dchk = image.image_check_dims(w, h, fmt);
+    if (dchk < 0) { return dchk; }
+
+    // Source row stride is padded to a 4-byte boundary.
+    let is i64 as ibpp = bitcount / 8;
+    let is i64 as row_bytes = ((w * ibpp + 3) / 4) * 4;
+    // Validate the pixel array fits before allocating anything.
+    let is i64 as need = data_off + row_bytes * h;
+    if (need > src_len) { return errno.I_CORRUPT; }
+
+    let is i64 as rc = image.image_init(out, w, h, fmt);
+    if (rc < 0) { return rc; }
+
+    let is *u8 as dst = out.pixels;
+    let is i64 as y with mut = 0;
+    while (y < h) {
+        let is i64 as srow with mut = y;
+        if (top_down == 0) { srow = h - 1 - y; }
+        let is i64 as soff = data_off + srow * row_bytes;
+        let is i64 as doff = y * out.stride;
+        let is i64 as x with mut = 0;
+        while (x < w) {
+            let is i64 as si = soff + x * ibpp;
+            let is i64 as b = cast(i64, src[si]);
+            let is i64 as g = cast(i64, src[si + 1]);
+            let is i64 as r = cast(i64, src[si + 2]);
+            let is i64 as di = doff + x * obpp;
+            dst[di] = cast(u8, r);
+            dst[di + 1] = cast(u8, g);
+            dst[di + 2] = cast(u8, b);
+            if (obpp == 4) { dst[di + 3] = src[si + 3]; }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return 0;
+}
+
+// Encode an RGB8 (24-bit) or RGBA8 (32-bit) image as an uncompressed BI_RGB
+// BMP into `out`, rows bottom-up. Returns out.len, or negative.
+fn bmp_encode(img as *image.Image, out as *cb.Bytes) as i64 {
+    let is i64 as ibpp with mut = 0;
+    let is i64 as bitcount with mut = 0;
+    if (img.fmt == pixfmt.FMT_RGB8)  { ibpp = 3; bitcount = 24; }
+    if (img.fmt == pixfmt.FMT_RGBA8) { ibpp = 4; bitcount = 32; }
+    if (ibpp == 0) { return errno.I_UNSUPPORTED; }
+
+    let is i64 as w = img.width;
+    let is i64 as h = img.height;
+    let is i64 as row_bytes = ((w * ibpp + 3) / 4) * 4;
+    let is i64 as data_off = 54;
+    let is i64 as file_size = data_off + row_bytes * h;
+
+    // File header (14 bytes).
+    cb.bytes_push(out, cast(u8, 66)); cb.bytes_push(out, cast(u8, 77));   // "BM"
+    _p32(out, file_size);
+    _p32(out, 0);              // reserved
+    _p32(out, data_off);
+    // BITMAPINFOHEADER (40 bytes).
+    _p32(out, 40);
+    _p32(out, w);
+    _p32(out, h);              // positive -> bottom-up
+    _p16(out, 1);              // planes
+    _p16(out, bitcount);
+    _p32(out, 0);              // BI_RGB
+    _p32(out, row_bytes * h);  // image size
+    _p32(out, 2835); _p32(out, 2835);   // 72 DPI
+    _p32(out, 0); _p32(out, 0);
+
+    let is *u8 as src = img.pixels;
+    let is i64 as pad = row_bytes - w * ibpp;
+    let is i64 as y with mut = 0;
+    while (y < h) {
+        let is i64 as srow = (h - 1 - y) * img.stride;   // bottom-up
+        let is i64 as x with mut = 0;
+        while (x < w) {
+            let is i64 as si = srow + x * ibpp;
+            cb.bytes_push(out, src[si + 2]);   // B
+            cb.bytes_push(out, src[si + 1]);   // G
+            cb.bytes_push(out, src[si]);       // R
+            if (ibpp == 4) { cb.bytes_push(out, src[si + 3]); }
+            x = x + 1;
+        }
+        let is i64 as p with mut = 0;
+        while (p < pad) { cb.bytes_push(out, cast(u8, 0)); p = p + 1; }
+        y = y + 1;
+    }
+    return out.len;
+}

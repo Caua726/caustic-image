@@ -1,0 +1,29 @@
+// test_buf — the offset-driven byte cursor: endianness, skip, EOF.
+use "../core/buf.cst" as buf;
+
+fn main() as i64 {
+    let is *u8 as d with imut = "\x01\x02\x03\x04\x05\x06\x07\x08";
+    let is buf.Buf as b;
+    buf.buf_init(&b, d, 8);
+
+    if (buf.buf_u8(&b) != 1) { return 1; }           // pos 1
+    if (buf.buf_u16le(&b) != 770) { return 2; }      // 0x0302, pos 3
+    if (buf.buf_u16be(&b) != 1029) { return 3; }     // 0x0405, pos 5
+    if (buf.buf_remaining(&b) != 3) { return 4; }
+    if (buf.buf_u8(&b) != 6) { return 5; }           // pos 6
+    if (buf.buf_u16be(&b) != 1800) { return 6; }     // 0x0708, pos 8
+    if (buf.buf_eof(&b) != 1) { return 7; }
+    if (buf.buf_u8(&b) >= 0) { return 8; }           // EOF -> negative
+
+    // Re-read as 32-bit words.
+    buf.buf_init(&b, d, 8);
+    if (buf.buf_u32le(&b) != 67305985) { return 9; }   // 0x04030201
+    if (buf.buf_u32be(&b) != 84281096) { return 10; }  // 0x05060708
+
+    // skip / peek bounds.
+    buf.buf_init(&b, d, 8);
+    if (buf.buf_skip(&b, 8) != 0) { return 11; }
+    if (buf.buf_skip(&b, 1) >= 0) { return 12; }       // past end -> error
+    if (buf.buf_peek(&b, 0) >= 0) { return 13; }       // at end -> EOF
+    return 0;
+}

@@ -1,0 +1,283 @@
+// =======================================================
+// caustic-image/formats/gif.cst
+// GIF decoder — the first frame: header + logical screen descriptor + global
+// or local colour table + LZW image data (de-blocked and handed to
+// caustic-compact's lzw_gif_decode), with de-interlacing and optional
+// transparency from a Graphic Control Extension. Multi-frame animation is a
+// later phase; this decodes the primary image.
+//   gif_decode(src, src_len, out) -> 0, or negative errno; fills *out.
+// =======================================================
+
+use "std/mem.cst" only bins, core as mem;
+use "../core/errno.cst"  as errno;
+use "../core/image.cst"  as image;
+use "../core/pixfmt.cst" as pixfmt;
+use "../core/buf.cst"    as buf;
+
+use "caustic-compact/core/bytes.cst"   as cb;
+use "caustic-compact/formats/lzw.cst"  as lzw;
+
+// Skip a chain of GIF sub-blocks (…[len][len bytes]… terminated by a 0 length).
+fn _skip_subblocks(bf as *buf.Buf) as void {
+    let is i64 as go with mut = 1;
+    while (go == 1) {
+        let is i64 as n = buf.buf_u8(bf);
+        if (n <= 0) { go = 0; }
+        else { buf.buf_skip(bf, n); }
+    }
+}
+
+fn gif_decode(src as *u8, src_len as i64, out as *image.Image) as i64 {
+    let is buf.Buf as bf;
+    buf.buf_init(&bf, src, src_len);
+
+    // "GIF" + "87a"/"89a".
+    if (buf.buf_u8(&bf) != 71) { return errno.I_BADMAGIC; }   // 'G'
+    if (buf.buf_u8(&bf) != 73) { return errno.I_BADMAGIC; }   // 'I'
+    if (buf.buf_u8(&bf) != 70) { return errno.I_BADMAGIC; }   // 'F'
+    buf.buf_skip(&bf, 3);                                     // "87a"/"89a"
+
+    buf.buf_u16le(&bf);                                       // screen width
+    buf.buf_u16le(&bf);                                       // screen height
+    let is i64 as packed = buf.buf_u8(&bf);
+    buf.buf_u8(&bf);                                          // background index
+    buf.buf_u8(&bf);                                          // pixel aspect ratio
+    if (packed < 0) { return errno.I_EOF; }
+
+    let is *u8 as gct_ptr with mut = cast(*u8, 0);
+    let is i64 as gct_size with mut = 0;
+    if ((packed & 128) != 0) {
+        gct_size = 1 << ((packed & 7) + 1);
+        gct_ptr = buf.buf_here(&bf);
+        if (buf.buf_skip(&bf, gct_size * 3) < 0) { return errno.I_CORRUPT; }
+    }
+
+    let is i64 as transp_flag with mut = 0;
+    let is i64 as transp_index with mut = 0 - 1;
+
+    // Walk blocks until the first image descriptor.
+    let is i64 as go with mut = 1;
+    while (go == 1) {
+        let is i64 as blk = buf.buf_u8(&bf);
+        if (blk < 0) { return errno.I_CORRUPT; }
+        if (blk == 59) { return errno.I_CORRUPT; }           // ';' trailer, no image
+        if (blk == 33) {                                     // '!' extension
+            let is i64 as label = buf.buf_u8(&bf);
+            if (label == 249) {                              // Graphic Control Extension
+                let is i64 as n = buf.buf_u8(&bf);
+                if (n >= 4) {
+                    let is i64 as gp = buf.buf_u8(&bf);
+                    buf.buf_u8(&bf);                         // delay lo
+                    buf.buf_u8(&bf);                         // delay hi
+                    let is i64 as ti = buf.buf_u8(&bf);
+                    transp_flag = gp & 1;
+                    transp_index = ti;
+                    buf.buf_skip(&bf, n - 4);
+                } else { buf.buf_skip(&bf, n); }
+                _skip_subblocks(&bf);
+            } else { _skip_subblocks(&bf); }
+        } else {
+            if (blk == 44) { go = 0; }                       // ',' image descriptor
+            else { return errno.I_CORRUPT; }
+        }
+    }
+
+    // Image descriptor.
+    buf.buf_u16le(&bf);                                      // left
+    buf.buf_u16le(&bf);                                      // top
+    let is i64 as iw = buf.buf_u16le(&bf);
+    let is i64 as ih = buf.buf_u16le(&bf);
+    let is i64 as ipacked = buf.buf_u8(&bf);
+    if (ipacked < 0) { return errno.I_EOF; }
+    let is i64 as lct_flag = (ipacked >> 7) & 1;
+    let is i64 as interlace = (ipacked >> 6) & 1;
+
+    let is *u8 as tab_ptr with mut = gct_ptr;
+    let is i64 as tab_size with mut = gct_size;
+    if (lct_flag != 0) {
+        tab_size = 1 << ((ipacked & 7) + 1);
+        tab_ptr = buf.buf_here(&bf);
+        if (buf.buf_skip(&bf, tab_size * 3) < 0) { return errno.I_CORRUPT; }
+    }
+    if (tab_size < 1) { return errno.I_CORRUPT; }            // need a palette
+
+    let is i64 as min_code_size = buf.buf_u8(&bf);
+    if (min_code_size < 0) { return errno.I_EOF; }
+
+    // De-block the LZW data into one contiguous buffer.
+    let is cb.Bytes as comp = cb.bytes_new(1024);
+    let is i64 as more with mut = 1;
+    while (more == 1) {
+        let is i64 as bl = buf.buf_u8(&bf);
+        if (bl <= 0) { more = 0; }
+        else {
+            if (buf.buf_remaining(&bf) < bl) { cb.bytes_free(&comp); return errno.I_CORRUPT; }
+            if (cb.bytes_append(&comp, buf.buf_here(&bf), bl) < 0) { cb.bytes_free(&comp); return errno.I_OOM; }
+            buf.buf_skip(&bf, bl);
+        }
+    }
+
+    let is cb.Bytes as idx = cb.bytes_new(iw * ih + 16);
+    let is i64 as lr = lzw.lzw_gif_decode(comp.ptr, comp.len, min_code_size, &idx);
+    cb.bytes_free(&comp);
+    if (lr < 0) { cb.bytes_free(&idx); return errno.I_CORRUPT; }
+    if (idx.len < iw * ih) { cb.bytes_free(&idx); return errno.I_CORRUPT; }
+
+    let is i64 as fmt with mut = pixfmt.FMT_RGB8;
+    if (transp_flag != 0) { fmt = pixfmt.FMT_RGBA8; }
+    let is i64 as rc = image.image_init(out, iw, ih, fmt);
+    if (rc < 0) { cb.bytes_free(&idx); return rc; }
+    let is i64 as obpp = pixfmt.fmt_bpp(fmt);
+    let is *u8 as dst = out.pixels;
+    let is *u8 as ip = idx.ptr;
+
+    // Emit one pixel `s` (in decode order) to image position (row, col).
+    // Interlaced GIFs deliver rows in 4 passes; we expand them in place.
+    let is i64 as s with mut = 0;
+    let is i64 as pass with mut = 0;
+    let is i64 as npass with mut = 1;
+    if (interlace != 0) { npass = 4; }
+    while (pass < npass) {
+        let is i64 as start with mut = 0;
+        let is i64 as step with mut = 1;
+        if (interlace != 0) {
+            if (pass == 0) { start = 0; step = 8; }
+            if (pass == 1) { start = 4; step = 8; }
+            if (pass == 2) { start = 2; step = 4; }
+            if (pass == 3) { start = 1; step = 2; }
+        }
+        let is i64 as row with mut = start;
+        while (row < ih) {
+            let is i64 as drow = row * out.stride;
+            let is i64 as x with mut = 0;
+            while (x < iw) {
+                let is i64 as v = cast(i64, ip[s]);
+                s = s + 1;
+                let is i64 as r with mut = 0;
+                let is i64 as g with mut = 0;
+                let is i64 as b with mut = 0;
+                if (v < tab_size) {
+                    r = cast(i64, tab_ptr[v * 3]);
+                    g = cast(i64, tab_ptr[v * 3 + 1]);
+                    b = cast(i64, tab_ptr[v * 3 + 2]);
+                }
+                let is i64 as di = drow + x * obpp;
+                dst[di] = cast(u8, r);
+                dst[di + 1] = cast(u8, g);
+                dst[di + 2] = cast(u8, b);
+                if (obpp == 4) {
+                    let is i64 as al with mut = 255;
+                    if (transp_flag != 0) { if (v == transp_index) { al = 0; } }
+                    dst[di + 3] = cast(u8, al);
+                }
+                x = x + 1;
+            }
+            row = row + step;
+        }
+        pass = pass + 1;
+    }
+
+    cb.bytes_free(&idx);
+    return 0;
+}
+
+// Encode RGB8 or GRAY8 as a single-frame GIF into `out`, building an exact
+// palette. Fails with I_UNSUPPORTED if the image has more than 256 distinct
+// colours (a colour quantiser is a later phase). Returns out.len.
+fn gif_encode(img as *image.Image, out as *cb.Bytes) as i64 {
+    let is i64 as ibpp with mut = 0;
+    let is i64 as gray with mut = 0;
+    if (img.fmt == pixfmt.FMT_RGB8)  { ibpp = 3; }
+    if (img.fmt == pixfmt.FMT_GRAY8) { ibpp = 1; gray = 1; }
+    if (ibpp == 0) { return errno.I_UNSUPPORTED; }
+
+    let is i64 as w = img.width;
+    let is i64 as h = img.height;
+    let is i64 as npx = w * h;
+
+    let is [256]i64 as pr;
+    let is [256]i64 as pg;
+    let is [256]i64 as pb;
+    let is i64 as count with mut = 0;
+    let is *u8 as idxbuf = mem.core.mmap_anon(npx);
+    if (cast(i64, idxbuf) <= 0) { return errno.I_OOM; }
+
+    let is *u8 as src = img.pixels;
+    let is i64 as p with mut = 0;
+    while (p < npx) {
+        let is i64 as si = p * ibpp;
+        let is i64 as r with mut = cast(i64, src[si]);
+        let is i64 as g with mut = r;
+        let is i64 as b with mut = r;
+        if (gray == 0) { g = cast(i64, src[si + 1]); b = cast(i64, src[si + 2]); }
+        // linear search of the palette so far (fine for <=256 colours)
+        let is i64 as found with mut = 0 - 1;
+        let is i64 as j with mut = 0;
+        while (j < count) {
+            if (pr[j] == r) { if (pg[j] == g) { if (pb[j] == b) { found = j; j = count; } } }
+            j = j + 1;
+        }
+        if (found < 0) {
+            if (count >= 256) { mem.core.munmap(idxbuf, npx); return errno.I_UNSUPPORTED; }
+            pr[count] = r; pg[count] = g; pb[count] = b;
+            found = count;
+            count = count + 1;
+        }
+        idxbuf[p] = cast(u8, found);
+        p = p + 1;
+    }
+
+    // Bits per index (GIF minimum 2); GCT holds 2^nbits entries.
+    let is i64 as nbits with mut = 2;
+    while ((1 << nbits) < count) { nbits = nbits + 1; }
+    let is i64 as gct_entries = 1 << nbits;
+
+    // Header + logical screen descriptor.
+    cb.bytes_push(out, cast(u8, 71)); cb.bytes_push(out, cast(u8, 73)); cb.bytes_push(out, cast(u8, 70));
+    cb.bytes_push(out, cast(u8, 56)); cb.bytes_push(out, cast(u8, 57)); cb.bytes_push(out, cast(u8, 97));  // "GIF89a"
+    cb.bytes_push(out, cast(u8, w & 255)); cb.bytes_push(out, cast(u8, (w >> 8) & 255));
+    cb.bytes_push(out, cast(u8, h & 255)); cb.bytes_push(out, cast(u8, (h >> 8) & 255));
+    cb.bytes_push(out, cast(u8, 128 | ((nbits - 1) << 4) | (nbits - 1)));   // packed: GCT + sizes
+    cb.bytes_push(out, cast(u8, 0));    // background index
+    cb.bytes_push(out, cast(u8, 0));    // aspect ratio
+
+    // Global colour table (unused entries zero-filled).
+    let is i64 as e with mut = 0;
+    while (e < gct_entries) {
+        if (e < count) {
+            cb.bytes_push(out, cast(u8, pr[e])); cb.bytes_push(out, cast(u8, pg[e])); cb.bytes_push(out, cast(u8, pb[e]));
+        } else {
+            cb.bytes_push(out, cast(u8, 0)); cb.bytes_push(out, cast(u8, 0)); cb.bytes_push(out, cast(u8, 0));
+        }
+        e = e + 1;
+    }
+
+    // Image descriptor.
+    cb.bytes_push(out, cast(u8, 44));   // ','
+    cb.bytes_push(out, cast(u8, 0)); cb.bytes_push(out, cast(u8, 0));   // left
+    cb.bytes_push(out, cast(u8, 0)); cb.bytes_push(out, cast(u8, 0));   // top
+    cb.bytes_push(out, cast(u8, w & 255)); cb.bytes_push(out, cast(u8, (w >> 8) & 255));
+    cb.bytes_push(out, cast(u8, h & 255)); cb.bytes_push(out, cast(u8, (h >> 8) & 255));
+    cb.bytes_push(out, cast(u8, 0));    // no LCT, no interlace
+    cb.bytes_push(out, cast(u8, nbits));   // LZW minimum code size
+
+    // LZW-compress the index stream, then GIF sub-block it (<=255 per block).
+    let is cb.Bytes as comp = cb.bytes_new(npx + 64);
+    let is i64 as lr = lzw.lzw_gif_encode(idxbuf, npx, nbits, &comp);
+    mem.core.munmap(idxbuf, npx);
+    if (lr < 0) { cb.bytes_free(&comp); return errno.I_OOM; }
+
+    let is i64 as off with mut = 0;
+    while (off < comp.len) {
+        let is i64 as chunk with mut = comp.len - off;
+        if (chunk > 255) { chunk = 255; }
+        cb.bytes_push(out, cast(u8, chunk));
+        cb.bytes_append(out, cast(*u8, cast(i64, comp.ptr) + off), chunk);
+        off = off + chunk;
+    }
+    cb.bytes_push(out, cast(u8, 0));    // block terminator
+    cb.bytes_free(&comp);
+
+    cb.bytes_push(out, cast(u8, 59));   // ';' trailer
+    return out.len;
+}

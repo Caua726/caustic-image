@@ -1,0 +1,28 @@
+// test_png_filters — a 2x4 RGB PNG whose four scanlines use filters
+// Sub / Up / Average / Paeth respectively, exercising every unfilter branch
+// and the Paeth predictor. Asserts exact reconstruction of the known pixels.
+use "../core/image.cst"  as image;
+use "../core/pixfmt.cst" as pixfmt;
+use "../formats/png.cst" as png;
+
+fn main() as i64 {
+    let is *u8 as data with imut = "\x89\x50\x4e\x47\x0d\x0a\x1a\x0a\x00\x00\x00\x0d\x49\x48\x44\x52\x00\x00\x00\x02\x00\x00\x00\x04\x08\x02\x00\x00\x00\x2b\x8d\x79\x6e\x00\x00\x00\x1c\x49\x44\x41\x54\x78\xda\x63\xe4\x12\x91\x03\x02\x26\x1b\x30\x60\x8e\x4f\xc9\xd4\xd5\xd5\x65\x01\x32\x81\x82\x00\x3e\x5b\x04\xca\x78\x5e\xa7\x74\x00\x00\x00\x00\x49\x45\x4e\x44\xae\x42\x60\x82";
+
+    let is image.Image as img;
+    let is i64 as rc = png.png_decode(data, 85, &img);
+    if (rc != 0) { return 90; }
+    if (img.width != 2)  { return 91; }
+    if (img.height != 4) { return 92; }
+    if (img.fmt != pixfmt.FMT_RGB8) { return 93; }
+
+    // Expected pixels: 10,20,30 .. 240 in steps of 10, row-major.
+    let is *u8 as p = img.pixels;
+    let is i64 as i with mut = 0;
+    while (i < 24) {
+        let is i64 as expect = 10 + i * 10;
+        if (cast(i64, p[i]) != expect) { return 20 + i; }
+        i = i + 1;
+    }
+    image.image_free(&img);
+    return 0;
+}

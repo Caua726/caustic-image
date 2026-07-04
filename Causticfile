@@ -1,0 +1,16 @@
+name "caustic-image"
+version "0.0.1"
+author "Caua"
+
+// caustic-image depends on the sibling caustic-compact (DEFLATE/zlib/CRC, and
+// later the CSIF entropy substrate). Cross-repo modules resolve only when the
+// workspace root is on the module search path (caustic --path <root>), so the
+// canonical build/test entry point is tests/run.sh, which computes that path.
+
+script "test" {
+    "bash tests/run.sh"
+}
+
+script "clean" {
+    "rm -rf .caustic build tests/runtests"
+}

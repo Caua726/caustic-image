@@ -1,0 +1,27 @@
+// =======================================================
+// caustic-image — pure-Caustic image (de)coding library.
+//
+//   use "caustic-image/caustic_image.cst" as img;
+//   img.decode.decode(src, len, &image);   img.image.image_free(&image);
+//
+// Compile-check the whole tree (needs the workspace root on the module path
+// for the caustic-compact dependency):
+//   caustic --path <workspace-root> -c caustic_image.cst
+//
+// One file per format under formats/; shared foundation under core/. Heavy
+// entropy/compression (DEFLATE, CRC-32, LZW, and later the CSIF rANS
+// substrate) is reused from the sibling caustic-compact.
+// =======================================================
+
+use "core/errno.cst"   as errno;
+use "core/pixfmt.cst"  as pixfmt;
+use "core/image.cst"   as image;
+use "core/buf.cst"     as buf;
+use "core/sniff.cst"   as sniff;
+use "formats/bmp.cst"  as bmp;
+use "formats/pnm.cst"  as pnm;
+use "formats/tga.cst"  as tga;
+use "formats/qoi.cst"  as qoi;
+use "formats/gif.cst"  as gif;
+use "formats/png.cst"  as png;
+use "decode.cst"       as decode;

@@ -1,0 +1,49 @@
+// =======================================================
+// examples/identify.cst — sniff + decode a file and print "FMT WxH".
+//   identify <image-file>
+// =======================================================
+
+use "std/io.cst"  as io;
+use "std/env.cst" as env;
+use "std/mem.cst" only bins, core as mem;
+use "../core/image.cst" as image;
+use "../core/sniff.cst" as sniff;
+use "../decode.cst"     as decode;
+
+fn main(argc as i64, argv as *u8) as i32 {
+    env.init(argc, argv);
+    if (env.argc() < 2) {
+        io.write_str(io.STDERR, "usage: identify <image-file>\n");
+        return 2;
+    }
+    let is *u8 as path = env.argv(1);
+
+    let is i64 as sz = io.file_size(path);
+    if (sz < 0) { io.write_str(io.STDERR, "identify: cannot stat file\n"); return 1; }
+    let is *u8 as data = mem.core.mmap_anon(sz + 1);
+    let is i64 as fd = io._open_read(path);
+    if (fd < 0) { io.write_str(io.STDERR, "identify: cannot open file\n"); return 1; }
+    let is i64 as got with mut = 0;
+    if (sz > 0) { got = io.read_exact(fd, data, sz); }
+    io._close_fd(fd);
+    if (got != sz) { io.write_str(io.STDERR, "identify: read error\n"); return 1; }
+
+    let is i64 as f = sniff.sniff(data, sz);
+    let is image.Image as img;
+    let is i64 as rc = decode.decode(data, sz, &img);
+    if (rc < 0) {
+        io.write_str(io.STDERR, "identify: decode failed (");
+        io.write_int(io.STDERR, rc);
+        io.write_str(io.STDERR, ")\n");
+        return 1;
+    }
+
+    io.write_str(io.STDOUT, decode.format_name(f));
+    io.write_str(io.STDOUT, " ");
+    io.write_int(io.STDOUT, img.width);
+    io.write_str(io.STDOUT, "x");
+    io.write_int(io.STDOUT, img.height);
+    io.write_str(io.STDOUT, "\n");
+    image.image_free(&img);
+    return 0;
+}

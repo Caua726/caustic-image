@@ -1,0 +1,235 @@
+// =======================================================
+// caustic-image/formats/qoi.cst
+// QOI decoder (Quite OK Image, https://qoiformat.org). A byte-oriented codec:
+// run-length + a 64-entry colour cache + small per-channel deltas. No external
+// compression — a good first real decoder that exercises Image/Buf end to end.
+//
+//   qoi_decode(src, src_len, out) -> 0, or a negative errno; fills *out.
+//
+// This is exactly the "colour-cache" case of the CSIF MODULAR codec, so the
+// logic gets reused there later.
+// =======================================================
+
+use "../core/errno.cst"  as errno;
+use "../core/image.cst"  as image;
+use "../core/pixfmt.cst" as pixfmt;
+use "../core/buf.cst"    as buf;
+use "caustic-compact/core/bytes.cst" as cb;
+
+fn _hash(r as i64, g as i64, b as i64, a as i64) as i64 {
+    return (r * 3 + g * 5 + b * 7 + a * 11) & 63;
+}
+
+// Wrap an 8-bit difference into signed -128..127 (QOI treats deltas mod 256).
+fn _wrap(d as i64) as i64 {
+    return ((d + 128) & 255) - 128;
+}
+
+fn qoi_decode(src as *u8, src_len as i64, out as *image.Image) as i64 {
+    let is buf.Buf as bf;
+    buf.buf_init(&bf, src, src_len);
+
+    // Header: "qoif", width(be32), height(be32), channels(u8), colorspace(u8).
+    if (buf.buf_u8(&bf) != 113) { return errno.I_BADMAGIC; }   // 'q'
+    if (buf.buf_u8(&bf) != 111) { return errno.I_BADMAGIC; }   // 'o'
+    if (buf.buf_u8(&bf) != 105) { return errno.I_BADMAGIC; }   // 'i'
+    if (buf.buf_u8(&bf) != 102) { return errno.I_BADMAGIC; }   // 'f'
+    let is i64 as w = buf.buf_u32be(&bf);
+    let is i64 as h = buf.buf_u32be(&bf);
+    let is i64 as channels = buf.buf_u8(&bf);
+    let is i64 as colorspace = buf.buf_u8(&bf);
+    if (w < 0) { return errno.I_CORRUPT; }
+    if (h < 0) { return errno.I_CORRUPT; }
+    if (colorspace < 0) { return errno.I_CORRUPT; }
+    if (channels != 3) { if (channels != 4) { return errno.I_UNSUPPORTED; } }
+
+    let is i64 as fmt with mut = pixfmt.FMT_RGBA8;
+    if (channels == 3) { fmt = pixfmt.FMT_RGB8; }
+
+    let is i64 as rc = image.image_init(out, w, h, fmt);
+    if (rc < 0) { return rc; }
+    let is i64 as bpp = channels;
+    let is i64 as npx = w * h;
+
+    // Colour cache (64 entries) and running pixel state.
+    let is [64]i64 as ir;
+    let is [64]i64 as ig;
+    let is [64]i64 as ib;
+    let is [64]i64 as ia;
+    let is i64 as k with mut = 0;
+    while (k < 64) { ir[k] = 0; ig[k] = 0; ib[k] = 0; ia[k] = 0; k = k + 1; }
+
+    let is i64 as pr with mut = 0;
+    let is i64 as pg with mut = 0;
+    let is i64 as pb with mut = 0;
+    let is i64 as pa with mut = 255;
+    let is i64 as run with mut = 0;
+
+    let is *u8 as dst = out.pixels;
+    let is i64 as i with mut = 0;
+    while (i < npx) {
+        if (run > 0) {
+            run = run - 1;
+        } else {
+            let is i64 as b8 = buf.buf_u8(&bf);
+            if (b8 < 0) { return errno.I_CORRUPT; }
+            if (b8 == 254) {                       // QOI_OP_RGB
+                let is i64 as r = buf.buf_u8(&bf);
+                let is i64 as g = buf.buf_u8(&bf);
+                let is i64 as b = buf.buf_u8(&bf);
+                if (b < 0) { return errno.I_CORRUPT; }
+                pr = r; pg = g; pb = b;
+            } else {
+                if (b8 == 255) {                   // QOI_OP_RGBA
+                    let is i64 as r = buf.buf_u8(&bf);
+                    let is i64 as g = buf.buf_u8(&bf);
+                    let is i64 as b = buf.buf_u8(&bf);
+                    let is i64 as a = buf.buf_u8(&bf);
+                    if (a < 0) { return errno.I_CORRUPT; }
+                    pr = r; pg = g; pb = b; pa = a;
+                } else {
+                    let is i64 as tag = b8 & 192;   // 0xC0
+                    if (tag == 0) {                // QOI_OP_INDEX
+                        let is i64 as idx = b8 & 63;
+                        pr = ir[idx]; pg = ig[idx]; pb = ib[idx]; pa = ia[idx];
+                    } else {
+                        if (tag == 64) {           // QOI_OP_DIFF
+                            let is i64 as dr = ((b8 >> 4) & 3) - 2;
+                            let is i64 as dg = ((b8 >> 2) & 3) - 2;
+                            let is i64 as db = (b8 & 3) - 2;
+                            pr = (pr + dr) & 255;
+                            pg = (pg + dg) & 255;
+                            pb = (pb + db) & 255;
+                        } else {
+                            if (tag == 128) {      // QOI_OP_LUMA
+                                let is i64 as b2 = buf.buf_u8(&bf);
+                                if (b2 < 0) { return errno.I_CORRUPT; }
+                                let is i64 as dg = (b8 & 63) - 32;
+                                let is i64 as dr = ((b2 >> 4) & 15) - 8 + dg;
+                                let is i64 as db = (b2 & 15) - 8 + dg;
+                                pr = (pr + dr) & 255;
+                                pg = (pg + dg) & 255;
+                                pb = (pb + db) & 255;
+                            } else {               // QOI_OP_RUN (tag == 192)
+                                run = b8 & 63;
+                            }
+                        }
+                    }
+                }
+            }
+            let is i64 as hh = _hash(pr, pg, pb, pa);
+            ir[hh] = pr; ig[hh] = pg; ib[hh] = pb; ia[hh] = pa;
+        }
+        let is i64 as base = i * bpp;
+        dst[base] = cast(u8, pr);
+        dst[base + 1] = cast(u8, pg);
+        dst[base + 2] = cast(u8, pb);
+        if (bpp == 4) { dst[base + 3] = cast(u8, pa); }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Encode an RGB8/RGBA8 image as QOI into `out`. Returns out.len, or negative.
+fn qoi_encode(img as *image.Image, out as *cb.Bytes) as i64 {
+    let is i64 as channels with mut = 0;
+    if (img.fmt == pixfmt.FMT_RGB8)  { channels = 3; }
+    if (img.fmt == pixfmt.FMT_RGBA8) { channels = 4; }
+    if (channels == 0) { return errno.I_UNSUPPORTED; }
+
+    let is i64 as w = img.width;
+    let is i64 as h = img.height;
+    // header: "qoif", width(be32), height(be32), channels, colorspace(0)
+    cb.bytes_push(out, cast(u8, 113)); cb.bytes_push(out, cast(u8, 111));
+    cb.bytes_push(out, cast(u8, 105)); cb.bytes_push(out, cast(u8, 102));
+    cb.bytes_push(out, cast(u8, (w >> 24) & 255)); cb.bytes_push(out, cast(u8, (w >> 16) & 255));
+    cb.bytes_push(out, cast(u8, (w >> 8) & 255));  cb.bytes_push(out, cast(u8, w & 255));
+    cb.bytes_push(out, cast(u8, (h >> 24) & 255)); cb.bytes_push(out, cast(u8, (h >> 16) & 255));
+    cb.bytes_push(out, cast(u8, (h >> 8) & 255));  cb.bytes_push(out, cast(u8, h & 255));
+    cb.bytes_push(out, cast(u8, channels));
+    cb.bytes_push(out, cast(u8, 0));
+
+    let is [64]i64 as ir;
+    let is [64]i64 as ig;
+    let is [64]i64 as ib;
+    let is [64]i64 as ia;
+    let is i64 as k with mut = 0;
+    while (k < 64) { ir[k] = 0; ig[k] = 0; ib[k] = 0; ia[k] = 0; k = k + 1; }
+
+    let is i64 as pr with mut = 0;
+    let is i64 as pg with mut = 0;
+    let is i64 as pb with mut = 0;
+    let is i64 as pa with mut = 255;
+    let is i64 as run with mut = 0;
+
+    let is *u8 as src = img.pixels;
+    let is i64 as npx = w * h;
+    let is i64 as i with mut = 0;
+    while (i < npx) {
+        let is i64 as base = i * channels;
+        let is i64 as r = cast(i64, src[base]);
+        let is i64 as g = cast(i64, src[base + 1]);
+        let is i64 as b = cast(i64, src[base + 2]);
+        let is i64 as a with mut = 255;
+        if (channels == 4) { a = cast(i64, src[base + 3]); }
+
+        let is i64 as same with mut = 0;
+        if (r == pr) { if (g == pg) { if (b == pb) { if (a == pa) { same = 1; } } } }
+
+        if (same == 1) {
+            run = run + 1;
+            if (run == 62) { cb.bytes_push(out, cast(u8, 192 | (run - 1))); run = 0; }
+        } else {
+            if (run > 0) { cb.bytes_push(out, cast(u8, 192 | (run - 1))); run = 0; }
+            let is i64 as hh = _hash(r, g, b, a);
+            let is i64 as hit with mut = 0;
+            if (ir[hh] == r) { if (ig[hh] == g) { if (ib[hh] == b) { if (ia[hh] == a) { hit = 1; } } } }
+            if (hit == 1) {
+                cb.bytes_push(out, cast(u8, hh));               // QOI_OP_INDEX
+            } else {
+                ir[hh] = r; ig[hh] = g; ib[hh] = b; ia[hh] = a;
+                if (a == pa) {
+                    let is i64 as vr = _wrap(r - pr);
+                    let is i64 as vg = _wrap(g - pg);
+                    let is i64 as vb = _wrap(b - pb);
+                    let is i64 as ok_diff with mut = 0;
+                    if (vr >= 0 - 2) { if (vr <= 1) { if (vg >= 0 - 2) { if (vg <= 1) {
+                    if (vb >= 0 - 2) { if (vb <= 1) { ok_diff = 1; } } } } } }
+                    if (ok_diff == 1) {
+                        cb.bytes_push(out, cast(u8, 64 | ((vr + 2) << 4) | ((vg + 2) << 2) | (vb + 2)));
+                    } else {
+                        let is i64 as vgr = _wrap(vr - vg);
+                        let is i64 as vgb = _wrap(vb - vg);
+                        let is i64 as ok_luma with mut = 0;
+                        if (vg >= 0 - 32) { if (vg <= 31) { if (vgr >= 0 - 8) { if (vgr <= 7) {
+                        if (vgb >= 0 - 8) { if (vgb <= 7) { ok_luma = 1; } } } } } }
+                        if (ok_luma == 1) {
+                            cb.bytes_push(out, cast(u8, 128 | (vg + 32)));
+                            cb.bytes_push(out, cast(u8, ((vgr + 8) << 4) | (vgb + 8)));
+                        } else {
+                            cb.bytes_push(out, cast(u8, 254));   // QOI_OP_RGB
+                            cb.bytes_push(out, cast(u8, r));
+                            cb.bytes_push(out, cast(u8, g));
+                            cb.bytes_push(out, cast(u8, b));
+                        }
+                    }
+                } else {
+                    cb.bytes_push(out, cast(u8, 255));           // QOI_OP_RGBA
+                    cb.bytes_push(out, cast(u8, r));
+                    cb.bytes_push(out, cast(u8, g));
+                    cb.bytes_push(out, cast(u8, b));
+                    cb.bytes_push(out, cast(u8, a));
+                }
+            }
+            pr = r; pg = g; pb = b; pa = a;
+        }
+        i = i + 1;
+    }
+    if (run > 0) { cb.bytes_push(out, cast(u8, 192 | (run - 1))); }
+
+    // 8-byte end marker.
+    let is i64 as e with mut = 0;
+    while (e < 7) { cb.bytes_push(out, cast(u8, 0)); e = e + 1; }
+    cb.bytes_push(out, cast(u8, 1));
+    return out.len;
+}

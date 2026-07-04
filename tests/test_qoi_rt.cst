@@ -1,0 +1,29 @@
+// test_qoi_rt — QOI encode->decode round-trip must reproduce the image
+// byte-exact, for both RGBA8 and RGB8 sources.
+use "../core/image.cst"  as image;
+use "../core/pixfmt.cst" as pixfmt;
+use "../formats/qoi.cst" as qoi;
+use "caustic-compact/core/bytes.cst" as cb;
+use "rt.cst" as rt;
+
+fn roundtrip(w as i64, h as i64, fmt as i64) as i64 {
+    let is image.Image as a;
+    if (rt.make_image(&a, w, h, fmt) != 0) { return 1; }
+    let is cb.Bytes as enc = cb.bytes_new(256);
+    if (qoi.qoi_encode(&a, &enc) < 0) { return 2; }
+    let is image.Image as b;
+    if (qoi.qoi_decode(enc.ptr, enc.len, &b) != 0) { return 3; }
+    let is i64 as eq = rt.pixels_equal(&a, &b);
+    cb.bytes_free(&enc);
+    image.image_free(&a);
+    image.image_free(&b);
+    return eq;
+}
+
+fn main() as i64 {
+    if (roundtrip(16, 12, pixfmt.FMT_RGBA8) != 0) { return 10; }
+    if (roundtrip(16, 12, pixfmt.FMT_RGB8)  != 0) { return 20; }
+    if (roundtrip(1, 1, pixfmt.FMT_RGBA8)   != 0) { return 30; }
+    if (roundtrip(64, 1, pixfmt.FMT_RGB8)   != 0) { return 40; }
+    return 0;
+}

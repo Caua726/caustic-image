@@ -1,0 +1,195 @@
+// =======================================================
+// caustic-image/formats/pnm.cst
+// Netpbm decoder: PBM/PGM/PPM in both ASCII (P1/P2/P3) and binary (P4/P5/P6)
+// flavours, 8-bit samples (maxval <= 255). The header is whitespace-separated
+// ASCII tokens with '#' comments; binary data follows a single whitespace.
+// 16-bit samples (maxval > 255) are deferred.
+//   pnm_decode(src, src_len, out) -> 0, or negative errno; fills *out.
+// =======================================================
+
+use "../core/errno.cst"  as errno;
+use "../core/image.cst"  as image;
+use "../core/pixfmt.cst" as pixfmt;
+use "../core/buf.cst"    as buf;
+use "caustic-compact/core/bytes.cst" as cb;
+
+// Append a non-negative integer as ASCII decimal.
+fn _push_dec(out as *cb.Bytes, n as i64) as void {
+    if (n == 0) { cb.bytes_push(out, cast(u8, 48)); return; }
+    let is [24]i64 as d;
+    let is i64 as cnt with mut = 0;
+    let is i64 as v with mut = n;
+    while (v > 0) { d[cnt] = v % 10; v = v / 10; cnt = cnt + 1; }
+    while (cnt > 0) { cnt = cnt - 1; cb.bytes_push(out, cast(u8, 48 + d[cnt])); }
+}
+
+fn _is_ws(c as i64) as i64 {
+    if (c == 32) { return 1; }        // space
+    if (c >= 9)  { if (c <= 13) { return 1; } }  // tab/LF/VT/FF/CR
+    return 0;
+}
+
+fn _is_digit(c as i64) as i64 {
+    if (c >= 48) { if (c <= 57) { return 1; } }
+    return 0;
+}
+
+// Skip whitespace and #-to-end-of-line comments at the cursor.
+fn _skip_ws(bf as *buf.Buf) as void {
+    let is i64 as go with mut = 1;
+    while (go == 1) {
+        let is i64 as c = buf.buf_peek(bf, 0);
+        if (c < 0) { go = 0; }
+        else {
+            if (_is_ws(c) == 1) { buf.buf_u8(bf); }
+            else {
+                if (c == 35) {                    // '#': skip to newline
+                    buf.buf_u8(bf);
+                    let is i64 as inner with mut = 1;
+                    while (inner == 1) {
+                        let is i64 as d = buf.buf_u8(bf);
+                        if (d < 0) { inner = 0; go = 0; }
+                        else { if (d == 10) { inner = 0; } }
+                    }
+                } else { go = 0; }
+            }
+        }
+    }
+}
+
+// Read the next unsigned decimal token, or a negative errno.
+fn _next_uint(bf as *buf.Buf) as i64 {
+    _skip_ws(bf);
+    let is i64 as c = buf.buf_u8(bf);
+    if (c < 0) { return errno.I_EOF; }
+    if (_is_digit(c) == 0) { return errno.I_CORRUPT; }
+    let is i64 as v with mut = c - 48;
+    let is i64 as go with mut = 1;
+    while (go == 1) {
+        let is i64 as p = buf.buf_peek(bf, 0);
+        if (p < 0) { go = 0; }
+        else {
+            if (_is_digit(p) == 1) { v = v * 10 + (buf.buf_u8(bf) - 48); }
+            else { go = 0; }
+        }
+    }
+    return v;
+}
+
+fn pnm_decode(src as *u8, src_len as i64, out as *image.Image) as i64 {
+    let is buf.Buf as bf;
+    buf.buf_init(&bf, src, src_len);
+
+    if (buf.buf_u8(&bf) != 80) { return errno.I_BADMAGIC; }   // 'P'
+    let is i64 as t = buf.buf_u8(&bf);                         // '1'..'6'
+    if (t < 49) { return errno.I_BADMAGIC; }
+    if (t > 54) { return errno.I_BADMAGIC; }
+    let is i64 as kind = t - 48;
+
+    let is i64 as w = _next_uint(&bf);
+    if (w < 0) { return errno.I_CORRUPT; }
+    let is i64 as h = _next_uint(&bf);
+    if (h < 0) { return errno.I_CORRUPT; }
+
+    // PBM (1,4) has no maxval; the rest read one.
+    let is i64 as maxval with mut = 1;
+    if (kind != 1) { if (kind != 4) {
+        maxval = _next_uint(&bf);
+        if (maxval < 1) { return errno.I_CORRUPT; }
+        if (maxval > 255) { return errno.I_UNSUPPORTED; }     // 16-bit deferred
+    }}
+
+    // Colour model: PPM(3,6)=RGB, else gray.
+    let is i64 as is_rgb with mut = 0;
+    if (kind == 3) { is_rgb = 1; }
+    if (kind == 6) { is_rgb = 1; }
+    let is i64 as fmt with mut = pixfmt.FMT_GRAY8;
+    if (is_rgb == 1) { fmt = pixfmt.FMT_RGB8; }
+
+    let is i64 as rc = image.image_init(out, w, h, fmt);
+    if (rc < 0) { return rc; }
+    let is *u8 as dst = out.pixels;
+    let is i64 as npx = w * h;
+
+    // ---- ASCII flavours: P1 (bitmap), P2 (gray), P3 (rgb) ----
+    if (kind <= 3) {
+        let is i64 as nsamp with mut = npx;
+        if (is_rgb == 1) { nsamp = npx * 3; }
+        let is i64 as i with mut = 0;
+        while (i < nsamp) {
+            let is i64 as v = _next_uint(&bf);
+            if (v < 0) { return errno.I_CORRUPT; }
+            let is i64 as out_v with mut = v;
+            if (kind == 1) {
+                // PBM: 1 = black, 0 = white.
+                if (v == 0) { out_v = 255; } else { out_v = 0; }
+            } else {
+                if (maxval != 255) { out_v = v * 255 / maxval; }
+            }
+            dst[i] = cast(u8, out_v);
+            i = i + 1;
+        }
+        return 0;
+    }
+
+    // ---- Binary flavours: exactly one whitespace, then raw bytes ----
+    buf.buf_u8(&bf);                                          // the single separator
+
+    if (kind == 4) {
+        // PBM binary: rows of ceil(w/8) bytes, MSB first, bit set = black.
+        let is i64 as row_bytes = (w + 7) / 8;
+        if (buf.buf_remaining(&bf) < row_bytes * h) { return errno.I_CORRUPT; }
+        let is *u8 as p = buf.buf_here(&bf);
+        let is i64 as y with mut = 0;
+        while (y < h) {
+            let is i64 as x with mut = 0;
+            while (x < w) {
+                let is i64 as byte = cast(i64, p[y * row_bytes + (x / 8)]);
+                let is i64 as bit = (byte >> (7 - (x & 7))) & 1;
+                let is i64 as g with mut = 255;
+                if (bit == 1) { g = 0; }
+                dst[y * w + x] = cast(u8, g);
+                x = x + 1;
+            }
+            y = y + 1;
+        }
+        return 0;
+    }
+
+    // P5 gray / P6 rgb: raw samples, 1 byte each, already 8-bit.
+    let is i64 as chan with mut = 1;
+    if (is_rgb == 1) { chan = 3; }
+    let is i64 as nbytes = npx * chan;
+    if (buf.buf_remaining(&bf) < nbytes) { return errno.I_CORRUPT; }
+    let is *u8 as sp = buf.buf_here(&bf);
+    let is i64 as i with mut = 0;
+    while (i < nbytes) {
+        let is i64 as v with mut = cast(i64, sp[i]);
+        if (maxval != 255) { v = v * 255 / maxval; }
+        dst[i] = cast(u8, v);
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Encode RGB8 as binary P6 or GRAY8 as binary P5 into `out`. Returns out.len.
+fn pnm_encode(img as *image.Image, out as *cb.Bytes) as i64 {
+    let is i64 as magic with mut = 0;
+    if (img.fmt == pixfmt.FMT_RGB8)  { magic = 54; }   // '6'
+    if (img.fmt == pixfmt.FMT_GRAY8) { magic = 53; }   // '5'
+    if (magic == 0) { return errno.I_UNSUPPORTED; }
+
+    cb.bytes_push(out, cast(u8, 80));       // 'P'
+    cb.bytes_push(out, cast(u8, magic));
+    cb.bytes_push(out, cast(u8, 10));       // '\n'
+    _push_dec(out, img.width);
+    cb.bytes_push(out, cast(u8, 32));       // ' '
+    _push_dec(out, img.height);
+    cb.bytes_push(out, cast(u8, 10));
+    _push_dec(out, 255);
+    cb.bytes_push(out, cast(u8, 10));
+
+    // Raw samples: image rows are contiguous (stride == width*channels).
+    if (cb.bytes_append(out, img.pixels, img.stride * img.height) < 0) { return errno.I_OOM; }
+    return out.len;
+}

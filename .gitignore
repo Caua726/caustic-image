@@ -1,0 +1,5 @@
+build/
+.caustic/
+*.cst.s
+*.cst.s.o
+tests/runtests

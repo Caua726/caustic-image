@@ -1,0 +1,116 @@
+// =======================================================
+// caustic-image/core/buf.cst
+// Offset-driven byte cursor over an in-memory source. Every foreign-format
+// parser reads through this — never by scanning for sync markers. Reads are
+// bounds-checked: an integer read that would run past the end returns I_EOF
+// (< 0) and does NOT advance, so a truncated file can never index past its
+// buffer. Multi-byte helpers cover both endiannesses (TIFF, ICO, etc.).
+// =======================================================
+
+use "errno.cst" as errno;
+
+struct Buf {
+    ptr as *u8;
+    len as i64;
+    pos as i64;
+}
+
+fn buf_init(b as *Buf, ptr as *u8, len as i64) as void {
+    b.ptr = ptr;
+    b.len = len;
+    b.pos = 0;
+}
+
+fn buf_remaining(b as *Buf) as i64 {
+    return b.len - b.pos;
+}
+
+fn buf_eof(b as *Buf) as i64 {
+    if (b.pos >= b.len) { return 1; }
+    return 0;
+}
+
+// Absolute seek. Returns 0, or I_EOF if out of range (position may equal len).
+fn buf_seek(b as *Buf, off as i64) as i64 {
+    if (off < 0) { return errno.I_EOF; }
+    if (off > b.len) { return errno.I_EOF; }
+    b.pos = off;
+    return 0;
+}
+
+// Skip `n` bytes forward. Returns 0, or I_EOF (without moving) if too few left.
+fn buf_skip(b as *Buf, n as i64) as i64 {
+    if (n < 0) { return errno.I_BADPARAM; }
+    if (buf_remaining(b) < n) { return errno.I_EOF; }
+    b.pos = b.pos + n;
+    return 0;
+}
+
+// Next byte as 0..255, or I_EOF. (A valid byte is never negative, so the
+// caller can test the result directly.)
+fn buf_u8(b as *Buf) as i64 {
+    if (b.pos >= b.len) { return errno.I_EOF; }
+    let is i64 as v = cast(i64, b.ptr[b.pos]);
+    b.pos = b.pos + 1;
+    return v;
+}
+
+// Peek the byte `off` ahead of the cursor without consuming, or I_EOF.
+fn buf_peek(b as *Buf, off as i64) as i64 {
+    let is i64 as i = b.pos + off;
+    if (i < 0) { return errno.I_EOF; }
+    if (i >= b.len) { return errno.I_EOF; }
+    return cast(i64, b.ptr[i]);
+}
+
+fn buf_u16le(b as *Buf) as i64 {
+    if (buf_remaining(b) < 2) { return errno.I_EOF; }
+    let is i64 as v = cast(i64, b.ptr[b.pos]) | (cast(i64, b.ptr[b.pos + 1]) << 8);
+    b.pos = b.pos + 2;
+    return v;
+}
+
+fn buf_u16be(b as *Buf) as i64 {
+    if (buf_remaining(b) < 2) { return errno.I_EOF; }
+    let is i64 as v = (cast(i64, b.ptr[b.pos]) << 8) | cast(i64, b.ptr[b.pos + 1]);
+    b.pos = b.pos + 2;
+    return v;
+}
+
+fn buf_u32le(b as *Buf) as i64 {
+    if (buf_remaining(b) < 4) { return errno.I_EOF; }
+    let is i64 as v = cast(i64, b.ptr[b.pos])
+        | (cast(i64, b.ptr[b.pos + 1]) << 8)
+        | (cast(i64, b.ptr[b.pos + 2]) << 16)
+        | (cast(i64, b.ptr[b.pos + 3]) << 24);
+    b.pos = b.pos + 4;
+    return v;
+}
+
+fn buf_u32be(b as *Buf) as i64 {
+    if (buf_remaining(b) < 4) { return errno.I_EOF; }
+    let is i64 as v = (cast(i64, b.ptr[b.pos]) << 24)
+        | (cast(i64, b.ptr[b.pos + 1]) << 16)
+        | (cast(i64, b.ptr[b.pos + 2]) << 8)
+        | cast(i64, b.ptr[b.pos + 3]);
+    b.pos = b.pos + 4;
+    return v;
+}
+
+// Copy `n` bytes into `dst`. Returns 0, or I_EOF (without moving) if too few.
+fn buf_read(b as *Buf, dst as *u8, n as i64) as i64 {
+    if (n < 0) { return errno.I_BADPARAM; }
+    if (buf_remaining(b) < n) { return errno.I_EOF; }
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        dst[i] = b.ptr[b.pos + i];
+        i = i + 1;
+    }
+    b.pos = b.pos + n;
+    return 0;
+}
+
+// Raw pointer to the cursor position (for zero-copy handoff to a codec).
+fn buf_here(b as *Buf) as *u8 {
+    return cast(*u8, cast(i64, b.ptr) + b.pos);
+}

@@ -1,0 +1,26 @@
+// test_limit — the ILIM-style dimension guard rejects oversized/degenerate
+// geometry BEFORE allocating, and accepts a valid small image.
+use "../core/errno.cst"  as errno;
+use "../core/image.cst"  as image;
+use "../core/pixfmt.cst" as pixfmt;
+
+fn main() as i64 {
+    let is image.Image as img;
+
+    // Way past the per-side ceiling -> I_DIMS, no allocation attempted.
+    if (image.image_init(&img, 2000000000, 2000000000, pixfmt.FMT_RGBA8) != errno.I_DIMS) { return 1; }
+    // Pixel-count overflow past the total ceiling (each side legal alone).
+    if (image.image_check_dims(100000, 100000, pixfmt.FMT_RGBA8) != errno.I_DIMS) { return 2; }
+    // Degenerate.
+    if (image.image_check_dims(0, 10, pixfmt.FMT_RGB8) != errno.I_DIMS) { return 3; }
+    // Unknown pixel format.
+    if (image.image_check_dims(4, 4, 999) != errno.I_UNSUPPORTED) { return 4; }
+
+    // A valid small image allocates and reports the right stride.
+    if (image.image_init(&img, 4, 4, pixfmt.FMT_RGB8) != 0) { return 5; }
+    if (img.stride != 12) { return 6; }
+    if (img.width != 4) { return 7; }
+    image.image_free(&img);
+    if (cast(i64, img.pixels) != 0) { return 8; }   // freed handle is null
+    return 0;
+}

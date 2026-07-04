@@ -1,0 +1,353 @@
+// =======================================================
+// caustic-image/formats/png.cst
+// PNG decoder. Reuses the sibling caustic-compact for the two heavy pieces:
+// per-chunk CRC-32 (checksum.crc32) and the IDAT zlib/DEFLATE stream
+// (zlib.zlib_decompress) — a PNG IDAT stream IS a zlib stream. We own the
+// container walk, the scanline unfilter (None/Sub/Up/Average/Paeth) and the
+// pixel expansion.
+//
+// Phase-1 scope: 8-bit depth, colour types 0/2/3/4/6, non-interlaced. Adam7,
+// 1/2/4/16-bit depths, and ancillary colour chunks land in a later phase.
+//   png_decode(src, src_len, out) -> 0, or negative errno; fills *out.
+// =======================================================
+
+use "std/mem.cst" only bins, core as mem;
+use "../core/errno.cst"  as errno;
+use "../core/image.cst"  as image;
+use "../core/pixfmt.cst" as pixfmt;
+use "../core/buf.cst"    as buf;
+
+use "caustic-compact/core/bytes.cst"    as cb;
+use "caustic-compact/core/checksum.cst" as checksum;
+use "caustic-compact/formats/zlib.cst"  as zlib;
+
+fn _iabs(x as i64) as i64 { if (x < 0) { return 0 - x; } return x; }
+
+// PNG Paeth predictor over the three neighbours a(left) b(up) c(up-left).
+fn _paeth(a as i64, b as i64, c as i64) as i64 {
+    let is i64 as p = a + b - c;
+    let is i64 as pa = _iabs(p - a);
+    let is i64 as pb = _iabs(p - b);
+    let is i64 as pc = _iabs(p - c);
+    if (pa <= pb) { if (pa <= pc) { return a; } }
+    if (pb <= pc) { return b; }
+    return c;
+}
+
+// Filtered byte for filter type `ft` given neighbours a(left) b(up) c(up-left).
+fn _filt(ft as i64, x as i64, a as i64, b as i64, c as i64) as i64 {
+    if (ft == 0) { return x & 255; }
+    if (ft == 1) { return (x - a) & 255; }
+    if (ft == 2) { return (x - b) & 255; }
+    if (ft == 3) { return (x - ((a + b) >> 1)) & 255; }
+    return (x - _paeth(a, b, c)) & 255;
+}
+
+// Absolute value of a filtered byte read as signed (minimum-sum-of-abs heuristic).
+fn _sabs(fb as i64) as i64 {
+    if (fb >= 128) { return 256 - fb; }
+    return fb;
+}
+
+fn _type_is(t0 as i64, t1 as i64, t2 as i64, t3 as i64,
+            c0 as i64, c1 as i64, c2 as i64, c3 as i64) as i64 {
+    if (t0 != c0) { return 0; }
+    if (t1 != c1) { return 0; }
+    if (t2 != c2) { return 0; }
+    if (t3 != c3) { return 0; }
+    return 1;
+}
+
+fn png_decode(src as *u8, src_len as i64, out as *image.Image) as i64 {
+    let is buf.Buf as bf;
+    buf.buf_init(&bf, src, src_len);
+    // 8-byte signature.
+    let is *u8 as sig with imut = "\x89\x50\x4e\x47\x0d\x0a\x1a\x0a";
+    let is i64 as si with mut = 0;
+    while (si < 8) {
+        if (buf.buf_u8(&bf) != cast(i64, sig[si])) { return errno.I_BADMAGIC; }
+        si = si + 1;
+    }
+
+    let is i64 as have_ihdr with mut = 0;
+    let is i64 as w with mut = 0;
+    let is i64 as h with mut = 0;
+    let is i64 as bitdepth with mut = 0;
+    let is i64 as colortype with mut = 0;
+    let is i64 as interlace with mut = 0;
+
+    let is *u8 as plte_ptr with mut = cast(*u8, 0);
+    let is i64 as plte_count with mut = 0;
+    let is *u8 as trns_ptr with mut = cast(*u8, 0);
+    let is i64 as trns_len with mut = 0;
+    let is i64 as has_trns with mut = 0;
+
+    let is cb.Bytes as idat = cb.bytes_new(1024);
+
+    // ---- chunk walk (offset-driven) ----
+    let is i64 as done with mut = 0;
+    while (done == 0) {
+        let is i64 as clen = buf.buf_u32be(&bf);
+        if (clen < 0) { cb.bytes_free(&idat); return errno.I_CORRUPT; }
+        let is i64 as type_off = bf.pos;
+        let is i64 as t0 = buf.buf_u8(&bf);
+        let is i64 as t1 = buf.buf_u8(&bf);
+        let is i64 as t2 = buf.buf_u8(&bf);
+        let is i64 as t3 = buf.buf_u8(&bf);
+        if (t3 < 0) { cb.bytes_free(&idat); return errno.I_CORRUPT; }
+        let is i64 as data_off = bf.pos;
+        if (buf.buf_remaining(&bf) < clen) { cb.bytes_free(&idat); return errno.I_CORRUPT; }
+
+        // CRC covers the type + data bytes, contiguous in src.
+        let is *u8 as crc_ptr = cast(*u8, cast(i64, src) + type_off);
+        let is i64 as crc_calc = checksum.crc32(crc_ptr, 4 + clen);
+        buf.buf_skip(&bf, clen);
+        let is i64 as crc_stored = buf.buf_u32be(&bf);
+        if (crc_calc != crc_stored) { cb.bytes_free(&idat); return errno.I_CORRUPT; }
+
+        let is *u8 as data = cast(*u8, cast(i64, src) + data_off);
+        if (_type_is(t0,t1,t2,t3, 73,72,68,82) == 1) {            // IHDR
+            if (clen != 13) { cb.bytes_free(&idat); return errno.I_CORRUPT; }
+            w = (cast(i64,data[0])<<24)|(cast(i64,data[1])<<16)|(cast(i64,data[2])<<8)|cast(i64,data[3]);
+            h = (cast(i64,data[4])<<24)|(cast(i64,data[5])<<16)|(cast(i64,data[6])<<8)|cast(i64,data[7]);
+            bitdepth  = cast(i64, data[8]);
+            colortype = cast(i64, data[9]);
+            interlace = cast(i64, data[12]);
+            have_ihdr = 1;
+        } else {
+        if (_type_is(t0,t1,t2,t3, 80,76,84,69) == 1) {            // PLTE
+            plte_ptr = data;
+            plte_count = clen / 3;
+        } else {
+        if (_type_is(t0,t1,t2,t3, 116,82,78,83) == 1) {           // tRNS
+            trns_ptr = data;
+            trns_len = clen;
+            has_trns = 1;
+        } else {
+        if (_type_is(t0,t1,t2,t3, 73,68,65,84) == 1) {            // IDAT
+            if (cb.bytes_append(&idat, data, clen) < 0) { cb.bytes_free(&idat); return errno.I_OOM; }
+        } else {
+        if (_type_is(t0,t1,t2,t3, 73,69,78,68) == 1) {            // IEND
+            done = 1;
+        }
+        }}}}
+    }
+
+    if (have_ihdr == 0) { cb.bytes_free(&idat); return errno.I_CORRUPT; }
+    if (interlace != 0) { cb.bytes_free(&idat); return errno.I_UNSUPPORTED; }   // Adam7 deferred
+    if (bitdepth != 8)  { cb.bytes_free(&idat); return errno.I_UNSUPPORTED; }   // 1/2/4/16 deferred
+
+    // Raw (pre-output) channel count and destination format.
+    let is i64 as chan with mut = 0;
+    let is i64 as fmt with mut = 0;
+    if (colortype == 0) { chan = 1; fmt = pixfmt.FMT_GRAY8; }
+    else { if (colortype == 2) { chan = 3; fmt = pixfmt.FMT_RGB8; }
+    else { if (colortype == 3) { chan = 1; fmt = pixfmt.FMT_RGB8; if (has_trns == 1) { fmt = pixfmt.FMT_RGBA8; } }
+    else { if (colortype == 4) { chan = 2; fmt = pixfmt.FMT_GRAYA8; }
+    else { if (colortype == 6) { chan = 4; fmt = pixfmt.FMT_RGBA8; }
+    else { cb.bytes_free(&idat); return errno.I_UNSUPPORTED; } }}}}
+
+    let is i64 as dchk = image.image_check_dims(w, h, fmt);
+    if (dchk < 0) { cb.bytes_free(&idat); return dchk; }
+    if (colortype == 3) { if (plte_count < 1) { cb.bytes_free(&idat); return errno.I_CORRUPT; } }
+
+    let is i64 as bpp = chan;                 // filter left-offset (8-bit)
+    let is i64 as stride = w * bpp;           // decompressed bytes per scanline
+    let is i64 as full = 1 + stride;          // + filter-type byte
+    let is i64 as expect = full * h;
+
+    // Inflate the concatenated IDAT (a zlib stream) into filtered scanlines.
+    let is cb.Bytes as raw = cb.bytes_new(expect + 64);
+    let is i64 as zr = zlib.zlib_decompress(idat.ptr, idat.len, &raw);
+    cb.bytes_free(&idat);
+    if (zr < 0) { cb.bytes_free(&raw); return errno.I_CORRUPT; }
+    if (raw.len < expect) { cb.bytes_free(&raw); return errno.I_CORRUPT; }
+
+    // ---- unfilter in place (row references already-reconstructed bytes) ----
+    let is *u8 as rp = raw.ptr;
+    let is i64 as y with mut = 0;
+    while (y < h) {
+        let is i64 as rowstart = y * full;
+        let is i64 as ft = cast(i64, rp[rowstart]);
+        let is i64 as cur = rowstart + 1;                 // start of data bytes
+        let is i64 as prev = cur - full;                  // start of prev row's data
+        let is i64 as i with mut = 0;
+        while (i < stride) {
+            let is i64 as x = cast(i64, rp[cur + i]);
+            let is i64 as a with mut = 0;
+            if (i >= bpp) { a = cast(i64, rp[cur + i - bpp]); }
+            let is i64 as b with mut = 0;
+            if (y > 0) { b = cast(i64, rp[prev + i]); }
+            let is i64 as c with mut = 0;
+            if (y > 0) { if (i >= bpp) { c = cast(i64, rp[prev + i - bpp]); } }
+            let is i64 as recon with mut = x;
+            if (ft == 1) { recon = x + a; }
+            else { if (ft == 2) { recon = x + b; }
+            else { if (ft == 3) { recon = x + ((a + b) >> 1); }
+            else { if (ft == 4) { recon = x + _paeth(a, b, c); } } } }
+            rp[cur + i] = cast(u8, recon & 255);
+            i = i + 1;
+        }
+        y = y + 1;
+    }
+
+    // ---- materialise the Image ----
+    let is i64 as rc = image.image_init(out, w, h, fmt);
+    if (rc < 0) { cb.bytes_free(&raw); return rc; }
+    let is *u8 as dst = out.pixels;
+
+    if (colortype == 3) {
+        // Palette expansion (index -> RGB, plus alpha from tRNS).
+        let is i64 as obpp = pixfmt.fmt_bpp(fmt);
+        let is i64 as yy with mut = 0;
+        while (yy < h) {
+            let is i64 as srow = yy * full + 1;
+            let is i64 as drow = yy * out.stride;
+            let is i64 as x with mut = 0;
+            while (x < w) {
+                let is i64 as idx = cast(i64, rp[srow + x]);
+                let is i64 as r with mut = 0;
+                let is i64 as g with mut = 0;
+                let is i64 as b with mut = 0;
+                if (idx < plte_count) {
+                    r = cast(i64, plte_ptr[idx * 3]);
+                    g = cast(i64, plte_ptr[idx * 3 + 1]);
+                    b = cast(i64, plte_ptr[idx * 3 + 2]);
+                }
+                let is i64 as di = drow + x * obpp;
+                dst[di] = cast(u8, r);
+                dst[di + 1] = cast(u8, g);
+                dst[di + 2] = cast(u8, b);
+                if (obpp == 4) {
+                    let is i64 as al with mut = 255;
+                    if (idx < trns_len) { al = cast(i64, trns_ptr[idx]); }
+                    dst[di + 3] = cast(u8, al);
+                }
+                x = x + 1;
+            }
+            yy = yy + 1;
+        }
+    } else {
+        // Direct-copy formats: decompressed stride == output stride.
+        let is i64 as yy with mut = 0;
+        while (yy < h) {
+            let is i64 as srow = yy * full + 1;
+            let is *u8 as sptr = cast(*u8, cast(i64, rp) + srow);
+            let is *u8 as dptr = image.image_row(out, yy);
+            mem.core.memcpy(dptr, sptr, stride);
+            yy = yy + 1;
+        }
+    }
+
+    cb.bytes_free(&raw);
+    return 0;
+}
+
+// Write a PNG chunk: length(be32) + type(4) + data + CRC-32(type+data).
+fn _png_chunk(out as *cb.Bytes, typ as *u8, data as *u8, len as i64) as void {
+    cb.bytes_push(out, cast(u8, (len >> 24) & 255));
+    cb.bytes_push(out, cast(u8, (len >> 16) & 255));
+    cb.bytes_push(out, cast(u8, (len >> 8) & 255));
+    cb.bytes_push(out, cast(u8, len & 255));
+    cb.bytes_push(out, typ[0]); cb.bytes_push(out, typ[1]);
+    cb.bytes_push(out, typ[2]); cb.bytes_push(out, typ[3]);
+    if (len > 0) { cb.bytes_append(out, data, len); }
+    let is i64 as c with mut = checksum.crc32_update(0, typ, 4);
+    if (len > 0) { c = checksum.crc32_update(c, data, len); }
+    cb.bytes_push(out, cast(u8, (c >> 24) & 255));
+    cb.bytes_push(out, cast(u8, (c >> 16) & 255));
+    cb.bytes_push(out, cast(u8, (c >> 8) & 255));
+    cb.bytes_push(out, cast(u8, c & 255));
+}
+
+// Encode GRAY8/GRAYA8/RGB8/RGBA8 as a non-interlaced 8-bit PNG into `out`,
+// choosing a per-row filter by the minimum-sum-of-absolute-differences
+// heuristic. IDAT is a zlib stream from caustic-compact. Returns out.len.
+fn png_encode(img as *image.Image, out as *cb.Bytes) as i64 {
+    let is i64 as chan with mut = 0;
+    let is i64 as colortype with mut = 0;
+    if (img.fmt == pixfmt.FMT_GRAY8)  { chan = 1; colortype = 0; }
+    if (img.fmt == pixfmt.FMT_GRAYA8) { chan = 2; colortype = 4; }
+    if (img.fmt == pixfmt.FMT_RGB8)   { chan = 3; colortype = 2; }
+    if (img.fmt == pixfmt.FMT_RGBA8)  { chan = 4; colortype = 6; }
+    if (chan == 0) { return errno.I_UNSUPPORTED; }
+
+    let is i64 as w = img.width;
+    let is i64 as h = img.height;
+    let is i64 as bpp = chan;
+    let is i64 as stride = w * bpp;
+
+    // Signature.
+    cb.bytes_push(out, cast(u8, 137)); cb.bytes_push(out, cast(u8, 80));
+    cb.bytes_push(out, cast(u8, 78));  cb.bytes_push(out, cast(u8, 71));
+    cb.bytes_push(out, cast(u8, 13));  cb.bytes_push(out, cast(u8, 10));
+    cb.bytes_push(out, cast(u8, 26));  cb.bytes_push(out, cast(u8, 10));
+
+    // IHDR.
+    let is [13]u8 as ih;
+    ih[0] = cast(u8, (w >> 24) & 255); ih[1] = cast(u8, (w >> 16) & 255);
+    ih[2] = cast(u8, (w >> 8) & 255);  ih[3] = cast(u8, w & 255);
+    ih[4] = cast(u8, (h >> 24) & 255); ih[5] = cast(u8, (h >> 16) & 255);
+    ih[6] = cast(u8, (h >> 8) & 255);  ih[7] = cast(u8, h & 255);
+    ih[8] = cast(u8, 8);               // bit depth
+    ih[9] = cast(u8, colortype);
+    ih[10] = cast(u8, 0); ih[11] = cast(u8, 0); ih[12] = cast(u8, 0);
+    _png_chunk(out, "IHDR", cast(*u8, &ih), 13);
+
+    // Build filtered scanlines.
+    let is *u8 as px = img.pixels;
+    let is cb.Bytes as raw = cb.bytes_new(h * (1 + stride) + 16);
+    let is i64 as y with mut = 0;
+    while (y < h) {
+        let is i64 as cur = y * img.stride;
+        let is i64 as prev = cur - img.stride;
+        // Choose the filter with the smallest sum of absolute filtered bytes.
+        let is i64 as best_ft with mut = 0;
+        let is i64 as best_cost with mut = 0 - 1;
+        let is i64 as ft with mut = 0;
+        while (ft < 5) {
+            let is i64 as cost with mut = 0;
+            let is i64 as i with mut = 0;
+            while (i < stride) {
+                let is i64 as x = cast(i64, px[cur + i]);
+                let is i64 as a with mut = 0;
+                if (i >= bpp) { a = cast(i64, px[cur + i - bpp]); }
+                let is i64 as b with mut = 0;
+                if (y > 0) { b = cast(i64, px[prev + i]); }
+                let is i64 as cc with mut = 0;
+                if (y > 0) { if (i >= bpp) { cc = cast(i64, px[prev + i - bpp]); } }
+                cost = cost + _sabs(_filt(ft, x, a, b, cc));
+                i = i + 1;
+            }
+            if (best_cost < 0) { best_cost = cost; best_ft = ft; }
+            else { if (cost < best_cost) { best_cost = cost; best_ft = ft; } }
+            ft = ft + 1;
+        }
+        // Emit the chosen filter byte + filtered row.
+        cb.bytes_push(&raw, cast(u8, best_ft));
+        let is i64 as j with mut = 0;
+        while (j < stride) {
+            let is i64 as x = cast(i64, px[cur + j]);
+            let is i64 as a with mut = 0;
+            if (j >= bpp) { a = cast(i64, px[cur + j - bpp]); }
+            let is i64 as b with mut = 0;
+            if (y > 0) { b = cast(i64, px[prev + j]); }
+            let is i64 as cc with mut = 0;
+            if (y > 0) { if (j >= bpp) { cc = cast(i64, px[prev + j - bpp]); } }
+            cb.bytes_push(&raw, cast(u8, _filt(best_ft, x, a, b, cc)));
+            j = j + 1;
+        }
+        y = y + 1;
+    }
+
+    // Compress to IDAT (zlib) and emit.
+    let is cb.Bytes as idat = cb.bytes_new(raw.len / 2 + 64);
+    let is i64 as zr = zlib.zlib_compress(raw.ptr, raw.len, &idat, 2);
+    cb.bytes_free(&raw);
+    if (zr < 0) { cb.bytes_free(&idat); return errno.I_OOM; }
+    _png_chunk(out, "IDAT", idat.ptr, idat.len);
+    cb.bytes_free(&idat);
+
+    _png_chunk(out, "IEND", cast(*u8, 0), 0);
+    return out.len;
+}

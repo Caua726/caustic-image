@@ -1,0 +1,18 @@
+// test_bmp — decode a hand-built 70-byte 24-bit bottom-up BI_RGB BMP.
+use "../core/image.cst"  as image;
+use "../formats/bmp.cst" as bmp;
+use "check.cst"          as chk;
+
+fn main() as i64 {
+    // 14-byte file header (dataoffset=0x36) + 40-byte BITMAPINFOHEADER (2x2,
+    // 24bpp, BI_RGB) + 16 bytes of bottom-up BGR pixels (2 rows of stride 8).
+    let is *u8 as data with imut = "\x42\x4d\x46\x00\x00\x00\x00\x00\x00\x00\x36\x00\x00\x00\x28\x00\x00\x00\x02\x00\x00\x00\x02\x00\x00\x00\x01\x00\x18\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\x00\x00\xff\xff\xff\x00\x00\x00\x00\xff\x00\xff\x00\x00\x00";
+
+    let is image.Image as img;
+    let is i64 as rc = bmp.bmp_decode(data, 70, &img);
+    if (rc != 0) { return 90; }
+    let is i64 as c = chk.check_rgb2x2(&img);
+    if (c != 0) { return c; }
+    image.image_free(&img);
+    return 0;
+}

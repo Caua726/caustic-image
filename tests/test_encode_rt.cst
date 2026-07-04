@@ -1,0 +1,93 @@
+// test_encode_rt — BMP/PNM/TGA encode->decode round-trips, byte-exact.
+use "../core/image.cst"  as image;
+use "../core/pixfmt.cst" as pixfmt;
+use "../formats/bmp.cst" as bmp;
+use "../formats/pnm.cst" as pnm;
+use "../formats/tga.cst" as tga;
+use "../formats/png.cst" as png;
+use "../formats/gif.cst" as gif;
+use "caustic-compact/core/bytes.cst" as cb;
+use "rt.cst" as rt;
+
+fn rt_bmp(w as i64, h as i64, fmt as i64) as i64 {
+    let is image.Image as a;
+    if (rt.make_image(&a, w, h, fmt) != 0) { return 1; }
+    let is cb.Bytes as e = cb.bytes_new(256);
+    if (bmp.bmp_encode(&a, &e) < 0) { return 2; }
+    let is image.Image as b;
+    if (bmp.bmp_decode(e.ptr, e.len, &b) != 0) { return 3; }
+    let is i64 as eq = rt.pixels_equal(&a, &b);
+    cb.bytes_free(&e); image.image_free(&a); image.image_free(&b);
+    return eq;
+}
+fn rt_pnm(w as i64, h as i64, fmt as i64) as i64 {
+    let is image.Image as a;
+    if (rt.make_image(&a, w, h, fmt) != 0) { return 1; }
+    let is cb.Bytes as e = cb.bytes_new(256);
+    if (pnm.pnm_encode(&a, &e) < 0) { return 2; }
+    let is image.Image as b;
+    if (pnm.pnm_decode(e.ptr, e.len, &b) != 0) { return 3; }
+    let is i64 as eq = rt.pixels_equal(&a, &b);
+    cb.bytes_free(&e); image.image_free(&a); image.image_free(&b);
+    return eq;
+}
+fn rt_tga(w as i64, h as i64, fmt as i64) as i64 {
+    let is image.Image as a;
+    if (rt.make_image(&a, w, h, fmt) != 0) { return 1; }
+    let is cb.Bytes as e = cb.bytes_new(256);
+    if (tga.tga_encode(&a, &e) < 0) { return 2; }
+    let is image.Image as b;
+    if (tga.tga_decode(e.ptr, e.len, &b) != 0) { return 3; }
+    let is i64 as eq = rt.pixels_equal(&a, &b);
+    cb.bytes_free(&e); image.image_free(&a); image.image_free(&b);
+    return eq;
+}
+
+fn rt_png(w as i64, h as i64, fmt as i64) as i64 {
+    let is image.Image as a;
+    if (rt.make_image(&a, w, h, fmt) != 0) { return 1; }
+    let is cb.Bytes as e = cb.bytes_new(256);
+    if (png.png_encode(&a, &e) < 0) { return 2; }
+    let is image.Image as b;
+    if (png.png_decode(e.ptr, e.len, &b) != 0) { return 3; }
+    let is i64 as eq = rt.pixels_equal(&a, &b);
+    cb.bytes_free(&e); image.image_free(&a); image.image_free(&b);
+    return eq;
+}
+
+fn rt_gif(w as i64, h as i64, fmt as i64) as i64 {
+    let is image.Image as a;
+    if (rt.make_image(&a, w, h, fmt) != 0) { return 1; }
+    let is cb.Bytes as e = cb.bytes_new(256);
+    if (gif.gif_encode(&a, &e) < 0) { return 2; }
+    let is image.Image as b;
+    if (gif.gif_decode(e.ptr, e.len, &b) != 0) { return 3; }
+    let is i64 as eq = rt.pixels_equal(&a, &b);
+    cb.bytes_free(&e); image.image_free(&a); image.image_free(&b);
+    return eq;
+}
+
+fn main() as i64 {
+    if (rt_bmp(7, 5, pixfmt.FMT_RGB8)   != 0) { return 10; }   // odd width -> padding
+    if (rt_bmp(8, 4, pixfmt.FMT_RGBA8)  != 0) { return 11; }
+    if (rt_pnm(9, 6, pixfmt.FMT_RGB8)   != 0) { return 20; }
+    if (rt_pnm(9, 6, pixfmt.FMT_GRAY8)  != 0) { return 21; }
+    if (rt_tga(7, 5, pixfmt.FMT_RGB8)   != 0) { return 30; }
+    if (rt_tga(8, 4, pixfmt.FMT_RGBA8)  != 0) { return 31; }
+    if (rt_tga(9, 6, pixfmt.FMT_GRAY8)  != 0) { return 32; }
+    if (rt_png(13, 9, pixfmt.FMT_RGB8)   != 0) { return 40; }
+    if (rt_png(13, 9, pixfmt.FMT_RGBA8)  != 0) { return 41; }
+    if (rt_png(13, 9, pixfmt.FMT_GRAY8)  != 0) { return 42; }
+    if (rt_png(13, 9, pixfmt.FMT_GRAYA8) != 0) { return 43; }
+    if (rt_gif(13, 9, pixfmt.FMT_RGB8)   != 0) { return 50; }
+    // larger low-colour image: exercises LZW dictionary growth + code-size bumps
+    let is image.Image as ga;
+    if (rt.make_lowcolor(&ga, 40, 30) != 0) { return 51; }
+    let is cb.Bytes as ge = cb.bytes_new(512);
+    if (gif.gif_encode(&ga, &ge) < 0) { return 52; }
+    let is image.Image as gb;
+    if (gif.gif_decode(ge.ptr, ge.len, &gb) != 0) { return 53; }
+    if (rt.pixels_equal(&ga, &gb) != 0) { return 54; }
+    cb.bytes_free(&ge); image.image_free(&ga); image.image_free(&gb);
+    return 0;
+}

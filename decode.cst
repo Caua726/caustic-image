@@ -1,0 +1,40 @@
+// =======================================================
+// caustic-image/decode.cst
+// Top-level decode dispatch: sniff the leading bytes, then hand off to the
+// matching format decoder. Detection is by content magic only. Formats with
+// no reliable magic (TGA) are reached through their decoder directly.
+//   decode(src, src_len, out) -> 0, or a negative errno; fills *out.
+// =======================================================
+
+use "core/errno.cst"  as errno;
+use "core/image.cst"  as image;
+use "core/sniff.cst"  as sniff;
+use "formats/png.cst" as png;
+use "formats/gif.cst" as gif;
+use "formats/bmp.cst" as bmp;
+use "formats/qoi.cst" as qoi;
+use "formats/pnm.cst" as pnm;
+
+fn decode(src as *u8, src_len as i64, out as *image.Image) as i64 {
+    let is i64 as f = sniff.sniff(src, src_len);
+    if (f == sniff.SNIFF_PNG) { return png.png_decode(src, src_len, out); }
+    if (f == sniff.SNIFF_GIF) { return gif.gif_decode(src, src_len, out); }
+    if (f == sniff.SNIFF_BMP) { return bmp.bmp_decode(src, src_len, out); }
+    if (f == sniff.SNIFF_QOI) { return qoi.qoi_decode(src, src_len, out); }
+    if (f == sniff.SNIFF_PNM) { return pnm.pnm_decode(src, src_len, out); }
+    return errno.I_UNSUPPORTED;
+}
+
+// Short name for a sniffed format id (for CLI / diagnostics).
+fn format_name(f as i64) as *u8 {
+    if (f == sniff.SNIFF_PNG)  { return "PNG"; }
+    if (f == sniff.SNIFF_JPEG) { return "JPEG"; }
+    if (f == sniff.SNIFF_GIF)  { return "GIF"; }
+    if (f == sniff.SNIFF_BMP)  { return "BMP"; }
+    if (f == sniff.SNIFF_QOI)  { return "QOI"; }
+    if (f == sniff.SNIFF_PNM)  { return "PNM"; }
+    if (f == sniff.SNIFF_WEBP) { return "WEBP"; }
+    if (f == sniff.SNIFF_TIFF) { return "TIFF"; }
+    if (f == sniff.SNIFF_CSIF) { return "CSIF"; }
+    return "unknown";
+}

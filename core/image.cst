@@ -1,0 +1,100 @@
+// =======================================================
+// caustic-image/core/image.cst
+// The one pixel-buffer abstraction every decoder fills and every encoder
+// reads. Pixels are interleaved, top-down, `stride` bytes per row (stride =
+// width * bytes-per-pixel, no extra padding). Backed by mmap so it grows past
+// the 64 KB bins cap (a 4K RGBA frame is 33 MB).
+//
+// image_init validates dimensions in widened i64 BEFORE allocating — the
+// ILIM posture the CSIF spec mandates and the fix for the WebP/BLASTPASS
+// class of allocator-overflow bugs.
+// =======================================================
+
+use "std/mem.cst" only bins, core as mem;
+use "errno.cst"  as errno;
+use "pixfmt.cst" as pixfmt;
+
+struct Image {
+    pixels as *u8;   // interleaved pixel data (owned iff owned==1)
+    width  as i64;   // pixels
+    height as i64;   // pixels
+    stride as i64;   // bytes per row
+    fmt    as i64;   // pixfmt.FMT_*
+    owned  as i64;   // 1 = image_free must munmap pixels
+}
+
+// Safety ceilings. These are the library-wide ILIM defaults; a per-file ILIM
+// chunk (CSIF) can only tighten them, never widen. Chosen so every product
+// below stays far inside i64 (no wraparound): DIM^2 * 8 <= 2^51.
+let is i64 as IMG_MAX_DIM    with imut = 16777216;    // 1<<24 per side
+let is i64 as IMG_MAX_PIXELS with imut = 1073741824;  // 1<<30 total pixels (~1 Gpx)
+
+// Validate a (width, height, fmt) triple against the ceilings using widened
+// arithmetic. Returns 0 if an allocation of width*height*bpp is safe, else a
+// negative code. Does not allocate. Callers should run this before trusting a
+// header's dimensions.
+fn image_check_dims(w as i64, h as i64, fmt as i64) as i64 {
+    if (w < 1) { return errno.I_DIMS; }
+    if (h < 1) { return errno.I_DIMS; }
+    if (w > IMG_MAX_DIM) { return errno.I_DIMS; }
+    if (h > IMG_MAX_DIM) { return errno.I_DIMS; }
+    let is i64 as bpp = pixfmt.fmt_bpp(fmt);
+    if (bpp <= 0) { return errno.I_UNSUPPORTED; }
+    // w,h <= 2^24 so the product is <= 2^48 — no i64 overflow.
+    let is i64 as npx = w * h;
+    if (npx > IMG_MAX_PIXELS) { return errno.I_DIMS; }
+    return 0;
+}
+
+// Allocate pixel storage for a width*height image of `fmt`. Fills *img and
+// returns 0, or leaves img->pixels null and returns a negative code.
+fn image_init(img as *Image, w as i64, h as i64, fmt as i64) as i64 {
+    img.pixels = cast(*u8, 0);
+    img.width  = 0;
+    img.height = 0;
+    img.stride = 0;
+    img.fmt    = pixfmt.FMT_NONE;
+    img.owned  = 0;
+
+    let is i64 as chk = image_check_dims(w, h, fmt);
+    if (chk < 0) { return chk; }
+
+    let is i64 as bpp = pixfmt.fmt_bpp(fmt);
+    let is i64 as stride = w * bpp;             // <= 2^24 * 8 = 2^27
+    let is i64 as nbytes = stride * h;          // <= 2^51
+    let is *u8 as p = mem.core.mmap_anon(nbytes);
+    if (cast(i64, p) <= 0) { return errno.I_OOM; }
+
+    img.pixels = p;
+    img.width  = w;
+    img.height = h;
+    img.stride = stride;
+    img.fmt    = fmt;
+    img.owned  = 1;
+    return 0;
+}
+
+// Byte size of the pixel buffer (stride * height).
+fn image_size(img as *Image) as i64 {
+    return img.stride * img.height;
+}
+
+// Pointer to the first byte of row `y`.
+fn image_row(img as *Image, y as i64) as *u8 {
+    return cast(*u8, cast(i64, img.pixels) + y * img.stride);
+}
+
+// Release owned pixel storage and reset the handle.
+fn image_free(img as *Image) as void {
+    if (img.owned == 1) {
+        if (cast(i64, img.pixels) > 0) {
+            mem.core.munmap(img.pixels, image_size(img));
+        }
+    }
+    img.pixels = cast(*u8, 0);
+    img.width  = 0;
+    img.height = 0;
+    img.stride = 0;
+    img.fmt    = pixfmt.FMT_NONE;
+    img.owned  = 0;
+}
