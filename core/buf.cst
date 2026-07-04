@@ -97,6 +97,22 @@ fn buf_u32be(b as *Buf) as i64 {
     return v;
 }
 
+// 64-bit little-endian. Returns the value (may be large/negative if bit 63 set;
+// CSIF sizes stay well under 2^63 so a negative result signals corruption).
+fn buf_u64le(b as *Buf) as i64 {
+    if (buf_remaining(b) < 8) { return errno.I_EOF; }
+    let is i64 as lo = cast(i64, b.ptr[b.pos])
+        | (cast(i64, b.ptr[b.pos + 1]) << 8)
+        | (cast(i64, b.ptr[b.pos + 2]) << 16)
+        | (cast(i64, b.ptr[b.pos + 3]) << 24);
+    let is i64 as hi = cast(i64, b.ptr[b.pos + 4])
+        | (cast(i64, b.ptr[b.pos + 5]) << 8)
+        | (cast(i64, b.ptr[b.pos + 6]) << 16)
+        | (cast(i64, b.ptr[b.pos + 7]) << 24);
+    b.pos = b.pos + 8;
+    return lo | (hi << 32);
+}
+
 // Copy `n` bytes into `dst`. Returns 0, or I_EOF (without moving) if too few.
 fn buf_read(b as *Buf, dst as *u8, n as i64) as i64 {
     if (n < 0) { return errno.I_BADPARAM; }

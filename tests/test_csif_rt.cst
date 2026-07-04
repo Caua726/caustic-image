@@ -1,0 +1,32 @@
+// test_csif_rt — CSIF (RAW codec) encode->decode round-trip, bit-exact, for
+// every 8-bit pixel format. Exercises the full container: header + CRC,
+// directory, chunk framing, ILIM/IHDR/ICOL/ICOD/IDAT/IEND, and RAW.
+use "../core/image.cst"  as image;
+use "../core/pixfmt.cst" as pixfmt;
+use "../csif/container.cst" as csif;
+use "caustic-compact/core/bytes.cst" as cb;
+use "rt.cst" as rt;
+
+fn roundtrip(w as i64, h as i64, fmt as i64) as i64 {
+    let is image.Image as a;
+    if (rt.make_image(&a, w, h, fmt) != 0) { return 1; }
+    let is cb.Bytes as e = cb.bytes_new(1024);
+    let is i64 as n = csif.csif_encode(&a, &e);
+    if (n < 0) { return 2; }
+    let is image.Image as b;
+    let is i64 as rc = csif.csif_decode(e.ptr, e.len, &b);
+    if (rc < 0) { return 3; }
+    let is i64 as eq = rt.pixels_equal(&a, &b);
+    cb.bytes_free(&e); image.image_free(&a); image.image_free(&b);
+    return eq;
+}
+
+fn main() as i64 {
+    if (roundtrip(13, 9, pixfmt.FMT_RGB8)   != 0) { return 10; }
+    if (roundtrip(13, 9, pixfmt.FMT_RGBA8)  != 0) { return 20; }
+    if (roundtrip(13, 9, pixfmt.FMT_GRAY8)  != 0) { return 30; }
+    if (roundtrip(13, 9, pixfmt.FMT_GRAYA8) != 0) { return 40; }
+    if (roundtrip(1, 1, pixfmt.FMT_RGBA8)   != 0) { return 50; }
+    if (roundtrip(64, 48, pixfmt.FMT_RGB8)  != 0) { return 60; }
+    return 0;
+}

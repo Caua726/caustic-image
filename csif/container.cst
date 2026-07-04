@@ -1,0 +1,376 @@
+// =======================================================
+// caustic-image/csif/container.cst
+// The CSIF container (byte-exact, spec §1) plus the RAW codec (§5.1) for a
+// single-item, single-tile, 8-bit UINT8 interleaved image. This is the first
+// end-to-end CSIF slice: encode an Image to a valid .csif and decode it back
+// bit-exact.
+//
+// File = [header 64B][directory chunk_count×32B][framed chunks][pad]. Every
+// chunk is [type 4][flags 4][payload_length 8][payload][crc32 4]. CRC-32 is
+// reused from caustic-compact. Colour is carried in an ICOL chunk with the
+// mandatory CICP block (§2.1); "Unspecified" (2) is rejected loudly.
+//
+//   csif_encode(img, out) -> out.len, or negative E_CSIF_*.
+//   csif_decode(src, len, out) -> 0, or negative E_CSIF_*.
+// =======================================================
+
+use "../core/image.cst"  as image;
+use "../core/pixfmt.cst" as pixfmt;
+use "../core/buf.cst"    as buf;
+use "errno.cst"          as ce;
+use "caustic-compact/core/bytes.cst"    as cb;
+use "caustic-compact/core/checksum.cst" as checksum;
+
+// ---- little-endian append helpers ----
+fn _w8(o as *cb.Bytes, v as i64)  as void { cb.bytes_push(o, cast(u8, v & 255)); }
+fn _w16(o as *cb.Bytes, v as i64) as void { _w8(o, v); _w8(o, v >> 8); }
+fn _w32(o as *cb.Bytes, v as i64) as void { _w8(o, v); _w8(o, v >> 8); _w8(o, v >> 16); _w8(o, v >> 24); }
+fn _w64(o as *cb.Bytes, v as i64) as void { _w32(o, v); _w32(o, v >> 32); }
+fn _wz(o as *cb.Bytes, n as i64)  as void { let is i64 as i with mut = 0; while (i < n) { _w8(o, 0); i = i + 1; } }
+
+fn _align8(x as i64) as i64 { return ((x + 7) / 8) * 8; }
+
+// Frame one chunk into `c`: [type][flags][payload_length][payload][crc32].
+fn _emit_chunk(c as *cb.Bytes, typ as *u8, flags as i64, payload as *u8, plen as i64) as void {
+    cb.bytes_push(c, typ[0]); cb.bytes_push(c, typ[1]); cb.bytes_push(c, typ[2]); cb.bytes_push(c, typ[3]);
+    _w32(c, flags);
+    _w64(c, plen);
+    cb.bytes_append(c, payload, plen);
+    let is i64 as crc = checksum.crc32(c.ptr, c.len);
+    _w32(c, crc);
+}
+
+// Map Image format to (color_model, channels), or channels=0 if unsupported.
+fn _fmt_axes(fmt as i64, cm as *i64, ch as *i64) as void {
+    cm[0] = 0; ch[0] = 0;
+    if (fmt == pixfmt.FMT_GRAY8)  { cm[0] = 0; ch[0] = 1; }
+    if (fmt == pixfmt.FMT_GRAYA8) { cm[0] = 1; ch[0] = 2; }
+    if (fmt == pixfmt.FMT_RGB8)   { cm[0] = 2; ch[0] = 3; }
+    if (fmt == pixfmt.FMT_RGBA8)  { cm[0] = 3; ch[0] = 4; }
+}
+
+// ---- payload builders ----
+fn _pl_ilim(p as *cb.Bytes) as void {
+    // 23 u64 ceilings — generous BASELINE defaults.
+    _w64(p, 65536); _w64(p, 65536); _w64(p, 268435456); _w64(p, 268435456);   // w,h,pixels,tile_pixels
+    _w64(p, 1073741824); _w64(p, 16); _w64(p, 64); _w64(p, 1073741824);       // alloc,comp,aux,chunk
+    _w64(p, 1024); _w64(p, 65536); _w64(p, 32); _w64(p, 65536);               // items,tiles,mips,frames
+    _w64(p, 64); _w64(p, 32); _w64(p, 64); _w64(p, 64);                       // refslots,derdepth,derfanin,estreams
+    _w64(p, 262144); _w64(p, 4096); _w64(p, 65536); _w64(p, 65536);           // matree,palette,patches,splines
+    _w64(p, 1048576); _w64(p, 16777216); _w64(p, 256);                        // splinepts,metabytes,manifests
+}
+
+fn _pl_ihdr(p as *cb.Bytes, img as *image.Image, cm as i64, ch as i64) as void {
+    let is i64 as w = img.width;
+    let is i64 as h = img.height;
+    let is i64 as alpha_mode with mut = 0;
+    if (cm == 1) { alpha_mode = 1; }   // GRAYA straight
+    if (cm == 3) { alpha_mode = 1; }   // RGBA straight
+    _w64(p, 0);            // item_id
+    _w32(p, w);           // width
+    _w32(p, h);           // height
+    _w32(p, 1);           // depth
+    _w8(p, 0);            // sample_format UINT8
+    _w8(p, 0);            // sample_endian LE
+    _w8(p, 8);            // bit_depth
+    _w8(p, 0);            // sample_layout FLAT
+    _w8(p, cm);           // color_model
+    _w8(p, ch);           // component_count
+    _w8(p, 1);            // chroma_h_subsample
+    _w8(p, 1);            // chroma_v_subsample
+    _w8(p, 0);            // chroma_sample_position N/A
+    _w8(p, alpha_mode);   // alpha_mode
+    _w8(p, 0);            // orientation
+    _w8(p, 0);            // reserved0
+    _w32(p, 0); _w32(p, 0); _w32(p, w); _w32(p, h);   // display_window {x,y,w,h}
+    _w32(p, 0); _w32(p, 0); _w32(p, w); _w32(p, h);   // data_window
+    _w32(p, 1); _w32(p, 1);                            // pixel_aspect_ratio {num,den}
+    _w32(p, 0);                                        // intensity_target_nits f32 = 0.0
+}
+
+fn _pl_icol(p as *cb.Bytes) as void {
+    _w64(p, 0);      // item_id
+    _w8(p, 0);       // color_authority CICP
+    _w8(p, 1);       // color_primaries BT.709/sRGB
+    _w8(p, 13);      // transfer_function sRGB
+    _w8(p, 0);       // matrix_coefficients Identity (required for RGB/Gray)
+    _w8(p, 1);       // full_range
+    _w8(p, 0);       // chroma_sample_position
+    _w8(p, 1);       // h_subsample
+    _w8(p, 1);       // v_subsample
+}
+
+fn _pl_icod(p as *cb.Bytes) as void {
+    _w64(p, 0);      // item_id
+    _w16(p, 0);      // codec_id RAW
+    _w16(p, 1);      // codec_version
+    _w8(p, 1);       // is_lossless
+    _w8(p, 0);       // color_transform NONE
+    _w8(p, 0);       // supercompress_id
+    _w8(p, 0);       // cross_tile_prediction
+    _w32(p, 0); _w32(p, 0);        // tile_w, tile_h (0 = full image)
+    _w32(p, 1); _w32(p, 1);        // n_tiles_x, n_tiles_y
+    _w32(p, 1); _w32(p, 1);        // n_resolution_levels, n_quality_layers
+    _w32(p, 0);                    // progression_order NONE
+    _w16(p, 3);                    // entropy_method_id raw
+    _w8(p, 0);                     // sub_image_count
+    _w8(p, 0);                     // reserved0
+    _w32(p, 8);                    // params_length
+    // RAW params (8 bytes): interleaved, byte-aligned, row_alignment 1.
+    _w8(p, 1); _w8(p, 0); _w8(p, 1); _wz(p, 5);
+}
+
+fn _pl_idat(p as *cb.Bytes, img as *image.Image, ch as i64) as void {
+    _w64(p, 0);      // item_id
+    _w32(p, 0);      // idat_index
+    _w32(p, 0);      // coord_kind WHOLE
+    _w32(p, 0); _w32(p, 0); _w32(p, 0); _w32(p, 0);   // coords
+    // RAW codec bytes: interleaved UINT8 pixels, contiguous (stride == w*ch).
+    cb.bytes_append(p, img.pixels, img.stride * img.height);
+}
+
+fn csif_encode(img as *image.Image, out as *cb.Bytes) as i64 {
+    let is [1]i64 as cmv;
+    let is [1]i64 as chv;
+    _fmt_axes(img.fmt, cast(*i64, &cmv), cast(*i64, &chv));
+    let is i64 as cm = cmv[0];
+    let is i64 as ch = chv[0];
+    if (ch == 0) { return ce.E_CSIF_UNSUPPORTED_SAMPLE; }
+
+    // Build the six framed chunks.
+    let is cb.Bytes as p = cb.bytes_new(4096);
+    let is cb.Bytes as c0 = cb.bytes_new(256);
+    let is cb.Bytes as c1 = cb.bytes_new(128);
+    let is cb.Bytes as c2 = cb.bytes_new(64);
+    let is cb.Bytes as c3 = cb.bytes_new(128);
+    let is cb.Bytes as c4 = cb.bytes_new(256);
+    let is cb.Bytes as c5 = cb.bytes_new(64);
+    cb.bytes_reset(&p); _pl_ilim(&p);          _emit_chunk(&c0, "ILIM", 11, p.ptr, p.len);
+    cb.bytes_reset(&p); _pl_ihdr(&p, img, cm, ch); _emit_chunk(&c1, "IHDR", 19, p.ptr, p.len);
+    cb.bytes_reset(&p); _pl_icol(&p);          _emit_chunk(&c2, "ICOL", 19, p.ptr, p.len);
+    cb.bytes_reset(&p); _pl_icod(&p);          _emit_chunk(&c3, "ICOD", 19, p.ptr, p.len);
+    cb.bytes_reset(&p); _pl_idat(&p, img, ch); _emit_chunk(&c4, "IDAT", 51, p.ptr, p.len);
+    cb.bytes_reset(&p); _w64(&p, 0);           _emit_chunk(&c5, "IEND", 11, p.ptr, p.len);
+
+    // Lay out offsets (8-byte aligned) after header + directory.
+    let is i64 as o0 = 64 + 6 * 32;
+    let is i64 as o1 = _align8(o0 + c0.len);
+    let is i64 as o2 = _align8(o1 + c1.len);
+    let is i64 as o3 = _align8(o2 + c2.len);
+    let is i64 as o4 = _align8(o3 + c3.len);
+    let is i64 as o5 = _align8(o4 + c4.len);
+    let is i64 as file_size = _align8(o5 + c5.len);
+
+    // Header (64 bytes).
+    cb.bytes_push(out, cast(u8, 67)); cb.bytes_push(out, cast(u8, 83));
+    cb.bytes_push(out, cast(u8, 73)); cb.bytes_push(out, cast(u8, 70));   // "CSIF"
+    _w8(out, 137); _w8(out, 13); _w8(out, 10); _w8(out, 26); _w8(out, 10); _w8(out, 0);  // probe
+    _w16(out, 1);        // version
+    _w8(out, 0);         // container_endian
+    _w8(out, 1);         // arch_hint x86_64
+    _w8(out, 0);         // layout RANDOM
+    _w8(out, 1);         // checksum_algo CRC32-IEEE
+    _w8(out, 0);         // profile BASELINE
+    _w8(out, 1);         // level
+    _w16(out, 0);        // header_flags
+    _w32(out, 6);        // chunk_count
+    _w64(out, 64);       // directory_offset
+    _w64(out, file_size);
+    _w64(out, 0);        // primary_item_id
+    _w64(out, 0);        // directory_offset_tail
+    let is i64 as hcrc = checksum.crc32(out.ptr, 56);
+    _w64(out, hcrc);     // header_crc (low 32 = crc)
+
+    // Directory (6 × 32B): type, flags, offset, length, seq, reserved.
+    _emit_dir(out, "ILIM", 11, o0, c0.len, 0);
+    _emit_dir(out, "IHDR", 19, o1, c1.len, 1);
+    _emit_dir(out, "ICOL", 19, o2, c2.len, 2);
+    _emit_dir(out, "ICOD", 19, o3, c3.len, 3);
+    _emit_dir(out, "IDAT", 51, o4, c4.len, 4);
+    _emit_dir(out, "IEND", 11, o5, c5.len, 5);
+
+    // Chunks, each padded to the next 8-byte offset.
+    cb.bytes_append(out, c0.ptr, c0.len); _wz(out, o1 - (o0 + c0.len));
+    cb.bytes_append(out, c1.ptr, c1.len); _wz(out, o2 - (o1 + c1.len));
+    cb.bytes_append(out, c2.ptr, c2.len); _wz(out, o3 - (o2 + c2.len));
+    cb.bytes_append(out, c3.ptr, c3.len); _wz(out, o4 - (o3 + c3.len));
+    cb.bytes_append(out, c4.ptr, c4.len); _wz(out, o5 - (o4 + c4.len));
+    cb.bytes_append(out, c5.ptr, c5.len); _wz(out, file_size - (o5 + c5.len));
+
+    cb.bytes_free(&p);
+    cb.bytes_free(&c0); cb.bytes_free(&c1); cb.bytes_free(&c2);
+    cb.bytes_free(&c3); cb.bytes_free(&c4); cb.bytes_free(&c5);
+    return out.len;
+}
+
+fn _emit_dir(out as *cb.Bytes, typ as *u8, flags as i64, off as i64, len as i64, seq as i64) as void {
+    cb.bytes_push(out, typ[0]); cb.bytes_push(out, typ[1]); cb.bytes_push(out, typ[2]); cb.bytes_push(out, typ[3]);
+    _w32(out, flags);
+    _w64(out, off);
+    _w64(out, len);
+    _w32(out, seq);
+    _w32(out, 0);
+}
+
+// ---- decode ----
+fn _is(t0 as i64, t1 as i64, t2 as i64, t3 as i64, s as *u8) as i64 {
+    if (t0 != cast(i64, s[0])) { return 0; }
+    if (t1 != cast(i64, s[1])) { return 0; }
+    if (t2 != cast(i64, s[2])) { return 0; }
+    if (t3 != cast(i64, s[3])) { return 0; }
+    return 1;
+}
+
+fn csif_decode(src as *u8, len as i64, out as *image.Image) as i64 {
+    if (len < 64) { return ce.E_CSIF_TOO_SMALL; }
+    let is buf.Buf as bf;
+    buf.buf_init(&bf, src, len);
+
+    // Header.
+    if (_is(buf.buf_u8(&bf), buf.buf_u8(&bf), buf.buf_u8(&bf), buf.buf_u8(&bf), "CSIF") == 0) { return ce.E_CSIF_MAGIC; }
+    if (buf.buf_u8(&bf) != 137) { return ce.E_CSIF_TRANSMISSION; }
+    if (buf.buf_u8(&bf) != 13)  { return ce.E_CSIF_TRANSMISSION; }
+    if (buf.buf_u8(&bf) != 10)  { return ce.E_CSIF_TRANSMISSION; }
+    if (buf.buf_u8(&bf) != 26)  { return ce.E_CSIF_TRANSMISSION; }
+    if (buf.buf_u8(&bf) != 10)  { return ce.E_CSIF_TRANSMISSION; }
+    if (buf.buf_u8(&bf) != 0)   { return ce.E_CSIF_TRANSMISSION; }
+    if (buf.buf_u16le(&bf) != 1) { return ce.E_CSIF_VERSION; }
+    if (buf.buf_u8(&bf) != 0)    { return ce.E_CSIF_ENDIAN; }
+    buf.buf_u8(&bf);                                   // arch_hint
+    buf.buf_u8(&bf);                                   // layout
+    let is i64 as cksum_algo = buf.buf_u8(&bf);
+    buf.buf_u8(&bf);                                   // profile
+    buf.buf_u8(&bf);                                   // level
+    buf.buf_u16le(&bf);                                // header_flags
+    let is i64 as chunk_count = buf.buf_u32le(&bf);
+    let is i64 as dir_off = buf.buf_u64le(&bf);
+    let is i64 as file_size = buf.buf_u64le(&bf);
+    if (file_size != len) { return ce.E_CSIF_TRUNCATED; }
+    buf.buf_u64le(&bf);                                // primary_item_id
+    buf.buf_u64le(&bf);                                // directory_offset_tail
+    let is i64 as hcrc = buf.buf_u64le(&bf);
+    if (cksum_algo != 0) {
+        if (checksum.crc32(src, 56) != (hcrc & 0xFFFFFFFF)) { return ce.E_CSIF_HEADER_CRC; }
+    }
+    if (dir_off < 64) { return ce.E_CSIF_DIR_RANGE; }
+    if (dir_off + chunk_count * 32 > len) { return ce.E_CSIF_DIR_RANGE; }
+
+    // Walk the directory, validate + verify each chunk, capture payload offsets.
+    let is i64 as ihdr_off with mut = 0 - 1;
+    let is i64 as icol_off with mut = 0 - 1;
+    let is i64 as icod_off with mut = 0 - 1;
+    let is i64 as idat_off with mut = 0 - 1;
+    let is i64 as idat_plen with mut = 0;
+
+    let is i64 as di with mut = 0;
+    while (di < chunk_count) {
+        buf.buf_seek(&bf, dir_off + di * 32);
+        let is i64 as dt0 = buf.buf_u8(&bf); let is i64 as dt1 = buf.buf_u8(&bf);
+        let is i64 as dt2 = buf.buf_u8(&bf); let is i64 as dt3 = buf.buf_u8(&bf);
+        let is i64 as dflags = buf.buf_u32le(&bf);
+        let is i64 as coff = buf.buf_u64le(&bf);
+        let is i64 as clen = buf.buf_u64le(&bf);
+        // buf_seek would already reject an out-of-range dir entry via EOF reads.
+        if (coff < 64) { return ce.E_CSIF_RANGE; }
+        if (coff + clen > len) { return ce.E_CSIF_RANGE; }
+
+        // Chunk header.
+        buf.buf_seek(&bf, coff);
+        let is i64 as t0 = buf.buf_u8(&bf); let is i64 as t1 = buf.buf_u8(&bf);
+        let is i64 as t2 = buf.buf_u8(&bf); let is i64 as t3 = buf.buf_u8(&bf);
+        let is i64 as cflags = buf.buf_u32le(&bf);
+        let is i64 as plen = buf.buf_u64le(&bf);
+        if (dt0 != t0) { return ce.E_CSIF_FLAG_MISMATCH; }
+        if (dflags != cflags) { return ce.E_CSIF_FLAG_MISMATCH; }
+        let is i64 as critical = cflags & 1;
+
+        // CRC over [type..payload] = the 16-byte header + payload.
+        if (cksum_algo != 0) {
+            let is i64 as body = 16 + plen;
+            if (coff + body + 4 > len) { return ce.E_CSIF_RANGE; }
+            let is i64 as calc = checksum.crc32(cast(*u8, cast(i64, src) + coff), body);
+            let is buf.Buf as cb2;
+            buf.buf_init(&cb2, src, len);
+            buf.buf_seek(&cb2, coff + body);
+            let is i64 as stored = buf.buf_u32le(&cb2);
+            if (calc != stored) {
+                if (critical == 1) { return ce.E_CSIF_CRC_CRITICAL; }
+            }
+        }
+
+        let is i64 as poff = coff + 16;
+        if (_is(t0,t1,t2,t3, "IHDR") == 1) { ihdr_off = poff; }
+        else { if (_is(t0,t1,t2,t3, "ICOL") == 1) { icol_off = poff; }
+        else { if (_is(t0,t1,t2,t3, "ICOD") == 1) { icod_off = poff; }
+        else { if (_is(t0,t1,t2,t3, "IDAT") == 1) { idat_off = poff; idat_plen = plen; }
+        else { if (_is(t0,t1,t2,t3, "ILIM") == 1) { }
+        else { if (_is(t0,t1,t2,t3, "IEND") == 1) { }
+        else {
+            // Unknown type: fail only if critical.
+            if (critical == 1) { return ce.E_CSIF_UNKNOWN_CRITICAL; }
+        } } } } } }
+        di = di + 1;
+    }
+
+    if (ihdr_off < 0) { return ce.E_CSIF_ORDER; }
+    if (icod_off < 0) { return ce.E_CSIF_ORDER; }
+    if (idat_off < 0) { return ce.E_CSIF_ORDER; }
+
+    // Parse IHDR.
+    buf.buf_seek(&bf, ihdr_off);
+    buf.buf_u64le(&bf);                       // item_id
+    let is i64 as w = buf.buf_u32le(&bf);
+    let is i64 as h = buf.buf_u32le(&bf);
+    buf.buf_u32le(&bf);                       // depth
+    let is i64 as sample_format = buf.buf_u8(&bf);
+    buf.buf_u8(&bf);                          // sample_endian
+    buf.buf_u8(&bf);                          // bit_depth
+    buf.buf_u8(&bf);                          // sample_layout
+    let is i64 as color_model = buf.buf_u8(&bf);
+    let is i64 as component_count = buf.buf_u8(&bf);
+    if (sample_format != 0) { return ce.E_CSIF_UNSUPPORTED_SAMPLE; }   // RAW-uint8 path
+
+    // Parse ICOL: enforce the anti-"Unspecified" + matrix rules.
+    if (icol_off >= 0) {
+        buf.buf_seek(&bf, icol_off);
+        buf.buf_u64le(&bf);                   // item_id
+        buf.buf_u8(&bf);                      // color_authority
+        let is i64 as prim = buf.buf_u8(&bf);
+        let is i64 as trc = buf.buf_u8(&bf);
+        let is i64 as mtx = buf.buf_u8(&bf);
+        if (prim == 2) { return ce.E_CSIF_COLOR_UNSPECIFIED; }
+        if (trc == 2)  { return ce.E_CSIF_COLOR_UNSPECIFIED; }
+        if (mtx == 2)  { return ce.E_CSIF_COLOR_UNSPECIFIED; }
+        // RGB/Gray must use Identity matrix.
+        if (color_model <= 3) { if (mtx != 0) { return ce.E_CSIF_COLOR_MATRIX_MISMATCH; } }
+    }
+
+    // Parse ICOD: dispatch by codec_id (only RAW implemented).
+    buf.buf_seek(&bf, icod_off);
+    buf.buf_u64le(&bf);                       // item_id
+    let is i64 as codec_id = buf.buf_u16le(&bf);
+    if (codec_id != 0) { return ce.E_CSIF_UNKNOWN_CODEC; }
+
+    // Resolve the pixel format from color_model + component_count.
+    let is i64 as fmt with mut = 0;
+    if (color_model == 0) { if (component_count == 1) { fmt = pixfmt.FMT_GRAY8; } }
+    if (color_model == 1) { if (component_count == 2) { fmt = pixfmt.FMT_GRAYA8; } }
+    if (color_model == 2) { if (component_count == 3) { fmt = pixfmt.FMT_RGB8; } }
+    if (color_model == 3) { if (component_count == 4) { fmt = pixfmt.FMT_RGBA8; } }
+    if (fmt == 0) { return ce.E_CSIF_UNSUPPORTED_SAMPLE; }
+
+    let is i64 as dchk = image.image_check_dims(w, h, fmt);
+    if (dchk < 0) { return ce.E_CSIF_DIMS; }
+
+    // RAW decode: codec bytes are the interleaved pixels (after IDAT's 32B head).
+    let is i64 as pixbytes = idat_plen - 32;
+    let is i64 as need = w * h * component_count;
+    if (pixbytes != need) { return ce.E_CSIF_PAYLOAD_TRUNC; }
+
+    let is i64 as rc = image.image_init(out, w, h, fmt);
+    if (rc < 0) { return rc; }
+    let is *u8 as srcpx = cast(*u8, cast(i64, src) + idat_off + 32);
+    let is i64 as i with mut = 0;
+    while (i < need) { out.pixels[i] = srcpx[i]; i = i + 1; }
+    return 0;
+}

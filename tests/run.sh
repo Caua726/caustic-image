@@ -44,6 +44,8 @@ run_case test_gif_interlace  tests/test_gif_interlace.cst
 run_case test_limit          tests/test_limit.cst
 run_case test_qoi_rt         tests/test_qoi_rt.cst
 run_case test_encode_rt      tests/test_encode_rt.cst
+run_case test_csif_rt        tests/test_csif_rt.cst
+run_case test_csif_corrupt   tests/test_csif_corrupt.cst
 
 if [ "$fail" -eq 0 ]; then echo "all green"; else echo "FAILURES"; fi
 exit $fail

@@ -1,0 +1,107 @@
+// test_csif_corrupt — the "fail loud" conformance corpus: each mutation of a
+// valid CSIF must be rejected with its exact numbered error, never a partial
+// or best-effort decode.
+use "../core/image.cst"  as image;
+use "../core/pixfmt.cst" as pixfmt;
+use "../core/buf.cst"    as buf;
+use "../csif/container.cst" as csif;
+use "../csif/errno.cst"     as ce;
+use "caustic-compact/core/bytes.cst"    as cb;
+use "caustic-compact/core/checksum.cst" as checksum;
+use "rt.cst" as rt;
+
+// Encode a fixed valid CSIF (8x6 RGB8) into `out`.
+fn enc(out as *cb.Bytes) as void {
+    let is image.Image as a;
+    rt.make_image(&a, 8, 6, pixfmt.FMT_RGB8);
+    csif.csif_encode(&a, out);
+    image.image_free(&a);
+}
+// Fresh mutable copy of a template.
+fn dup(tpl as *cb.Bytes, out as *cb.Bytes) as void {
+    cb.bytes_append(out, tpl.ptr, tpl.len);
+}
+// Recompute a chunk's trailing CRC after a payload byte was mutated.
+fn recrc(p as *u8, len as i64, coff as i64) as void {
+    let is buf.Buf as bf;
+    buf.buf_init(&bf, p, len);
+    buf.buf_seek(&bf, coff + 8);
+    let is i64 as plen = buf.buf_u64le(&bf);
+    let is i64 as body = 16 + plen;
+    let is i64 as crc = checksum.crc32(cast(*u8, cast(i64, p) + coff), body);
+    p[coff + body]     = cast(u8, crc & 255);
+    p[coff + body + 1] = cast(u8, (crc >> 8) & 255);
+    p[coff + body + 2] = cast(u8, (crc >> 16) & 255);
+    p[coff + body + 3] = cast(u8, (crc >> 24) & 255);
+}
+// Read chunk offset for directory entry `idx` (chunk_offset field @ +8).
+fn dir_off(p as *u8, len as i64, idx as i64) as i64 {
+    let is buf.Buf as bf;
+    buf.buf_init(&bf, p, len);
+    buf.buf_seek(&bf, 64 + idx * 32 + 8);
+    return buf.buf_u64le(&bf);
+}
+fn dec(c as *cb.Bytes) as i64 {
+    let is image.Image as img;
+    let is i64 as rc = csif.csif_decode(c.ptr, c.len, &img);
+    if (rc == 0) { image.image_free(&img); }
+    return rc;
+}
+
+fn main() as i64 {
+    let is cb.Bytes as tpl = cb.bytes_new(1024);
+    enc(&tpl);
+
+    // 0) the template itself decodes cleanly.
+    let is image.Image as ok;
+    if (csif.csif_decode(tpl.ptr, tpl.len, &ok) != 0) { return 1; }
+    image.image_free(&ok);
+
+    // 1) bad magic.
+    let is cb.Bytes as c1 = cb.bytes_new(tpl.len); dup(&tpl, &c1);
+    c1.ptr[0] = cast(u8, 88);
+    if (dec(&c1) != ce.E_CSIF_MAGIC) { return 10; }
+
+    // 2) bad transmission probe (byte 4 must be 0x89).
+    let is cb.Bytes as c2 = cb.bytes_new(tpl.len); dup(&tpl, &c2);
+    c2.ptr[4] = cast(u8, 0);
+    if (dec(&c2) != ce.E_CSIF_TRANSMISSION) { return 20; }
+
+    // 3) wrong file_size (field @ 0x20) -> truncated, before CRC check.
+    let is cb.Bytes as c3 = cb.bytes_new(tpl.len); dup(&tpl, &c3);
+    c3.ptr[0x20] = cast(u8, cast(i64, c3.ptr[0x20]) ^ 1);
+    if (dec(&c3) != ce.E_CSIF_TRUNCATED) { return 30; }
+
+    // 4) corrupt a header byte (profile @ 0x10) without fixing header_crc.
+    let is cb.Bytes as c4 = cb.bytes_new(tpl.len); dup(&tpl, &c4);
+    c4.ptr[0x10] = cast(u8, 7);
+    if (dec(&c4) != ce.E_CSIF_HEADER_CRC) { return 40; }
+
+    // 5) corrupt a critical chunk payload (ILIM, entry 0) without fixing CRC.
+    let is cb.Bytes as c5 = cb.bytes_new(tpl.len); dup(&tpl, &c5);
+    let is i64 as ilim_off = dir_off(c5.ptr, c5.len, 0);
+    c5.ptr[ilim_off + 16] = cast(u8, cast(i64, c5.ptr[ilim_off + 16]) ^ 0xFF);
+    if (dec(&c5) != ce.E_CSIF_CRC_CRITICAL) { return 50; }
+
+    // 6) unknown codec_id (ICOD entry 3), CRC repaired -> loud codec error.
+    let is cb.Bytes as c6 = cb.bytes_new(tpl.len); dup(&tpl, &c6);
+    let is i64 as icod_off = dir_off(c6.ptr, c6.len, 3);
+    c6.ptr[icod_off + 16 + 8] = cast(u8, 99);      // codec_id low byte
+    c6.ptr[icod_off + 16 + 9] = cast(u8, 0);
+    recrc(c6.ptr, c6.len, icod_off);
+    if (dec(&c6) != ce.E_CSIF_UNKNOWN_CODEC) { return 60; }
+
+    // 7) CICP "Unspecified" (ICOL entry 2, color_primaries = 2), CRC repaired.
+    let is cb.Bytes as c7 = cb.bytes_new(tpl.len); dup(&tpl, &c7);
+    let is i64 as icol_off = dir_off(c7.ptr, c7.len, 2);
+    c7.ptr[icol_off + 16 + 9] = cast(u8, 2);       // color_primaries = Unspecified
+    recrc(c7.ptr, c7.len, icol_off);
+    if (dec(&c7) != ce.E_CSIF_COLOR_UNSPECIFIED) { return 70; }
+
+    // 8) too small.
+    let is cb.Bytes as c8 = cb.bytes_new(32); dup(&tpl, &c8);
+    c8.len = 40;
+    if (dec(&c8) != ce.E_CSIF_TOO_SMALL) { return 80; }
+
+    return 0;
+}

@@ -1,0 +1,42 @@
+// =======================================================
+// caustic-image/csif/errno.cst
+// CSIF error codes (negative i64), numbered per the spec: container §1.5,
+// colour §2.11, codecs §5.0.5. Every failure is loud and names its cause.
+// =======================================================
+
+// --- container (§1.5) ---
+let is i64 as E_CSIF_TOO_SMALL        with imut = 0 - 1;
+let is i64 as E_CSIF_MAGIC            with imut = 0 - 2;
+let is i64 as E_CSIF_TRANSMISSION     with imut = 0 - 3;
+let is i64 as E_CSIF_VERSION          with imut = 0 - 4;
+let is i64 as E_CSIF_ENDIAN           with imut = 0 - 5;
+let is i64 as E_CSIF_HEADER_CRC       with imut = 0 - 6;
+let is i64 as E_CSIF_TRUNCATED        with imut = 0 - 7;
+let is i64 as E_CSIF_DIR_RANGE        with imut = 0 - 8;
+let is i64 as E_CSIF_OVERLAP          with imut = 0 - 9;
+let is i64 as E_CSIF_FLAG_MISMATCH    with imut = 0 - 10;
+let is i64 as E_CSIF_CRC_CRITICAL     with imut = 0 - 11;
+let is i64 as E_CSIF_UNKNOWN_CRITICAL with imut = 0 - 12;
+let is i64 as E_CSIF_ORDER            with imut = 0 - 13;
+let is i64 as E_CSIF_RANGE            with imut = 0 - 14;
+let is i64 as E_CSIF_DIMS             with imut = 0 - 15;
+let is i64 as E_CSIF_LIMIT            with imut = 0 - 16;
+let is i64 as E_CSIF_PROFILE          with imut = 0 - 17;
+let is i64 as E_CSIF_LEVEL            with imut = 0 - 18;
+let is i64 as E_CSIF_CYCLE            with imut = 0 - 19;
+let is i64 as E_CSIF_GEOM             with imut = 0 - 20;
+let is i64 as E_CSIF_NO_PRIMARY       with imut = 0 - 21;
+let is i64 as E_CSIF_ENUM             with imut = 0 - 22;
+let is i64 as E_CSIF_DEN_ZERO         with imut = 0 - 23;
+let is i64 as E_CSIF_NO_IEND          with imut = 0 - 24;
+let is i64 as E_CSIF_UNKNOWN_CODEC    with imut = 0 - 25;
+
+// --- colour (§2.11; spec names them, numbers assigned here) ---
+let is i64 as E_CSIF_COLOR_UNSPECIFIED    with imut = 0 - 30;
+let is i64 as E_CSIF_COLOR_MATRIX_MISMATCH with imut = 0 - 31;
+
+// --- codecs (§5.0.5) ---
+let is i64 as E_CSIF_UNSUPPORTED_SAMPLE with imut = 0 - 40;
+let is i64 as E_CSIF_BAD_PARAMS         with imut = 0 - 41;
+let is i64 as E_CSIF_PAYLOAD_OVERRUN    with imut = 0 - 42;
+let is i64 as E_CSIF_PAYLOAD_TRUNC      with imut = 0 - 43;
