@@ -1,0 +1,33 @@
+// test_dispatch — the top-level encode() + decode() dispatch round-trips
+// through each container-sniffable format (PNG/QOI/BMP/PNM/CSIF).
+use "../core/image.cst"  as image;
+use "../core/pixfmt.cst" as pixfmt;
+use "../core/sniff.cst"  as sniff;
+use "../decode.cst"      as decode;
+use "../encode.cst"      as encode;
+use "caustic-compact/core/bytes.cst" as cb;
+use "rt.cst" as rt;
+
+fn rt_fmt(w as i64, h as i64, ifmt as i64, target as i64) as i64 {
+    let is image.Image as a;
+    if (rt.make_image(&a, w, h, ifmt) != 0) { return 1; }
+    let is cb.Bytes as e = cb.bytes_new(1024);
+    if (encode.encode(&a, target, &e) < 0) { return 2; }
+    let is image.Image as b;
+    if (decode.decode(e.ptr, e.len, &b) < 0) { return 3; }
+    let is i64 as eq = rt.pixels_equal(&a, &b);
+    cb.bytes_free(&e); image.image_free(&a); image.image_free(&b);
+    return eq;
+}
+
+fn main() as i64 {
+    if (rt_fmt(12, 8, pixfmt.FMT_RGB8, sniff.SNIFF_PNG)   != 0) { return 10; }
+    if (rt_fmt(12, 8, pixfmt.FMT_RGBA8, sniff.SNIFF_PNG)  != 0) { return 11; }
+    if (rt_fmt(12, 8, pixfmt.FMT_RGB8, sniff.SNIFF_QOI)   != 0) { return 20; }
+    if (rt_fmt(12, 8, pixfmt.FMT_RGB8, sniff.SNIFF_BMP)   != 0) { return 30; }
+    if (rt_fmt(12, 8, pixfmt.FMT_GRAY8, sniff.SNIFF_PNM)  != 0) { return 40; }
+    if (rt_fmt(12, 8, pixfmt.FMT_RGB8, sniff.SNIFF_CSIF)  != 0) { return 50; }
+    if (rt_fmt(12, 8, pixfmt.FMT_RGBA8, sniff.SNIFF_CSIF) != 0) { return 51; }
+    if (rt_fmt(12, 8, pixfmt.FMT_GRAY8, sniff.SNIFF_CSIF) != 0) { return 52; }
+    return 0;
+}

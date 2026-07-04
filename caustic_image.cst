@@ -27,3 +27,4 @@ use "formats/png.cst"  as png;
 use "csif/errno.cst"     as csif_errno;
 use "csif/container.cst" as csif;
 use "decode.cst"       as decode;
+use "encode.cst"       as encode;

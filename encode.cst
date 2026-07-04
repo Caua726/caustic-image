@@ -1,0 +1,62 @@
+// =======================================================
+// caustic-image/encode.cst
+// Top-level encode dispatch: write an Image to a chosen format. Format ids are
+// the sniff.SNIFF_* values (so decode and encode share one vocabulary). CSIF
+// output uses the MODULAR codec (the flagship lossless path).
+//   encode(img, fmt, out) -> out.len, or negative errno.
+//   ext_to_fmt(path) -> a SNIFF_* id from the filename suffix, or -1.
+// =======================================================
+
+use "core/errno.cst"  as errno;
+use "core/image.cst"  as image;
+use "core/sniff.cst"  as sniff;
+use "formats/png.cst" as png;
+use "formats/qoi.cst" as qoi;
+use "formats/bmp.cst" as bmp;
+use "formats/pnm.cst" as pnm;
+use "formats/tga.cst" as tga;
+use "formats/gif.cst" as gif;
+use "csif/container.cst" as csif;
+use "caustic-compact/core/bytes.cst" as cb;
+
+fn encode(img as *image.Image, fmt as i64, out as *cb.Bytes) as i64 {
+    if (fmt == sniff.SNIFF_PNG)  { return png.png_encode(img, out); }
+    if (fmt == sniff.SNIFF_QOI)  { return qoi.qoi_encode(img, out); }
+    if (fmt == sniff.SNIFF_BMP)  { return bmp.bmp_encode(img, out); }
+    if (fmt == sniff.SNIFF_PNM)  { return pnm.pnm_encode(img, out); }
+    if (fmt == sniff.SNIFF_TGA)  { return tga.tga_encode(img, out); }
+    if (fmt == sniff.SNIFF_GIF)  { return gif.gif_encode(img, out); }
+    if (fmt == sniff.SNIFF_CSIF) { return csif.csif_encode_ex(img, out, 2); }
+    return errno.I_UNSUPPORTED;
+}
+
+fn _strlen(s as *u8) as i64 {
+    let is i64 as n with mut = 0;
+    while (cast(i64, s[n]) != 0) { n = n + 1; }
+    return n;
+}
+
+// Does the NUL-terminated `path` end with the n-byte ASCII suffix `suf`?
+fn _ends(path as *u8, suf as *u8, n as i64) as i64 {
+    let is i64 as pl = _strlen(path);
+    if (pl < n) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        if (cast(i64, path[pl - n + i]) != cast(i64, suf[i])) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn ext_to_fmt(path as *u8) as i64 {
+    if (_ends(path, ".png", 4) == 1)  { return sniff.SNIFF_PNG; }
+    if (_ends(path, ".qoi", 4) == 1)  { return sniff.SNIFF_QOI; }
+    if (_ends(path, ".bmp", 4) == 1)  { return sniff.SNIFF_BMP; }
+    if (_ends(path, ".tga", 4) == 1)  { return sniff.SNIFF_TGA; }
+    if (_ends(path, ".gif", 4) == 1)  { return sniff.SNIFF_GIF; }
+    if (_ends(path, ".csif", 5) == 1) { return sniff.SNIFF_CSIF; }
+    if (_ends(path, ".ppm", 4) == 1)  { return sniff.SNIFF_PNM; }
+    if (_ends(path, ".pgm", 4) == 1)  { return sniff.SNIFF_PNM; }
+    if (_ends(path, ".pnm", 4) == 1)  { return sniff.SNIFF_PNM; }
+    return 0 - 1;
+}
