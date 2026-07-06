@@ -17,6 +17,7 @@ use "formats/pnm.cst" as pnm;
 use "formats/jpeg.cst" as jpeg;
 use "formats/tiff.cst" as tiff;
 use "formats/webp.cst" as webp;
+use "formats/ico.cst" as ico;
 use "csif/container.cst" as csif;
 
 fn decode(src as *u8, src_len as i64, out as *image.Image) as i64 {
@@ -25,6 +26,7 @@ fn decode(src as *u8, src_len as i64, out as *image.Image) as i64 {
     if (f == sniff.SNIFF_JPEG) { return jpeg.jpeg_decode(src, src_len, out); }
     if (f == sniff.SNIFF_TIFF) { return tiff.tiff_decode(src, src_len, out); }
     if (f == sniff.SNIFF_WEBP) { return webp.webp_decode(src, src_len, out); }
+    if (f == sniff.SNIFF_ICO)  { return ico.ico_decode(src, src_len, out); }
     if (f == sniff.SNIFF_GIF)  { return gif.gif_decode(src, src_len, out); }
     if (f == sniff.SNIFF_BMP)  { return bmp.bmp_decode(src, src_len, out); }
     if (f == sniff.SNIFF_QOI)  { return qoi.qoi_decode(src, src_len, out); }
@@ -44,5 +46,6 @@ fn format_name(f as i64) as *u8 {
     if (f == sniff.SNIFF_WEBP) { return "WEBP"; }
     if (f == sniff.SNIFF_TIFF) { return "TIFF"; }
     if (f == sniff.SNIFF_CSIF) { return "CSIF"; }
+    if (f == sniff.SNIFF_ICO)  { return "ICO"; }
     return "unknown";
 }

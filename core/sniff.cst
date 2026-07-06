@@ -17,6 +17,7 @@ let is i64 as SNIFF_WEBP    with imut = 7;
 let is i64 as SNIFF_TIFF    with imut = 8;
 let is i64 as SNIFF_TGA     with imut = 9;
 let is i64 as SNIFF_CSIF    with imut = 10;
+let is i64 as SNIFF_ICO     with imut = 11;
 
 fn _b(p as *u8, i as i64) as i64 { return cast(i64, p[i]); }
 
@@ -74,6 +75,13 @@ fn sniff(p as *u8, len as i64) as i64 {
             let is i64 as c = _b(p,1);
             if (c >= 49) { if (c <= 54) { return SNIFF_PNM; } }
         }
+    }
+    // ICO: 00 00 01 00 + plausible entry count (weak magic; checked last)
+    if (len >= 6) {
+        if (_b(p,0)==0) { if (_b(p,1)==0) { if (_b(p,2)==1) { if (_b(p,3)==0) {
+            let is i64 as cnt = _b(p,4) | (_b(p,5) << 8);
+            if (cnt >= 1) { if (cnt <= 64) { return SNIFF_ICO; } }
+        }}}}
     }
     return SNIFF_UNKNOWN;
 }

@@ -27,6 +27,7 @@ use "formats/png.cst"  as png;
 use "formats/jpeg.cst" as jpeg;
 use "formats/tiff.cst" as tiff;
 use "formats/webp.cst" as webp;
+use "formats/ico.cst" as ico;
 use "transform/dct.cst" as dct;
 use "ops/ops.cst"      as ops;
 use "csif/errno.cst"     as csif_errno;

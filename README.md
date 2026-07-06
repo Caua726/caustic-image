@@ -23,6 +23,7 @@ in Pillow/giflib/libpng.
 | GIF  | yes | yes | decode single-frame + animation (compositing); encode exact-palette single-frame + animation (NETSCAPE loop) |
 | JPEG | yes | yes | decode baseline + progressive, fancy chroma upsampling (±3 of libjpeg); encode baseline 4:4:4 Annex-K tables, quality 90 (PSNR ~45 dB) |
 | TIFF | yes | — | II/MM, strips, uncompressed / PackBits / LZW / DEFLATE (+ predictor 2); 8-bit gray/RGB/RGBA |
+| ICO  | yes | — | favicon: largest entry, embedded-PNG or DIB+AND-mask |
 | CSIF | yes | yes | native flagship — see below |
 | WebP | yes | yes | decode VP8L full (meta-Huffman, LZ77 2D, cache, 4 transforms); encode VP8L (subtract-green + per-tile predictor + per-channel Huffman) — libwebp-exact |
 | AVIF | — | — | later phases |

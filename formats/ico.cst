@@ -1,0 +1,130 @@
+// =======================================================
+// caustic-image/formats/ico.cst
+// ICO (favicon) decoder: ICONDIR + entries; picks the largest image. Each
+// entry is either an embedded PNG (decoded by the PNG decoder) or a DIB with
+// doubled height (XOR pixels + 1-bit AND transparency mask). The DIB path
+// synthesizes an in-memory BMP (14-byte file header, height patched) and
+// reuses bmp_decode, then applies the AND mask as alpha.
+//   ico_decode(src, src_len, out) -> 0, or negative errno.
+// =======================================================
+
+use "std/mem.cst" only bins, core as mem;
+use "../core/errno.cst"  as errno;
+use "../core/image.cst"  as image;
+use "../core/pixfmt.cst" as pixfmt;
+use "../core/buf.cst"    as buf;
+use "png.cst" as png;
+use "bmp.cst" as bmp;
+use "caustic-compact/core/bytes.cst" as cb;
+
+fn _rd16(p as *u8, o as i64) as i64 { return cast(i64, p[o]) | (cast(i64, p[o + 1]) << 8); }
+fn _rd32(p as *u8, o as i64) as i64 {
+    return cast(i64, p[o]) | (cast(i64, p[o + 1]) << 8)
+        | (cast(i64, p[o + 2]) << 16) | (cast(i64, p[o + 3]) << 24);
+}
+
+fn ico_decode(src as *u8, src_len as i64, out as *image.Image) as i64 {
+    if (src_len < 6) { return errno.I_BADMAGIC; }
+    if (_rd16(src, 0) != 0) { return errno.I_BADMAGIC; }
+    if (_rd16(src, 2) != 1) { return errno.I_BADMAGIC; }   // 1 = icon
+    let is i64 as count = _rd16(src, 4);
+    if (count < 1) { return errno.I_CORRUPT; }
+    if (6 + count * 16 > src_len) { return errno.I_CORRUPT; }
+
+    // pick the largest entry
+    let is i64 as best with mut = 0;
+    let is i64 as bestpx with mut = 0 - 1;
+    let is i64 as e with mut = 0;
+    while (e < count) {
+        let is i64 as o = 6 + e * 16;
+        let is i64 as ew with mut = cast(i64, src[o]);
+        let is i64 as eh with mut = cast(i64, src[o + 1]);
+        if (ew == 0) { ew = 256; }
+        if (eh == 0) { eh = 256; }
+        if (ew * eh > bestpx) { bestpx = ew * eh; best = e; }
+        e = e + 1;
+    }
+    let is i64 as eo = 6 + best * 16;
+    let is i64 as dsize = _rd32(src, eo + 8);
+    let is i64 as doff = _rd32(src, eo + 12);
+    if (doff < 0) { return errno.I_CORRUPT; }
+    if (doff + dsize > src_len) { return errno.I_CORRUPT; }
+    let is *u8 as d = cast(*u8, cast(i64, src) + doff);
+
+    // embedded PNG?
+    if (dsize >= 8) {
+        if (cast(i64, d[0]) == 137) { if (cast(i64, d[1]) == 80) {
+            return png.png_decode(d, dsize, out);
+        } }
+    }
+
+    // DIB with doubled height: synthesize a BMP and reuse bmp_decode.
+    if (dsize < 40) { return errno.I_CORRUPT; }
+    let is i64 as dib_size = _rd32(d, 0);
+    let is i64 as w = _rd32(d, 4);
+    let is i64 as h2 = _rd32(d, 8);
+    let is i64 as h = h2 / 2;
+    let is i64 as bitcount = _rd16(d, 14);
+    if (w < 1) { return errno.I_CORRUPT; }
+    if (h < 1) { return errno.I_CORRUPT; }
+
+    let is i64 as clrused with mut = _rd32(d, 32);
+    if (bitcount <= 8) { if (clrused == 0) { clrused = 1 << bitcount; } }
+    if (bitcount > 8) { clrused = 0; }
+    let is i64 as xor_row = ((w * bitcount + 31) / 32) * 4;
+    let is i64 as and_row = ((w + 31) / 32) * 4;
+    let is i64 as data_off = 14 + dib_size + clrused * 4;
+
+    let is cb.Bytes as bmpf = cb.bytes_new(dsize + 32);
+    cb.bytes_push(&bmpf, cast(u8, 66)); cb.bytes_push(&bmpf, cast(u8, 77));
+    let is i64 as fsz = 14 + dsize;
+    cb.bytes_push(&bmpf, cast(u8, fsz & 255)); cb.bytes_push(&bmpf, cast(u8, (fsz >> 8) & 255));
+    cb.bytes_push(&bmpf, cast(u8, (fsz >> 16) & 255)); cb.bytes_push(&bmpf, cast(u8, (fsz >> 24) & 255));
+    cb.bytes_push(&bmpf, cast(u8, 0)); cb.bytes_push(&bmpf, cast(u8, 0));
+    cb.bytes_push(&bmpf, cast(u8, 0)); cb.bytes_push(&bmpf, cast(u8, 0));
+    cb.bytes_push(&bmpf, cast(u8, data_off & 255)); cb.bytes_push(&bmpf, cast(u8, (data_off >> 8) & 255));
+    cb.bytes_push(&bmpf, cast(u8, (data_off >> 16) & 255)); cb.bytes_push(&bmpf, cast(u8, (data_off >> 24) & 255));
+    cb.bytes_append(&bmpf, d, dsize);
+    // patch the DIB height from 2h to h (offset 14+8, 4 bytes LE)
+    bmpf.ptr[14 + 8]  = cast(u8, h & 255);
+    bmpf.ptr[14 + 9]  = cast(u8, (h >> 8) & 255);
+    bmpf.ptr[14 + 10] = cast(u8, (h >> 16) & 255);
+    bmpf.ptr[14 + 11] = cast(u8, (h >> 24) & 255);
+
+    let is i64 as rc = bmp.bmp_decode(bmpf.ptr, bmpf.len, out);
+    cb.bytes_free(&bmpf);
+    if (rc < 0) { return rc; }
+
+    // apply the AND mask as transparency (skip for 32-bit: alpha is in-band)
+    if (bitcount < 32) {
+        let is image.Image as rgba;
+        let is i64 as ir = image.image_init(&rgba, w, h, pixfmt.FMT_RGBA8);
+        if (ir < 0) { return ir; }
+        let is i64 as mask_off = doff + dib_size + clrused * 4 + xor_row * h;
+        let is i64 as sbpp = pixfmt.fmt_bpp(out.fmt);
+        let is i64 as y with mut = 0;
+        while (y < h) {
+            let is i64 as mrow = mask_off + (h - 1 - y) * and_row;   // bottom-up
+            let is i64 as x with mut = 0;
+            while (x < w) {
+                let is i64 as so = y * out.stride + x * sbpp;
+                let is i64 as di = (y * w + x) * 4;
+                rgba.pixels[di]     = out.pixels[so];
+                rgba.pixels[di + 1] = out.pixels[so + 1];
+                rgba.pixels[di + 2] = out.pixels[so + 2];
+                let is i64 as a with mut = 255;
+                if (mask_off + and_row * h <= src_len - doff + doff) {
+                    let is i64 as mb = cast(i64, src[mrow + x / 8]);
+                    if (((mb >> (7 - (x & 7))) & 1) == 1) { a = 0; }
+                }
+                rgba.pixels[di + 3] = cast(u8, a);
+                x = x + 1;
+            }
+            y = y + 1;
+        }
+        image.image_free(out);
+        out.pixels = rgba.pixels; out.width = rgba.width; out.height = rgba.height;
+        out.stride = rgba.stride; out.fmt = rgba.fmt; out.owned = rgba.owned;
+    }
+    return 0;
+}
