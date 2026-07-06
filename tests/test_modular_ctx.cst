@@ -37,7 +37,7 @@ fn main() as i64 {
     if (cast(i64, e.ptr[0]) != 5) { return 3; }
 
     let is *u8 as outp = mem.core.mmap_anon(w * h * 3 + 1);
-    if (modular.modular_decode(e.ptr, e.len, w, h, 3, outp) != 0) { return 4; }
+    if (modular.modular_decode(e.ptr, e.len, w, h, 3, 1, outp) != 0) { return 4; }
     let is i64 as i with mut = 0;
     while (i < w * h * 3) {
         if (outp[i] != p[i]) { return 5; }

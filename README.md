@@ -35,10 +35,10 @@ ILIM resource limits, IHDR geometry, ICOL/CICP colour with "Unspecified" banned)
 
 | Codec | Kind | Notes |
 |---|---|---|
-| RAW (0)     | lossless | identity |
-| QOI (1)     | lossless | the QOI op-stream as a tile codec |
-| MODULAR (2) | lossless | subtract-green + MED predictor + rANS entropy |
-| DCT (3)     | lossy    | forward DCT + quantise + rANS |
+| RAW (0)     | lossless | identity (8/16-bit) |
+| QOI (1)     | lossless | the QOI op-stream as a tile codec (8-bit) |
+| MODULAR (2) | lossless | subtract-green + MED predictor + rANS entropy (8/16-bit, deep colour) |
+| DCT (3)     | lossy    | forward DCT + quantise + rANS (8-bit) |
 
 Tiled images (ICOD tile grid + TIDX per-tile index with CRC and byte ranges) decode each tile
 independently — the scalability substrate for partial/parallel decode. Decode is fail-loud: bad

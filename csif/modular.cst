@@ -1,16 +1,17 @@
 // =======================================================
 // caustic-image/csif/modular.cst
-// CSIF codec 2 — MODULAR (lossless), lite subset: a per-channel MED predictor
-// (LOCO-I / JPEG-LS median) over already-reconstructed causal neighbours, with
-// the wrapped residual stream entropy-coded by the shared rANS substrate
-// (caustic-compact/entropy). 8-bit channels, single tile.
+// CSIF codec 2 — MODULAR (lossless): a per-channel MED predictor (LOCO-I /
+// JPEG-LS median) over already-reconstructed causal neighbours, wrapped-residual
+// entropy-coded by the shared rANS substrate. 8- and 16-bit samples.
 //
-// Honest scope: this implements predict + entropy. The full MODULAR (reversible
-// colour transforms, palette, Squeeze, MA decision tree, LZ layer, near-lossless)
-// is sequenced for later — codec_version 1 declares this subset.
+// 8-bit: subtract-green colour transform, a 5-bucket quantized-gradient context
+//        model (or a single table, whichever is smaller).
+// 16-bit: subtract-green (mod 65536); residuals split into low/high byte planes,
+//        each entropy-coded with a single table (contexts need whole samples, so
+//        the planes stay context-free to keep decode decoupled).
 //
 //   modular_encode(img, out) -> 0, or negative.
-//   modular_decode(src, len, w, h, channels, out_pixels) -> 0, or negative.
+//   modular_decode(src, len, w, h, channels, bps, out_pixels) -> 0, or negative.
 // =======================================================
 
 use "std/mem.cst" only bins, core as mem;
@@ -20,7 +21,6 @@ use "../core/pixfmt.cst" as pixfmt;
 use "caustic-compact/entropy/rans.cst" as rans;
 use "caustic-compact/core/bytes.cst"   as cb;
 
-// MED / LOCO-I median predictor over left(a) up(b) up-left(c).
 fn _med(a as i64, b as i64, c as i64) as i64 {
     let is i64 as mx with mut = a; if (b > a) { mx = b; }
     let is i64 as mn with mut = a; if (b < a) { mn = b; }
@@ -31,9 +31,6 @@ fn _med(a as i64, b as i64, c as i64) as i64 {
 
 let is i64 as _NCTX with imut = 5;
 
-// Context = quantized local-gradient bucket over the causal neighbours
-// (|a-c| + |c-b|). Both sides compute it from already-reconstructed values,
-// so it costs no side information (the CSIF §3.6.3 declared-context model).
 fn _ctx(a as i64, b as i64, c as i64) as i64 {
     let is i64 as d1 with mut = a - c; if (d1 < 0) { d1 = 0 - d1; }
     let is i64 as d2 with mut = c - b; if (d2 < 0) { d2 = 0 - d2; }
@@ -46,36 +43,57 @@ fn _ctx(a as i64, b as i64, c as i64) as i64 {
 }
 
 fn _channels(fmt as i64) as i64 {
-    if (fmt == pixfmt.FMT_GRAY8)  { return 1; }
-    if (fmt == pixfmt.FMT_GRAYA8) { return 2; }
-    if (fmt == pixfmt.FMT_RGB8)   { return 3; }
-    if (fmt == pixfmt.FMT_RGBA8)  { return 4; }
+    if (fmt == pixfmt.FMT_GRAY8)   { return 1; }
+    if (fmt == pixfmt.FMT_GRAYA8)  { return 2; }
+    if (fmt == pixfmt.FMT_RGB8)    { return 3; }
+    if (fmt == pixfmt.FMT_RGBA8)   { return 4; }
+    if (fmt == pixfmt.FMT_GRAY16)  { return 1; }
+    if (fmt == pixfmt.FMT_GRAYA16) { return 2; }
+    if (fmt == pixfmt.FMT_RGB16)   { return 3; }
+    if (fmt == pixfmt.FMT_RGBA16)  { return 4; }
     return 0;
+}
+
+// sample i (interleaved index) read/write, bps = 1 or 2 bytes (LE).
+fn _gs(p as *u8, i as i64, bps as i64) as i64 {
+    if (bps == 2) { return cast(i64, p[i * 2]) | (cast(i64, p[i * 2 + 1]) << 8); }
+    return cast(i64, p[i]);
+}
+fn _ps(p as *u8, i as i64, bps as i64, v as i64) as void {
+    if (bps == 2) { p[i * 2] = cast(u8, v & 255); p[i * 2 + 1] = cast(u8, (v >> 8) & 255); }
+    else { p[i] = cast(u8, v & 255); }
+}
+fn _w32(o as *cb.Bytes, v as i64) as void {
+    cb.bytes_push(o, cast(u8, v & 255)); cb.bytes_push(o, cast(u8, (v >> 8) & 255));
+    cb.bytes_push(o, cast(u8, (v >> 16) & 255)); cb.bytes_push(o, cast(u8, (v >> 24) & 255));
 }
 
 fn modular_encode(img as *image.Image, out as *cb.Bytes) as i64 {
     let is i64 as ch = _channels(img.fmt);
     if (ch == 0) { return errno.I_UNSUPPORTED; }
+    let is i64 as bps = pixfmt.fmt_depth(img.fmt) / 8;
+    let is i64 as mask with mut = 255;
+    if (bps == 2) { mask = 65535; }
     let is i64 as w = img.width;
     let is i64 as h = img.height;
-    let is i64 as rowb = w * ch;
-    let is i64 as n = ch * w * h;
-    let is *u8 as syms = mem.core.mmap_anon(n + 1);
+    let is i64 as rowb = w * ch;                       // samples per row
+    let is i64 as n = ch * w * h;                      // samples
+    let is *u8 as syms = mem.core.mmap_anon(n + 1);    // low residual byte
     let is *u8 as ctxs = mem.core.mmap_anon(n + 1);
+    let is *u8 as hi with mut = cast(*u8, 0);
+    if (bps == 2) { hi = mem.core.mmap_anon(n + 1); }
     if (cast(i64, ctxs) <= 0) { return errno.I_OOM; }
-    // Work on a copy so we can apply a reversible colour transform without
-    // touching the caller's image. For >=3 channels, subtract green (R-=G,
-    // B-=G mod 256) to decorrelate — 8-bit reversible, no headroom growth.
-    let is *u8 as px = mem.core.mmap_anon(n + 1);
+
+    // Work copy with subtract-green (R-=G, B-=G mod 2^depth) for >=3 channels.
+    let is *u8 as px = mem.core.mmap_anon(n * bps + 1);
     if (cast(i64, px) <= 0) { mem.core.munmap(syms, n + 1); return errno.I_OOM; }
-    mem.core.memcpy(px, img.pixels, n);
+    mem.core.memcpy(px, img.pixels, n * bps);
     if (ch >= 3) {
         let is i64 as p with mut = 0;
         while (p < w * h) {
-            let is i64 as bs = p * ch;
-            let is i64 as g = cast(i64, px[bs + 1]);
-            px[bs]     = cast(u8, (cast(i64, px[bs]) - g) & 255);
-            px[bs + 2] = cast(u8, (cast(i64, px[bs + 2]) - g) & 255);
+            let is i64 as g = _gs(px, p * ch + 1, bps);
+            _ps(px, p * ch,     bps, (_gs(px, p * ch, bps) - g) & mask);
+            _ps(px, p * ch + 2, bps, (_gs(px, p * ch + 2, bps) - g) & mask);
             p = p + 1;
         }
     }
@@ -89,13 +107,15 @@ fn modular_encode(img as *image.Image, out as *cb.Bytes) as i64 {
             while (x < w) {
                 let is i64 as base = (y * w + x) * ch + c;
                 let is i64 as a with mut = 0;
-                if (x > 0) { a = cast(i64, px[base - ch]); }
+                if (x > 0) { a = _gs(px, base - ch, bps); }
                 let is i64 as b with mut = 0;
-                if (y > 0) { b = cast(i64, px[base - rowb]); }
+                if (y > 0) { b = _gs(px, base - rowb, bps); }
                 let is i64 as ul with mut = 0;
-                if (x > 0) { if (y > 0) { ul = cast(i64, px[base - rowb - ch]); } }
+                if (x > 0) { if (y > 0) { ul = _gs(px, base - rowb - ch, bps); } }
                 let is i64 as pred = _med(a, b, ul);
-                syms[idx] = cast(u8, (cast(i64, px[base]) - pred) & 255);
+                let is i64 as res = (_gs(px, base, bps) - pred) & mask;
+                syms[idx] = cast(u8, res & 255);
+                if (bps == 2) { hi[idx] = cast(u8, (res >> 8) & 255); }
                 ctxs[idx] = cast(u8, _ctx(a, b, ul));
                 idx = idx + 1;
                 x = x + 1;
@@ -105,64 +125,137 @@ fn modular_encode(img as *image.Image, out as *cb.Bytes) as i64 {
         c = c + 1;
     }
 
-    // Encode with gradient contexts and with a single table; keep the smaller
-    // (the 5-table header ~2.5KB only pays off on non-trivial images).
-    let is cb.Bytes as e5 = cb.bytes_new(n / 2 + 4096);
-    let is i64 as r5 = rans.rans_ctx_encode(syms, ctxs, n, _NCTX, &e5);
-    mem.core.memset(ctxs, cast(i32, 0), n);
-    let is cb.Bytes as e1 = cb.bytes_new(n / 2 + 1024);
-    let is i64 as r1 = rans.rans_ctx_encode(syms, ctxs, n, 1, &e1);
+    let is i64 as rc with mut = 0;
+    if (bps == 1) {
+        // gradient contexts vs single table — keep the smaller.
+        let is cb.Bytes as e5 = cb.bytes_new(n / 2 + 4096);
+        let is i64 as r5 = rans.rans_ctx_encode(syms, ctxs, n, _NCTX, &e5);
+        mem.core.memset(ctxs, cast(i32, 0), n);
+        let is cb.Bytes as e1 = cb.bytes_new(n / 2 + 1024);
+        let is i64 as r1 = rans.rans_ctx_encode(syms, ctxs, n, 1, &e1);
+        if (r5 < 0) { rc = r5; } if (r1 < 0) { rc = r1; }
+        if (rc == 0) {
+            if (e5.len < e1.len) { cb.bytes_append(out, e5.ptr, e5.len); }
+            else { cb.bytes_append(out, e1.ptr, e1.len); }
+        }
+        cb.bytes_free(&e5); cb.bytes_free(&e1);
+    } else {
+        // low plane, then high plane, each single-table; prefix the low length.
+        mem.core.memset(ctxs, cast(i32, 0), n);
+        let is cb.Bytes as elo = cb.bytes_new(n / 2 + 1024);
+        rc = rans.rans_ctx_encode(syms, ctxs, n, 1, &elo);
+        if (rc == 0) {
+            _w32(out, elo.len);
+            cb.bytes_append(out, elo.ptr, elo.len);
+            rc = rans.rans_ctx_encode(hi, ctxs, n, 1, out);
+        }
+        cb.bytes_free(&elo);
+        mem.core.munmap(hi, n + 1);
+    }
+
     mem.core.munmap(syms, n + 1);
     mem.core.munmap(ctxs, n + 1);
-    mem.core.munmap(px, n + 1);
-    if (r5 < 0) { return errno.I_OOM; }
-    if (r1 < 0) { return errno.I_OOM; }
-    if (e5.len < e1.len) { cb.bytes_append(out, e5.ptr, e5.len); }
-    else { cb.bytes_append(out, e1.ptr, e1.len); }
-    cb.bytes_free(&e5);
-    cb.bytes_free(&e1);
+    mem.core.munmap(px, n * bps + 1);
+    if (rc < 0) { return errno.I_OOM; }
     return 0;
 }
 
-fn modular_decode(src as *u8, len as i64, w as i64, h as i64, ch as i64, out as *u8) as i64 {
+fn modular_decode(src as *u8, len as i64, w as i64, h as i64, ch as i64, bps as i64, out as *u8) as i64 {
     let is i64 as rowb = w * ch;
-    let is rans.RansCtx as d;
-    if (rans.rans_ctx_init(&d, src, len) < 0) { return errno.I_CORRUPT; }
+    let is i64 as n = ch * w * h;
+    let is i64 as mask with mut = 255;
+    if (bps == 2) { mask = 65535; }
 
-    let is i64 as c with mut = 0;
-    while (c < ch) {
-        let is i64 as y with mut = 0;
-        while (y < h) {
-            let is i64 as x with mut = 0;
-            while (x < w) {
-                let is i64 as base = (y * w + x) * ch + c;
-                let is i64 as a with mut = 0;
-                if (x > 0) { a = cast(i64, out[base - ch]); }
-                let is i64 as b with mut = 0;
-                if (y > 0) { b = cast(i64, out[base - rowb]); }
-                let is i64 as ul with mut = 0;
-                if (x > 0) { if (y > 0) { ul = cast(i64, out[base - rowb - ch]); } }
-                let is i64 as pred = _med(a, b, ul);
-                let is i64 as cx with mut = 0;
-                if (d.k > 1) { cx = _ctx(a, b, ul); }
-                let is i64 as sym = rans.rans_ctx_sym(&d, cx);
-                if (sym < 0) { rans.rans_ctx_free(&d); return errno.I_CORRUPT; }
-                out[base] = cast(u8, (pred + sym) & 255);
-                x = x + 1;
+    if (bps == 1) {
+        let is rans.RansCtx as d;
+        if (rans.rans_ctx_init(&d, src, len) < 0) { return errno.I_CORRUPT; }
+        let is i64 as c with mut = 0;
+        while (c < ch) {
+            let is i64 as y with mut = 0;
+            while (y < h) {
+                let is i64 as x with mut = 0;
+                while (x < w) {
+                    let is i64 as base = (y * w + x) * ch + c;
+                    let is i64 as a with mut = 0;
+                    if (x > 0) { a = cast(i64, out[base - ch]); }
+                    let is i64 as b with mut = 0;
+                    if (y > 0) { b = cast(i64, out[base - rowb]); }
+                    let is i64 as ul with mut = 0;
+                    if (x > 0) { if (y > 0) { ul = cast(i64, out[base - rowb - ch]); } }
+                    let is i64 as pred = _med(a, b, ul);
+                    let is i64 as cx with mut = 0;
+                    if (d.k > 1) { cx = _ctx(a, b, ul); }
+                    let is i64 as sym = rans.rans_ctx_sym(&d, cx);
+                    if (sym < 0) { rans.rans_ctx_free(&d); return errno.I_CORRUPT; }
+                    out[base] = cast(u8, (pred + sym) & 255);
+                    x = x + 1;
+                }
+                y = y + 1;
             }
-            y = y + 1;
+            c = c + 1;
         }
-        c = c + 1;
+        rans.rans_ctx_free(&d);
+    } else {
+        if (len < 4) { return errno.I_CORRUPT; }
+        let is i64 as lolen = cast(i64, src[0]) | (cast(i64, src[1]) << 8)
+            | (cast(i64, src[2]) << 16) | (cast(i64, src[3]) << 24);
+        let is *u8 as lo = mem.core.mmap_anon(n + 1);
+        let is *u8 as hi = mem.core.mmap_anon(n + 1);
+        if (cast(i64, hi) <= 0) { return errno.I_OOM; }
+        let is rans.RansCtx as dlo;
+        if (rans.rans_ctx_init(&dlo, cast(*u8, cast(i64, src) + 4), lolen) < 0) { return errno.I_CORRUPT; }
+        let is i64 as i with mut = 0;
+        while (i < n) {
+            let is i64 as s = rans.rans_ctx_sym(&dlo, 0);
+            if (s < 0) { rans.rans_ctx_free(&dlo); return errno.I_CORRUPT; }
+            lo[i] = cast(u8, s); i = i + 1;
+        }
+        rans.rans_ctx_free(&dlo);
+        let is rans.RansCtx as dhi;
+        if (rans.rans_ctx_init(&dhi, cast(*u8, cast(i64, src) + 4 + lolen), len - 4 - lolen) < 0) { return errno.I_CORRUPT; }
+        i = 0;
+        while (i < n) {
+            let is i64 as s = rans.rans_ctx_sym(&dhi, 0);
+            if (s < 0) { rans.rans_ctx_free(&dhi); return errno.I_CORRUPT; }
+            hi[i] = cast(u8, s); i = i + 1;
+        }
+        rans.rans_ctx_free(&dhi);
+
+        let is i64 as idx with mut = 0;
+        let is i64 as c with mut = 0;
+        while (c < ch) {
+            let is i64 as y with mut = 0;
+            while (y < h) {
+                let is i64 as x with mut = 0;
+                while (x < w) {
+                    let is i64 as base = (y * w + x) * ch + c;
+                    let is i64 as a with mut = 0;
+                    if (x > 0) { a = _gs(out, base - ch, 2); }
+                    let is i64 as b with mut = 0;
+                    if (y > 0) { b = _gs(out, base - rowb, 2); }
+                    let is i64 as ul with mut = 0;
+                    if (x > 0) { if (y > 0) { ul = _gs(out, base - rowb - ch, 2); } }
+                    let is i64 as pred = _med(a, b, ul);
+                    let is i64 as res = cast(i64, lo[idx]) | (cast(i64, hi[idx]) << 8);
+                    _ps(out, base, 2, (pred + res) & mask);
+                    idx = idx + 1;
+                    x = x + 1;
+                }
+                y = y + 1;
+            }
+            c = c + 1;
+        }
+        mem.core.munmap(lo, n + 1);
+        mem.core.munmap(hi, n + 1);
     }
-    rans.rans_ctx_free(&d);
-    // Inverse subtract-green (must match encode): R+=G, B+=G mod 256.
+
+    // Inverse subtract-green (matches encode): R+=G, B+=G mod 2^depth.
     if (ch >= 3) {
         let is i64 as p with mut = 0;
         while (p < w * h) {
-            let is i64 as bs = p * ch;
-            let is i64 as g = cast(i64, out[bs + 1]);
-            out[bs]     = cast(u8, (cast(i64, out[bs]) + g) & 255);
-            out[bs + 2] = cast(u8, (cast(i64, out[bs + 2]) + g) & 255);
+            let is i64 as g = _gs(out, p * ch + 1, bps);
+            _ps(out, p * ch,     bps, (_gs(out, p * ch, bps) + g) & mask);
+            _ps(out, p * ch + 2, bps, (_gs(out, p * ch + 2, bps) + g) & mask);
             p = p + 1;
         }
     }

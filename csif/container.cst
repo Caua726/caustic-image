@@ -47,10 +47,14 @@ fn _emit_chunk(c as *cb.Bytes, typ as *u8, flags as i64, payload as *u8, plen as
 // Map Image format to (color_model, channels), or channels=0 if unsupported.
 fn _fmt_axes(fmt as i64, cm as *i64, ch as *i64) as void {
     cm[0] = 0; ch[0] = 0;
-    if (fmt == pixfmt.FMT_GRAY8)  { cm[0] = 0; ch[0] = 1; }
-    if (fmt == pixfmt.FMT_GRAYA8) { cm[0] = 1; ch[0] = 2; }
-    if (fmt == pixfmt.FMT_RGB8)   { cm[0] = 2; ch[0] = 3; }
-    if (fmt == pixfmt.FMT_RGBA8)  { cm[0] = 3; ch[0] = 4; }
+    if (fmt == pixfmt.FMT_GRAY8)   { cm[0] = 0; ch[0] = 1; }
+    if (fmt == pixfmt.FMT_GRAYA8)  { cm[0] = 1; ch[0] = 2; }
+    if (fmt == pixfmt.FMT_RGB8)    { cm[0] = 2; ch[0] = 3; }
+    if (fmt == pixfmt.FMT_RGBA8)   { cm[0] = 3; ch[0] = 4; }
+    if (fmt == pixfmt.FMT_GRAY16)  { cm[0] = 0; ch[0] = 1; }
+    if (fmt == pixfmt.FMT_GRAYA16) { cm[0] = 1; ch[0] = 2; }
+    if (fmt == pixfmt.FMT_RGB16)   { cm[0] = 2; ch[0] = 3; }
+    if (fmt == pixfmt.FMT_RGBA16)  { cm[0] = 3; ch[0] = 4; }
 }
 
 // ---- payload builders ----
@@ -76,7 +80,7 @@ fn _pl_ihdr(p as *cb.Bytes, img as *image.Image, cm as i64, ch as i64) as void {
     _w32(p, 1);           // depth
     _w8(p, 0);            // sample_format UINT8
     _w8(p, 0);            // sample_endian LE
-    _w8(p, 8);            // bit_depth
+    _w8(p, pixfmt.fmt_depth(img.fmt));   // bit_depth (8 or 16)
     _w8(p, 0);            // sample_layout FLAT
     _w8(p, cm);           // color_model
     _w8(p, ch);           // component_count
@@ -193,6 +197,11 @@ fn csif_encode_tiled(img as *image.Image, out as *cb.Bytes, codec_id as i64,
     let is i64 as ch = chv[0];
     if (ch == 0) { return ce.E_CSIF_UNSUPPORTED_SAMPLE; }
     if (codec_id == 1) { if (ch != 3) { if (ch != 4) { return ce.E_CSIF_UNSUPPORTED_SAMPLE; } } }
+    // QOI/DCT are 8-bit only; RAW/MODULAR handle 16-bit too.
+    if (pixfmt.fmt_depth(img.fmt) != 8) {
+        if (codec_id == 1) { return ce.E_CSIF_UNSUPPORTED_SAMPLE; }
+        if (codec_id == 3) { return ce.E_CSIF_UNSUPPORTED_SAMPLE; }
+    }
     let is i64 as tw with mut = tw_in;
     let is i64 as th with mut = th_in;
     if (tw < 1) { tw = 0; th = 0; }
@@ -493,7 +502,7 @@ fn csif_decode(src as *u8, len as i64, out as *image.Image) as i64 {
     buf.buf_u32le(&bf);                       // depth
     let is i64 as sample_format = buf.buf_u8(&bf);
     buf.buf_u8(&bf);                          // sample_endian
-    buf.buf_u8(&bf);                          // bit_depth
+    let is i64 as bit_depth = buf.buf_u8(&bf);
     buf.buf_u8(&bf);                          // sample_layout
     let is i64 as color_model = buf.buf_u8(&bf);
     let is i64 as component_count = buf.buf_u8(&bf);
@@ -530,13 +539,27 @@ fn csif_decode(src as *u8, len as i64, out as *image.Image) as i64 {
     let is i64 as ntx = buf.buf_u32le(&bf);
     let is i64 as nty = buf.buf_u32le(&bf);
 
-    // Resolve the pixel format from color_model + component_count.
+    // Resolve the pixel format from color_model + component_count + bit_depth.
     let is i64 as fmt with mut = 0;
-    if (color_model == 0) { if (component_count == 1) { fmt = pixfmt.FMT_GRAY8; } }
-    if (color_model == 1) { if (component_count == 2) { fmt = pixfmt.FMT_GRAYA8; } }
-    if (color_model == 2) { if (component_count == 3) { fmt = pixfmt.FMT_RGB8; } }
-    if (color_model == 3) { if (component_count == 4) { fmt = pixfmt.FMT_RGBA8; } }
+    if (bit_depth == 8) {
+        if (color_model == 0) { if (component_count == 1) { fmt = pixfmt.FMT_GRAY8; } }
+        if (color_model == 1) { if (component_count == 2) { fmt = pixfmt.FMT_GRAYA8; } }
+        if (color_model == 2) { if (component_count == 3) { fmt = pixfmt.FMT_RGB8; } }
+        if (color_model == 3) { if (component_count == 4) { fmt = pixfmt.FMT_RGBA8; } }
+    } else {
+        if (bit_depth == 16) {
+            if (color_model == 0) { if (component_count == 1) { fmt = pixfmt.FMT_GRAY16; } }
+            if (color_model == 1) { if (component_count == 2) { fmt = pixfmt.FMT_GRAYA16; } }
+            if (color_model == 2) { if (component_count == 3) { fmt = pixfmt.FMT_RGB16; } }
+            if (color_model == 3) { if (component_count == 4) { fmt = pixfmt.FMT_RGBA16; } }
+        }
+    }
     if (fmt == 0) { return ce.E_CSIF_UNSUPPORTED_SAMPLE; }
+
+    // QOI/DCT are 8-bit only; RAW/MODULAR handle 16-bit too.
+    let is i64 as bpsamp = bit_depth / 8;                  // bytes per sample (1 or 2)
+    if (codec_id == 1) { if (bit_depth != 8) { return ce.E_CSIF_UNSUPPORTED_SAMPLE; } }
+    if (codec_id == 3) { if (bit_depth != 8) { return ce.E_CSIF_UNSUPPORTED_SAMPLE; } }
 
     let is i64 as dchk = image.image_check_dims(w, h, fmt);
     if (dchk < 0) { return ce.E_CSIF_DIMS; }
@@ -556,7 +579,7 @@ fn csif_decode(src as *u8, len as i64, out as *image.Image) as i64 {
         buf.buf_skip(&bf, 3);
         if (ecount != ntx * nty) { image.image_free(out); return ce.E_CSIF_GEOM; }
         let is i64 as ch = component_count;
-        let is i64 as tmpcap = tw * th * ch;
+        let is i64 as tmpcap = tw * th * ch * bpsamp;
         let is *u8 as tmp = mem.core.mmap_anon(tmpcap + 1);
         if (cast(i64, tmp) <= 0) { image.image_free(out); return ce.E_CSIF_LIMIT; }
         let is i64 as e with mut = 0;
@@ -581,14 +604,14 @@ fn csif_decode(src as *u8, len as i64, out as *image.Image) as i64 {
             if (tx * tw + tweff > w) { tweff = w - tx * tw; }
             let is i64 as theff with mut = th;
             if (ty * th + theff > h) { theff = h - ty * th; }
-            if (tunc != tweff * theff * ch) { image.image_free(out); return ce.E_CSIF_GEOM; }
+            if (tunc != tweff * theff * ch * bpsamp) { image.image_free(out); return ce.E_CSIF_GEOM; }
             let is i64 as trc with mut = 0;
             if (codec_id == 0) {
                 if (tstored != tunc) { trc = 0 - 1; }
                 else { mem.core.memcpy(tmp, tb, tunc); }
             } else {
                 if (codec_id == 1) { trc = qoi.qoi_tile_decode(tb, tstored, tweff * theff, ch, tmp); }
-                else { if (codec_id == 2) { trc = modular.modular_decode(tb, tstored, tweff, theff, ch, tmp); }
+                else { if (codec_id == 2) { trc = modular.modular_decode(tb, tstored, tweff, theff, ch, bpsamp, tmp); }
                 else { trc = dctc.dct_decode(tb, tstored, tweff, theff, ch, tmp); } }
             }
             if (trc < 0) { image.image_free(out); return ce.E_CSIF_PAYLOAD_TRUNC; }
@@ -596,9 +619,9 @@ fn csif_decode(src as *u8, len as i64, out as *image.Image) as i64 {
             let is i64 as r with mut = 0;
             while (r < theff) {
                 mem.core.memcpy(
-                    cast(*u8, cast(i64, out.pixels) + (ty * th + r) * out.stride + tx * tw * ch),
-                    cast(*u8, cast(i64, tmp) + r * tweff * ch),
-                    tweff * ch);
+                    cast(*u8, cast(i64, out.pixels) + (ty * th + r) * out.stride + tx * tw * ch * bpsamp),
+                    cast(*u8, cast(i64, tmp) + r * tweff * ch * bpsamp),
+                    tweff * ch * bpsamp);
                 r = r + 1;
             }
             e = e + 1;
@@ -610,13 +633,13 @@ fn csif_decode(src as *u8, len as i64, out as *image.Image) as i64 {
     // Codec bytes begin after IDAT's 32-byte head.
     let is i64 as codlen = idat_plen - 32;
     if (codec_id == 0) {
-        if (codlen != w * h * component_count) { return ce.E_CSIF_PAYLOAD_TRUNC; }
+        if (codlen != w * h * component_count * bpsamp) { return ce.E_CSIF_PAYLOAD_TRUNC; }
     }
     let is i64 as rc = image.image_init(out, w, h, fmt);
     if (rc < 0) { return rc; }
     let is *u8 as codbytes = cast(*u8, cast(i64, src) + idat_off + 32);
     if (codec_id == 0) {
-        let is i64 as need = w * h * component_count;
+        let is i64 as need = w * h * component_count * bpsamp;
         let is i64 as i with mut = 0;
         while (i < need) { out.pixels[i] = codbytes[i]; i = i + 1; }
     } else {
@@ -625,7 +648,7 @@ fn csif_decode(src as *u8, len as i64, out as *image.Image) as i64 {
             if (qr < 0) { image.image_free(out); return ce.E_CSIF_PAYLOAD_TRUNC; }
         } else {
             if (codec_id == 2) {
-                let is i64 as mr = modular.modular_decode(codbytes, codlen, w, h, component_count, out.pixels);
+                let is i64 as mr = modular.modular_decode(codbytes, codlen, w, h, component_count, bpsamp, out.pixels);
                 if (mr < 0) { image.image_free(out); return ce.E_CSIF_PAYLOAD_TRUNC; }
             } else {
                 let is i64 as dr = dctc.dct_decode(codbytes, codlen, w, h, component_count, out.pixels);
