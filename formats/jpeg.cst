@@ -17,6 +17,7 @@ use "../core/errno.cst"  as errno;
 use "../core/image.cst"  as image;
 use "../core/pixfmt.cst" as pixfmt;
 use "../transform/dct.cst" as dct;
+use "caustic-compact/core/bytes.cst" as cb;
 
 let is [256]i64 as _qt with mut;      // quant tables: [id*64 + k], zigzag order
 let is [160]i64 as _hmax with mut;    // 8 huff tables × 20 (index by length 1..16)
@@ -731,4 +732,290 @@ fn jpeg_decode(src as *u8, src_len as i64, out as *image.Image) as i64 {
         c = c + 1;
     }
     return 0;
+}
+
+// ============================ encoder =====================================
+// Baseline 4:4:4 JPEG encoder with the standard Annex K quantization and
+// Huffman tables, quality-scaled per the libjpeg convention. GRAY8 encodes a
+// single component; RGB8/RGBA8 encode YCbCr (alpha dropped).
+//   jpeg_encode(img, out) -> out.len, or negative (quality 90).
+
+let is *u8 as _QLUM with imut = "\x10\x0b\x0a\x10\x18\x28\x33\x3d\x0c\x0c\x0e\x13\x1a\x3a\x3c\x37\x0e\x0d\x10\x18\x28\x39\x45\x38\x0e\x11\x16\x1d\x33\x57\x50\x3e\x12\x16\x25\x38\x44\x6d\x67\x4d\x18\x23\x37\x40\x51\x68\x71\x5c\x31\x40\x4e\x57\x67\x79\x78\x65\x48\x5c\x5f\x62\x70\x64\x67\x63";
+let is *u8 as _QCHR with imut = "\x11\x12\x18\x2f\x63\x63\x63\x63\x12\x15\x1a\x42\x63\x63\x63\x63\x18\x1a\x38\x63\x63\x63\x63\x63\x2f\x42\x63\x63\x63\x63\x63\x63\x63\x63\x63\x63\x63\x63\x63\x63\x63\x63\x63\x63\x63\x63\x63\x63\x63\x63\x63\x63\x63\x63\x63\x63\x63\x63\x63\x63\x63\x63\x63\x63";
+let is *u8 as _DCLB with imut = "\x00\x01\x05\x01\x01\x01\x01\x01\x01\x00\x00\x00\x00\x00\x00\x00";
+let is *u8 as _DCLV with imut = "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b";
+let is *u8 as _DCCB with imut = "\x00\x03\x01\x01\x01\x01\x01\x01\x01\x01\x01\x00\x00\x00\x00\x00";
+let is *u8 as _DCCV with imut = "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b";
+let is *u8 as _ACLB with imut = "\x00\x02\x01\x03\x03\x02\x04\x03\x05\x05\x04\x04\x00\x00\x01\x7d";
+let is *u8 as _ACLV with imut = "\x01\x02\x03\x00\x04\x11\x05\x12\x21\x31\x41\x06\x13\x51\x61\x07\x22\x71\x14\x32\x81\x91\xa1\x08\x23\x42\xb1\xc1\x15\x52\xd1\xf0\x24\x33\x62\x72\x82\x09\x0a\x16\x17\x18\x19\x1a\x25\x26\x27\x28\x29\x2a\x34\x35\x36\x37\x38\x39\x3a\x43\x44\x45\x46\x47\x48\x49\x4a\x53\x54\x55\x56\x57\x58\x59\x5a\x63\x64\x65\x66\x67\x68\x69\x6a\x73\x74\x75\x76\x77\x78\x79\x7a\x83\x84\x85\x86\x87\x88\x89\x8a\x92\x93\x94\x95\x96\x97\x98\x99\x9a\xa2\xa3\xa4\xa5\xa6\xa7\xa8\xa9\xaa\xb2\xb3\xb4\xb5\xb6\xb7\xb8\xb9\xba\xc2\xc3\xc4\xc5\xc6\xc7\xc8\xc9\xca\xd2\xd3\xd4\xd5\xd6\xd7\xd8\xd9\xda\xe1\xe2\xe3\xe4\xe5\xe6\xe7\xe8\xe9\xea\xf1\xf2\xf3\xf4\xf5\xf6\xf7\xf8\xf9\xfa";
+let is *u8 as _ACCB with imut = "\x00\x02\x01\x02\x04\x04\x03\x04\x07\x05\x04\x04\x00\x01\x02\x77";
+let is *u8 as _ACCV with imut = "\x00\x01\x02\x03\x11\x04\x05\x21\x31\x06\x12\x41\x51\x07\x61\x71\x13\x22\x32\x81\x08\x14\x42\x91\xa1\xb1\xc1\x09\x23\x33\x52\xf0\x15\x62\x72\xd1\x0a\x16\x24\x34\xe1\x25\xf1\x17\x18\x19\x1a\x26\x27\x28\x29\x2a\x35\x36\x37\x38\x39\x3a\x43\x44\x45\x46\x47\x48\x49\x4a\x53\x54\x55\x56\x57\x58\x59\x5a\x63\x64\x65\x66\x67\x68\x69\x6a\x73\x74\x75\x76\x77\x78\x79\x7a\x82\x83\x84\x85\x86\x87\x88\x89\x8a\x92\x93\x94\x95\x96\x97\x98\x99\x9a\xa2\xa3\xa4\xa5\xa6\xa7\xa8\xa9\xaa\xb2\xb3\xb4\xb5\xb6\xb7\xb8\xb9\xba\xc2\xc3\xc4\xc5\xc6\xc7\xc8\xc9\xca\xd2\xd3\xd4\xd5\xd6\xd7\xd8\xd9\xda\xe2\xe3\xe4\xe5\xe6\xe7\xe8\xe9\xea\xf2\xf3\xf4\xf5\xf6\xf7\xf8\xf9\xfa";
+
+let is [1024]i64 as _ecode with mut;   // 4 tables × 256 symbols
+let is [1024]i64 as _esize with mut;
+let is i64 as _obuf with mut;
+let is i64 as _ocnt with mut;
+
+fn _build_enc(slot as i64, bits as *u8, vals as *u8) as void {
+    let is i64 as code with mut = 0;
+    let is i64 as k with mut = 0;
+    let is i64 as l with mut = 1;
+    while (l <= 16) {
+        let is i64 as n = cast(i64, bits[l - 1]);
+        let is i64 as i with mut = 0;
+        while (i < n) {
+            let is i64 as sym = cast(i64, vals[k]);
+            _ecode[slot * 256 + sym] = code;
+            _esize[slot * 256 + sym] = l;
+            code = code + 1;
+            k = k + 1;
+            i = i + 1;
+        }
+        code = code << 1;
+        l = l + 1;
+    }
+}
+
+fn _put_bits(out as *cb.Bytes, code as i64, n as i64) as void {
+    if (n == 0) { return; }
+    _obuf = (_obuf << n) | (code & ((1 << n) - 1));
+    _ocnt = _ocnt + n;
+    while (_ocnt >= 8) {
+        let is i64 as b = (_obuf >> (_ocnt - 8)) & 255;
+        cb.bytes_push(out, cast(u8, b));
+        if (b == 255) { cb.bytes_push(out, cast(u8, 0)); }   // stuffing
+        _ocnt = _ocnt - 8;
+    }
+}
+fn _flush_bits(out as *cb.Bytes) as void {
+    if (_ocnt > 0) { _put_bits(out, 127, 7 - ((_ocnt + 7) & 7) + 1); }
+    // pad remaining with 1s to the byte boundary
+    while (_ocnt > 0) { _put_bits(out, 1, 1); }
+}
+
+fn _nbits(v as i64) as i64 {
+    let is i64 as a with mut = v;
+    if (a < 0) { a = 0 - a; }
+    let is i64 as n with mut = 0;
+    while (a > 0) { a = a >> 1; n = n + 1; }
+    return n;
+}
+
+fn _jw16(out as *cb.Bytes, v as i64) as void {
+    cb.bytes_push(out, cast(u8, (v >> 8) & 255));
+    cb.bytes_push(out, cast(u8, v & 255));
+}
+fn _jmark(out as *cb.Bytes, m as i64) as void {
+    cb.bytes_push(out, cast(u8, 255));
+    cb.bytes_push(out, cast(u8, m));
+}
+
+// Encode one 8x8 block: level shift, FDCT, quantize, zigzag, entropy-code.
+// q = 64 quality-scaled quant values (natural order); dcslot/acslot select the
+// Huffman tables; pred is the running DC predictor address.
+fn _enc_block(out as *cb.Bytes, samp as *i64, q as *i64, cx as *i64,
+              dcslot as i64, acslot as i64, pred as *i64) as void {
+    let is [64]i64 as F;
+    dct.fdct8x8(samp, cx, cast(*i64, &F));
+    let is [64]i64 as z;
+    let is i64 as i with mut = 0;
+    while (i < 64) {
+        let is i64 as nat = _zz[i];
+        let is i64 as f = F[nat];
+        let is i64 as qq = q[nat];
+        if (f >= 0) { z[i] = (f + (qq >> 1)) / qq; }
+        else { z[i] = 0 - (((0 - f) + (qq >> 1)) / qq); }
+        i = i + 1;
+    }
+    // DC
+    let is i64 as diff = z[0] - pred[0];
+    pred[0] = z[0];
+    let is i64 as s = _nbits(diff);
+    _put_bits(out, _ecode[dcslot * 256 + s], _esize[dcslot * 256 + s]);
+    if (s > 0) {
+        let is i64 as v with mut = diff;
+        if (diff < 0) { v = diff - 1; }
+        _put_bits(out, v & ((1 << s) - 1), s);
+    }
+    // AC
+    let is i64 as run with mut = 0;
+    let is i64 as k with mut = 1;
+    while (k < 64) {
+        if (z[k] == 0) { run = run + 1; }
+        else {
+            while (run > 15) {
+                _put_bits(out, _ecode[acslot * 256 + 240], _esize[acslot * 256 + 240]);   // ZRL
+                run = run - 16;
+            }
+            let is i64 as sz = _nbits(z[k]);
+            let is i64 as rs = (run << 4) | sz;
+            _put_bits(out, _ecode[acslot * 256 + rs], _esize[acslot * 256 + rs]);
+            let is i64 as v with mut = z[k];
+            if (v < 0) { v = v - 1; }
+            _put_bits(out, v & ((1 << sz) - 1), sz);
+            run = 0;
+        }
+        k = k + 1;
+    }
+    if (run > 0) {
+        _put_bits(out, _ecode[acslot * 256], _esize[acslot * 256]);   // EOB
+    }
+}
+
+fn jpeg_encode(img as *image.Image, out as *cb.Bytes) as i64 {
+    let is i64 as quality = 90;
+    let is i64 as ncomp with mut = 0;
+    let is i64 as ibpp with mut = 0;
+    if (img.fmt == pixfmt.FMT_GRAY8) { ncomp = 1; ibpp = 1; }
+    if (img.fmt == pixfmt.FMT_RGB8)  { ncomp = 3; ibpp = 3; }
+    if (img.fmt == pixfmt.FMT_RGBA8) { ncomp = 3; ibpp = 4; }
+    if (ncomp == 0) { return errno.I_UNSUPPORTED; }
+    let is i64 as w = img.width;
+    let is i64 as h = img.height;
+
+    _build_zz();
+    dct.dct_build_cx(cast(*i64, &_cx));
+    _build_enc(0, _DCLB, _DCLV);
+    _build_enc(1, _ACLB, _ACLV);
+    _build_enc(2, _DCCB, _DCCV);
+    _build_enc(3, _ACCB, _ACCV);
+    _obuf = 0; _ocnt = 0;
+
+    // quality-scale the quant tables (libjpeg convention), natural order.
+    let is i64 as scale with mut = 200 - 2 * quality;
+    if (quality < 50) { scale = 5000 / quality; }
+    let is [64]i64 as ql;
+    let is [64]i64 as qc;
+    let is i64 as i with mut = 0;
+    while (i < 64) {
+        let is i64 as vl with mut = (cast(i64, _QLUM[i]) * scale + 50) / 100;
+        if (vl < 1) { vl = 1; } if (vl > 255) { vl = 255; }
+        ql[i] = vl;
+        let is i64 as vc with mut = (cast(i64, _QCHR[i]) * scale + 50) / 100;
+        if (vc < 1) { vc = 1; } if (vc > 255) { vc = 255; }
+        qc[i] = vc;
+        i = i + 1;
+    }
+
+    // ---- markers ----
+    _jmark(out, 216);                                  // SOI
+    _jmark(out, 224); _jw16(out, 16);                  // APP0 JFIF
+    cb.bytes_push(out, cast(u8, 74)); cb.bytes_push(out, cast(u8, 70));
+    cb.bytes_push(out, cast(u8, 73)); cb.bytes_push(out, cast(u8, 70));
+    cb.bytes_push(out, cast(u8, 0));
+    cb.bytes_push(out, cast(u8, 1)); cb.bytes_push(out, cast(u8, 1));   // v1.1
+    cb.bytes_push(out, cast(u8, 0));                   // aspect units
+    _jw16(out, 1); _jw16(out, 1);                      // aspect 1:1
+    cb.bytes_push(out, cast(u8, 0)); cb.bytes_push(out, cast(u8, 0));   // no thumb
+
+    _jmark(out, 219); _jw16(out, 2 + 65);              // DQT luma (zigzag order)
+    cb.bytes_push(out, cast(u8, 0));
+    i = 0; while (i < 64) { cb.bytes_push(out, cast(u8, ql[_zz[i]])); i = i + 1; }
+    if (ncomp == 3) {
+        _jmark(out, 219); _jw16(out, 2 + 65);          // DQT chroma
+        cb.bytes_push(out, cast(u8, 1));
+        i = 0; while (i < 64) { cb.bytes_push(out, cast(u8, qc[_zz[i]])); i = i + 1; }
+    }
+
+    _jmark(out, 192); _jw16(out, 8 + 3 * ncomp);       // SOF0
+    cb.bytes_push(out, cast(u8, 8));
+    _jw16(out, h); _jw16(out, w);
+    cb.bytes_push(out, cast(u8, ncomp));
+    let is i64 as c with mut = 0;
+    while (c < ncomp) {
+        cb.bytes_push(out, cast(u8, c + 1));           // id
+        cb.bytes_push(out, cast(u8, 17));              // h=1, v=1 (4:4:4)
+        let is i64 as tq with mut = 0;
+        if (c > 0) { tq = 1; }
+        cb.bytes_push(out, cast(u8, tq));
+        c = c + 1;
+    }
+
+    // DHT: DC/AC luma (+ DC/AC chroma for colour)
+    let is i64 as t with mut = 0;
+    while (t < 4) {
+        let is i64 as skip with mut = 0;
+        if (ncomp == 1) { if (t >= 2) { skip = 1; } }
+        if (skip == 0) {
+            let is *u8 as bits with mut = _DCLB;
+            let is *u8 as vals with mut = _DCLV;
+            let is i64 as tcth with mut = 0;
+            if (t == 1) { bits = _ACLB; vals = _ACLV; tcth = 16; }
+            if (t == 2) { bits = _DCCB; vals = _DCCV; tcth = 1; }
+            if (t == 3) { bits = _ACCB; vals = _ACCV; tcth = 17; }
+            let is i64 as total with mut = 0;
+            i = 0; while (i < 16) { total = total + cast(i64, bits[i]); i = i + 1; }
+            _jmark(out, 196); _jw16(out, 2 + 1 + 16 + total);
+            cb.bytes_push(out, cast(u8, tcth));
+            i = 0; while (i < 16) { cb.bytes_push(out, bits[i]); i = i + 1; }
+            i = 0; while (i < total) { cb.bytes_push(out, vals[i]); i = i + 1; }
+        }
+        t = t + 1;
+    }
+
+    _jmark(out, 218); _jw16(out, 6 + 2 * ncomp);       // SOS
+    cb.bytes_push(out, cast(u8, ncomp));
+    c = 0;
+    while (c < ncomp) {
+        cb.bytes_push(out, cast(u8, c + 1));
+        let is i64 as td with mut = 0;                 // dc0/ac0
+        if (c > 0) { td = 17; }                        // dc1/ac1
+        cb.bytes_push(out, cast(u8, td));
+        c = c + 1;
+    }
+    cb.bytes_push(out, cast(u8, 0)); cb.bytes_push(out, cast(u8, 63));
+    cb.bytes_push(out, cast(u8, 0));
+
+    // ---- entropy-coded data: 8x8 MCUs, components interleaved ----
+    let is [3]i64 as pred;
+    pred[0] = 0; pred[1] = 0; pred[2] = 0;
+    let is [64]i64 as samp;
+    let is *u8 as px = img.pixels;
+    let is i64 as bxn = (w + 7) / 8;
+    let is i64 as byn = (h + 7) / 8;
+    let is i64 as by with mut = 0;
+    while (by < byn) {
+        let is i64 as bx with mut = 0;
+        while (bx < bxn) {
+            c = 0;
+            while (c < ncomp) {
+                let is i64 as yy with mut = 0;
+                while (yy < 8) {
+                    let is i64 as xx with mut = 0;
+                    while (xx < 8) {
+                        let is i64 as sx with mut = bx * 8 + xx; if (sx >= w) { sx = w - 1; }
+                        let is i64 as sy with mut = by * 8 + yy; if (sy >= h) { sy = h - 1; }
+                        let is i64 as o = (sy * w + sx) * ibpp;
+                        let is i64 as v with mut = 0;
+                        if (ncomp == 1) { v = cast(i64, px[o]); }
+                        else {
+                            let is i64 as r = cast(i64, px[o]);
+                            let is i64 as g = cast(i64, px[o + 1]);
+                            let is i64 as b = cast(i64, px[o + 2]);
+                            if (c == 0) { v = (19595 * r + 38470 * g + 7471 * b) >> 16; }
+                            else { if (c == 1) { v = 128 + ((0 - 11059 * r - 21709 * g + 32768 * b) >> 16); }
+                            else { v = 128 + ((32768 * r - 27439 * g - 5329 * b) >> 16); } }
+                            if (v < 0) { v = 0; }
+                            if (v > 255) { v = 255; }
+                        }
+                        samp[yy * 8 + xx] = v - 128;
+                        xx = xx + 1;
+                    }
+                    yy = yy + 1;
+                }
+                let is *i64 as q with mut = cast(*i64, &ql);
+                let is i64 as dcs with mut = 0;
+                let is i64 as acs with mut = 1;
+                if (c > 0) { q = cast(*i64, &qc); dcs = 2; acs = 3; }
+                _enc_block(out, cast(*i64, &samp), q, cast(*i64, &_cx), dcs, acs,
+                    cast(*i64, cast(i64, cast(*i64, &pred)) + c * 8));
+                c = c + 1;
+            }
+            bx = bx + 1;
+        }
+        by = by + 1;
+    }
+    _flush_bits(out);
+    _jmark(out, 217);                                  // EOI
+    return out.len;
 }

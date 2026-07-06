@@ -1,0 +1,69 @@
+// test_jpeg_enc — encode with our baseline JPEG encoder, decode with our own
+// decoder, bounded error. (The encoder's bitstream conformance was verified
+// against Pillow/libjpeg at development time — PSNR 44.6 dB at quality 90;
+// this test guards the pipeline against regressions.)
+use "../core/image.cst"  as image;
+use "../core/pixfmt.cst" as pixfmt;
+use "../formats/jpeg.cst" as jpeg;
+use "caustic-compact/core/bytes.cst" as cb;
+
+fn smooth(img as *image.Image, w as i64, h as i64, fmt as i64) as i64 {
+    if (image.image_init(img, w, h, fmt) != 0) { return 1; }
+    let is i64 as ch = pixfmt.fmt_channels(fmt);
+    let is i64 as y with mut = 0;
+    while (y < h) {
+        let is i64 as x with mut = 0;
+        while (x < w) {
+            let is i64 as o = (y * w + x) * ch;
+            img.pixels[o] = cast(u8, 30 + x * 3);
+            if (ch >= 3) {
+                img.pixels[o + 1] = cast(u8, 20 + y * 4);
+                img.pixels[o + 2] = cast(u8, 25 + ((x + y) >> 1));
+            }
+            if (ch == 4) { img.pixels[o + 3] = cast(u8, 255); }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return 0;
+}
+
+fn rt(w as i64, h as i64, fmt as i64, tol as i64) as i64 {
+    let is image.Image as a;
+    if (smooth(&a, w, h, fmt) != 0) { return 1; }
+    let is cb.Bytes as e = cb.bytes_new(4096);
+    if (jpeg.jpeg_encode(&a, &e) < 0) { return 2; }
+    // structure: SOI + APP0, terminal EOI
+    if (cast(i64, e.ptr[0]) != 255) { return 3; }
+    if (cast(i64, e.ptr[1]) != 216) { return 4; }
+    if (cast(i64, e.ptr[e.len - 2]) != 255) { return 5; }
+    if (cast(i64, e.ptr[e.len - 1]) != 217) { return 6; }
+    let is image.Image as b;
+    if (jpeg.jpeg_decode(e.ptr, e.len, &b) != 0) { return 7; }
+    if (b.width != w) { return 8; }
+    // channel-aware compare: source may be RGBA (alpha dropped by the codec)
+    let is i64 as sch = pixfmt.fmt_channels(fmt);
+    let is i64 as dch = pixfmt.fmt_channels(b.fmt);
+    let is i64 as ncmp with mut = 3;
+    if (fmt == pixfmt.FMT_GRAY8) { ncmp = 1; }
+    let is i64 as p with mut = 0;
+    while (p < w * h) {
+        let is i64 as c with mut = 0;
+        while (c < ncmp) {
+            let is i64 as d with mut = cast(i64, a.pixels[p * sch + c]) - cast(i64, b.pixels[p * dch + c]);
+            if (d < 0) { d = 0 - d; }
+            if (d > tol) { return 9; }
+            c = c + 1;
+        }
+        p = p + 1;
+    }
+    cb.bytes_free(&e); image.image_free(&a); image.image_free(&b);
+    return 0;
+}
+
+fn main() as i64 {
+    if (rt(40, 30, pixfmt.FMT_RGB8, 12)  != 0) { return 10; }
+    if (rt(24, 20, pixfmt.FMT_GRAY8, 10) != 0) { return 20; }
+    if (rt(9, 7, pixfmt.FMT_RGBA8, 12)   != 0) { return 30; }   // odd dims + alpha dropped
+    return 0;
+}

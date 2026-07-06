@@ -16,6 +16,7 @@ use "formats/bmp.cst" as bmp;
 use "formats/pnm.cst" as pnm;
 use "formats/tga.cst" as tga;
 use "formats/gif.cst" as gif;
+use "formats/jpeg.cst" as jpeg;
 use "csif/container.cst" as csif;
 use "caustic-compact/core/bytes.cst" as cb;
 
@@ -26,6 +27,7 @@ fn encode(img as *image.Image, fmt as i64, out as *cb.Bytes) as i64 {
     if (fmt == sniff.SNIFF_PNM)  { return pnm.pnm_encode(img, out); }
     if (fmt == sniff.SNIFF_TGA)  { return tga.tga_encode(img, out); }
     if (fmt == sniff.SNIFF_GIF)  { return gif.gif_encode(img, out); }
+    if (fmt == sniff.SNIFF_JPEG) { return jpeg.jpeg_encode(img, out); }
     if (fmt == sniff.SNIFF_CSIF) { return csif.csif_encode_ex(img, out, 2); }
     return errno.I_UNSUPPORTED;
 }
@@ -54,6 +56,8 @@ fn ext_to_fmt(path as *u8) as i64 {
     if (_ends(path, ".bmp", 4) == 1)  { return sniff.SNIFF_BMP; }
     if (_ends(path, ".tga", 4) == 1)  { return sniff.SNIFF_TGA; }
     if (_ends(path, ".gif", 4) == 1)  { return sniff.SNIFF_GIF; }
+    if (_ends(path, ".jpg", 4) == 1)  { return sniff.SNIFF_JPEG; }
+    if (_ends(path, ".jpeg", 5) == 1) { return sniff.SNIFF_JPEG; }
     if (_ends(path, ".csif", 5) == 1) { return sniff.SNIFF_CSIF; }
     if (_ends(path, ".ppm", 4) == 1)  { return sniff.SNIFF_PNM; }
     if (_ends(path, ".pgm", 4) == 1)  { return sniff.SNIFF_PNM; }
