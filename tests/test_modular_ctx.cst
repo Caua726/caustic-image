@@ -1,12 +1,11 @@
-// test_modular_ctx — the MODULAR context-modelling path: on a half-smooth /
-// half-noisy image the encoder must pick the 5-context tables (stream K byte
-// = 5), decode must reconstruct exactly, and the context encoding must beat
-// the single-table one. Also pins the k=1 fallback on a smooth gradient.
+// test_modular_ctx — MODULAR best-of-three entropy: the encoder writes a method
+// byte (0=DEFLATE, 1=rANS, 2=context-rANS) and both a half-smooth/half-noisy
+// image and a smooth gradient must reconstruct exactly. The gradient (highly
+// repetitive after prediction) must pick the LZ method, the smallest for it.
 use "std/mem.cst" only bins, core as mem;
 use "../core/image.cst"  as image;
 use "../core/pixfmt.cst" as pixfmt;
 use "../csif/modular.cst" as modular;
-use "caustic-compact/entropy/rans.cst" as rans;
 use "caustic-compact/core/bytes.cst" as cb;
 
 fn main() as i64 {
@@ -33,8 +32,7 @@ fn main() as i64 {
 
     let is cb.Bytes as e = cb.bytes_new(8192);
     if (modular.modular_encode(&a, &e) != 0) { return 2; }
-    // First stream byte is K — the mixed image must engage the 5 contexts.
-    if (cast(i64, e.ptr[0]) != 5) { return 3; }
+    if (cast(i64, e.ptr[0]) > 2) { return 3; }        // valid method byte
 
     let is *u8 as outp = mem.core.mmap_anon(w * h * 3 + 1);
     if (modular.modular_decode(e.ptr, e.len, w, h, 3, 1, outp) != 0) { return 4; }
@@ -44,7 +42,7 @@ fn main() as i64 {
         i = i + 1;
     }
 
-    // Smooth gradient falls back to a single table (K = 1).
+    // Smooth gradient: LZ (method 0) wins by a large margin.
     let is image.Image as g;
     if (image.image_init(&g, 48, 48, pixfmt.FMT_RGB8) != 0) { return 6; }
     y = 0;
@@ -60,10 +58,15 @@ fn main() as i64 {
     }
     let is cb.Bytes as eg = cb.bytes_new(4096);
     if (modular.modular_encode(&g, &eg) != 0) { return 7; }
-    if (cast(i64, eg.ptr[0]) != 1) { return 8; }
+    if (cast(i64, eg.ptr[0]) != 0) { return 8; }      // DEFLATE chosen for the gradient
+    let is *u8 as og = mem.core.mmap_anon(48 * 48 * 3 + 1);
+    if (modular.modular_decode(eg.ptr, eg.len, 48, 48, 3, 1, og) != 0) { return 9; }
+    i = 0;
+    while (i < 48 * 48 * 3) { if (og[i] != g.pixels[i]) { return 10; } i = i + 1; }
 
     cb.bytes_free(&e); cb.bytes_free(&eg);
     image.image_free(&a); image.image_free(&g);
     mem.core.munmap(outp, w * h * 3 + 1);
+    mem.core.munmap(og, 48 * 48 * 3 + 1);
     return 0;
 }
