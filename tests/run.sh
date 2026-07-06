@@ -45,6 +45,7 @@ run_case test_apng           tests/test_apng.cst
 run_case test_gif            tests/test_gif.cst
 run_case test_gif_interlace  tests/test_gif_interlace.cst
 run_case test_gif_anim       tests/test_gif_anim.cst
+run_case test_gif_anim_enc   tests/test_gif_anim_enc.cst
 run_case test_limit          tests/test_limit.cst
 run_case test_qoi_rt         tests/test_qoi_rt.cst
 run_case test_encode_rt      tests/test_encode_rt.cst

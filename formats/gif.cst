@@ -492,3 +492,111 @@ fn gif_decode_anim(src as *u8, src_len as i64, out as *GifAnim) as i64 {
     mem.core.munmap(saved, fsize);
     return 0;
 }
+
+// Encode a GifAnim (RGBA8 frames) as an animated GIF: one exact global
+// palette across all frames (<=256 colours or I_UNSUPPORTED), NETSCAPE2.0
+// infinite loop, per-frame GCE delays (centiseconds), full-frame replace.
+fn gif_encode_anim(anim as *GifAnim, out as *cb.Bytes) as i64 {
+    let is i64 as w = anim.width;
+    let is i64 as h = anim.height;
+    let is i64 as npx = w * h;
+    let is [256]i64 as pr;
+    let is [256]i64 as pg;
+    let is [256]i64 as pb;
+    let is i64 as count with mut = 0;
+
+    // global palette across every frame
+    let is *u8 as idxall = mem.core.mmap_anon(anim.count * npx);
+    if (cast(i64, idxall) <= 0) { return errno.I_OOM; }
+    let is i64 as f with mut = 0;
+    while (f < anim.count) {
+        let is *u8 as fp = gif_anim_frame(anim, f);
+        let is i64 as p with mut = 0;
+        while (p < npx) {
+            let is i64 as r = cast(i64, fp[p * 4]);
+            let is i64 as g = cast(i64, fp[p * 4 + 1]);
+            let is i64 as b = cast(i64, fp[p * 4 + 2]);
+            let is i64 as found with mut = 0 - 1;
+            let is i64 as j with mut = 0;
+            while (j < count) {
+                if (pr[j] == r) { if (pg[j] == g) { if (pb[j] == b) { found = j; j = count; } } }
+                j = j + 1;
+            }
+            if (found < 0) {
+                if (count >= 256) { mem.core.munmap(idxall, anim.count * npx); return errno.I_UNSUPPORTED; }
+                pr[count] = r; pg[count] = g; pb[count] = b;
+                found = count;
+                count = count + 1;
+            }
+            idxall[f * npx + p] = cast(u8, found);
+            p = p + 1;
+        }
+        f = f + 1;
+    }
+    let is i64 as nbits with mut = 2;
+    while ((1 << nbits) < count) { nbits = nbits + 1; }
+    let is i64 as gct = 1 << nbits;
+
+    // header + LSD + GCT
+    cb.bytes_push(out, cast(u8, 71)); cb.bytes_push(out, cast(u8, 73)); cb.bytes_push(out, cast(u8, 70));
+    cb.bytes_push(out, cast(u8, 56)); cb.bytes_push(out, cast(u8, 57)); cb.bytes_push(out, cast(u8, 97));
+    cb.bytes_push(out, cast(u8, w & 255)); cb.bytes_push(out, cast(u8, (w >> 8) & 255));
+    cb.bytes_push(out, cast(u8, h & 255)); cb.bytes_push(out, cast(u8, (h >> 8) & 255));
+    cb.bytes_push(out, cast(u8, 128 | ((nbits - 1) << 4) | (nbits - 1)));
+    cb.bytes_push(out, cast(u8, 0)); cb.bytes_push(out, cast(u8, 0));
+    let is i64 as e with mut = 0;
+    while (e < gct) {
+        if (e < count) {
+            cb.bytes_push(out, cast(u8, pr[e])); cb.bytes_push(out, cast(u8, pg[e])); cb.bytes_push(out, cast(u8, pb[e]));
+        } else {
+            cb.bytes_push(out, cast(u8, 0)); cb.bytes_push(out, cast(u8, 0)); cb.bytes_push(out, cast(u8, 0));
+        }
+        e = e + 1;
+    }
+    // NETSCAPE2.0 loop-forever extension
+    cb.bytes_push(out, cast(u8, 33)); cb.bytes_push(out, cast(u8, 255)); cb.bytes_push(out, cast(u8, 11));
+    cb.bytes_push(out, cast(u8, 78)); cb.bytes_push(out, cast(u8, 69)); cb.bytes_push(out, cast(u8, 84));
+    cb.bytes_push(out, cast(u8, 83)); cb.bytes_push(out, cast(u8, 67)); cb.bytes_push(out, cast(u8, 65));
+    cb.bytes_push(out, cast(u8, 80)); cb.bytes_push(out, cast(u8, 69)); cb.bytes_push(out, cast(u8, 50));
+    cb.bytes_push(out, cast(u8, 46)); cb.bytes_push(out, cast(u8, 48));
+    cb.bytes_push(out, cast(u8, 3)); cb.bytes_push(out, cast(u8, 1));
+    cb.bytes_push(out, cast(u8, 0)); cb.bytes_push(out, cast(u8, 0));   // loop 0 = forever
+    cb.bytes_push(out, cast(u8, 0));
+
+    // frames
+    f = 0;
+    while (f < anim.count) {
+        let is *i64 as dl = cast(*i64, anim.delays);
+        let is i64 as delay_cs with mut = 10;
+        if (anim.delays > 0) { delay_cs = dl[f]; }        // GifAnim delays are centiseconds
+        // GCE: disposal 1 (leave), no transparency
+        cb.bytes_push(out, cast(u8, 33)); cb.bytes_push(out, cast(u8, 249)); cb.bytes_push(out, cast(u8, 4));
+        cb.bytes_push(out, cast(u8, 4));                  // disposal=1<<2
+        cb.bytes_push(out, cast(u8, delay_cs & 255)); cb.bytes_push(out, cast(u8, (delay_cs >> 8) & 255));
+        cb.bytes_push(out, cast(u8, 0)); cb.bytes_push(out, cast(u8, 0));
+        // image descriptor (full frame)
+        cb.bytes_push(out, cast(u8, 44));
+        cb.bytes_push(out, cast(u8, 0)); cb.bytes_push(out, cast(u8, 0));
+        cb.bytes_push(out, cast(u8, 0)); cb.bytes_push(out, cast(u8, 0));
+        cb.bytes_push(out, cast(u8, w & 255)); cb.bytes_push(out, cast(u8, (w >> 8) & 255));
+        cb.bytes_push(out, cast(u8, h & 255)); cb.bytes_push(out, cast(u8, (h >> 8) & 255));
+        cb.bytes_push(out, cast(u8, 0));
+        cb.bytes_push(out, cast(u8, nbits));
+        let is cb.Bytes as comp = cb.bytes_new(npx + 64);
+        lzw.lzw_gif_encode(cast(*u8, cast(i64, idxall) + f * npx), npx, nbits, &comp);
+        let is i64 as off with mut = 0;
+        while (off < comp.len) {
+            let is i64 as chunk with mut = comp.len - off;
+            if (chunk > 255) { chunk = 255; }
+            cb.bytes_push(out, cast(u8, chunk));
+            cb.bytes_append(out, cast(*u8, cast(i64, comp.ptr) + off), chunk);
+            off = off + chunk;
+        }
+        cb.bytes_push(out, cast(u8, 0));
+        cb.bytes_free(&comp);
+        f = f + 1;
+    }
+    cb.bytes_push(out, cast(u8, 59));
+    mem.core.munmap(idxall, anim.count * npx);
+    return out.len;
+}

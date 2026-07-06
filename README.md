@@ -20,7 +20,7 @@ in Pillow/giflib/libpng.
 | PNM  | yes | yes | P1–P6 decode; P5/P6 encode; 8-bit samples |
 | TGA  | yes | yes | decode uncompressed+RLE 24/32/gray; encode uncompressed (no magic → decode when named) |
 | PNG  | yes | yes | 1/2/4/8/16-bit, colour types 0/2/3/4/6, all filters, Adam7, APNG animation; encode 8-bit non-interlaced |
-| GIF  | yes | yes | decode first frame + de-interlace; encode exact-palette (≤256 colours) |
+| GIF  | yes | yes | decode single-frame + animation (compositing); encode exact-palette single-frame + animation (NETSCAPE loop) |
 | JPEG | yes | yes | decode baseline + progressive, fancy chroma upsampling (±3 of libjpeg); encode baseline 4:4:4 Annex-K tables, quality 90 (PSNR ~45 dB) |
 | TIFF | yes | — | II/MM, strips, uncompressed / PackBits / LZW / DEFLATE (+ predictor 2); 8-bit gray/RGB/RGBA |
 | CSIF | yes | yes | native flagship — see below |

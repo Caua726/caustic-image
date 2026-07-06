@@ -1,0 +1,54 @@
+// test_gif_anim_enc — build a synthetic animation, encode it as an animated
+// GIF, decode with our own animation decoder, frames byte-exact (opaque RGBA).
+use "std/mem.cst" only bins, core as mem;
+use "../formats/gif.cst" as gif;
+use "caustic-compact/core/bytes.cst" as cb;
+
+fn main() as i64 {
+    let is i64 as w = 14;
+    let is i64 as h = 10;
+    let is i64 as nf = 3;
+    let is i64 as fsize = w * h * 4;
+    let is gif.GifAnim as a;
+    a.width = w; a.height = h; a.count = nf;
+    a.frames = cast(i64, mem.core.mmap_anon(nf * fsize));
+    a.delays = cast(i64, mem.core.mmap_anon(nf * 8));
+    if (a.delays == 0) { return 1; }
+    let is *i64 as dl = cast(*i64, a.delays);
+    let is i64 as f with mut = 0;
+    while (f < nf) {
+        dl[f] = 80;
+        let is *u8 as fp = gif.gif_anim_frame(&a, f);
+        let is i64 as p with mut = 0;
+        while (p < w * h) {
+            let is i64 as ci = ((p % w) / 3 + f) % 5;
+            fp[p * 4]     = cast(u8, ci * 50);
+            fp[p * 4 + 1] = cast(u8, 255 - ci * 40);
+            fp[p * 4 + 2] = cast(u8, 30 + ci * 30);
+            fp[p * 4 + 3] = cast(u8, 255);
+            p = p + 1;
+        }
+        f = f + 1;
+    }
+
+    let is cb.Bytes as e = cb.bytes_new(1024);
+    if (gif.gif_encode_anim(&a, &e) < 0) { return 2; }
+
+    let is gif.GifAnim as b;
+    if (gif.gif_decode_anim(e.ptr, e.len, &b) != 0) { return 3; }
+    if (b.count != nf) { return 4; }
+    if (b.width != w) { return 5; }
+    let is *u8 as pa = cast(*u8, a.frames);
+    let is *u8 as pb = cast(*u8, b.frames);
+    let is i64 as i with mut = 0;
+    while (i < nf * fsize) {
+        if (pa[i] != pb[i]) { return 6; }
+        i = i + 1;
+    }
+    let is *i64 as bdl = cast(*i64, b.delays);
+    if (bdl[0] != 80) { return 7; }    // centiseconds round-trip
+    cb.bytes_free(&e);
+    gif.gif_anim_free(&a);
+    gif.gif_anim_free(&b);
+    return 0;
+}
