@@ -58,6 +58,7 @@ run_case test_tiff           tests/test_tiff.cst
 run_case test_webp           tests/test_webp.cst
 run_case test_ops            tests/test_ops.cst
 run_case test_lowbit         tests/test_lowbit.cst
+run_case test_modular_ctx    tests/test_modular_ctx.cst
 
 if [ "$fail" -eq 0 ]; then echo "all green"; else echo "FAILURES"; fi
 exit $fail
