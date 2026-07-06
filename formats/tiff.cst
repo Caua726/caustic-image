@@ -17,6 +17,7 @@ use "../core/image.cst"  as image;
 use "../core/pixfmt.cst" as pixfmt;
 use "caustic-compact/core/bytes.cst"   as cb;
 use "caustic-compact/formats/zlib.cst" as zlib;
+use "caustic-compact/formats/lzw.cst"  as lzw;
 
 fn _r16(p as *u8, o as i64, le as i64) as i64 {
     if (le == 1) { return cast(i64, p[o]) | (cast(i64, p[o + 1]) << 8); }
@@ -98,6 +99,7 @@ fn tiff_decode(src as *u8, src_len as i64, out as *image.Image) as i64 {
     let is i64 as rps with mut = 0;
     let is i64 as planar with mut = 1;
     let is i64 as bps with mut = 8;
+    let is i64 as predictor with mut = 1;
     let is i64 as so_v with mut = 0; let is i64 as so_t with mut = 0; let is i64 as so_c with mut = 0;
     let is i64 as sc_v with mut = 0; let is i64 as sc_t with mut = 0; let is i64 as sc_c with mut = 0;
 
@@ -117,6 +119,7 @@ fn tiff_decode(src as *u8, src_len as i64, out as *image.Image) as i64 {
         if (tag == 277) { spp = _scalar(src, vo, typ, le); }
         if (tag == 278) { rps = _scalar(src, vo, typ, le); }
         if (tag == 284) { planar = _scalar(src, vo, typ, le); }
+        if (tag == 317) { predictor = _scalar(src, vo, typ, le); }
         if (tag == 273) { so_v = vo; so_t = typ; so_c = count; }
         if (tag == 279) { sc_v = vo; sc_t = typ; sc_c = count; }
         i = i + 1;
@@ -130,7 +133,8 @@ fn tiff_decode(src as *u8, src_len as i64, out as *image.Image) as i64 {
     if (spp == 3) { fmt = pixfmt.FMT_RGB8; }
     if (spp == 4) { fmt = pixfmt.FMT_RGBA8; }
     if (fmt == 0) { return errno.I_UNSUPPORTED; }
-    if (comp != 1) { if (comp != 32773) { if (comp != 8) { if (comp != 32946) { return errno.I_UNSUPPORTED; } } } }
+    if (comp != 1) { if (comp != 32773) { if (comp != 8) { if (comp != 32946) { if (comp != 5) { return errno.I_UNSUPPORTED; } } } } }
+    if (predictor != 1) { if (predictor != 2) { return errno.I_UNSUPPORTED; } }
 
     let is i64 as dchk = image.image_check_dims(width, length, fmt);
     if (dchk < 0) { return dchk; }
@@ -159,9 +163,11 @@ fn tiff_decode(src as *u8, src_len as i64, out as *image.Image) as i64 {
             if (comp == 32773) {
                 _packbits(src, soff, scnt, cast(*u8, cast(i64, dst) + drow0), need);
             } else {
-                // DEFLATE (zlib) strip.
+                // LZW (5) or DEFLATE/zlib (8/32946) strip.
                 let is cb.Bytes as ob = cb.bytes_new(need + 64);
-                let is i64 as zr = zlib.zlib_decompress(cast(*u8, cast(i64, src) + soff), scnt, &ob);
+                let is i64 as zr with mut = 0;
+                if (comp == 5) { zr = lzw.lzw_tiff_decode(cast(*u8, cast(i64, src) + soff), scnt, &ob); }
+                else { zr = zlib.zlib_decompress(cast(*u8, cast(i64, src) + soff), scnt, &ob); }
                 if (zr < 0) { cb.bytes_free(&ob); return errno.I_CORRUPT; }
                 let is i64 as ncopy with mut = ob.len; if (ncopy > need) { ncopy = need; }
                 let is i64 as k with mut = 0;
@@ -170,6 +176,20 @@ fn tiff_decode(src as *u8, src_len as i64, out as *image.Image) as i64 {
             }
         }
         s = s + 1;
+    }
+
+    // Predictor 2: horizontal differencing — accumulate along each row.
+    if (predictor == 2) {
+        let is i64 as y2 with mut = 0;
+        while (y2 < length) {
+            let is i64 as ro = y2 * rowbytes;
+            let is i64 as k with mut = spp;
+            while (k < rowbytes) {
+                dst[ro + k] = cast(u8, (cast(i64, dst[ro + k]) + cast(i64, dst[ro + k - spp])) & 255);
+                k = k + 1;
+            }
+            y2 = y2 + 1;
+        }
     }
 
     // WhiteIsZero grayscale: invert to BlackIsZero.
