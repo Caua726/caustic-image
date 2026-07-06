@@ -21,7 +21,7 @@ in Pillow/giflib/libpng.
 | TGA  | yes | yes | decode uncompressed+RLE 24/32/gray; encode uncompressed (no magic → decode when named) |
 | PNG  | yes | yes | 1/2/4/8/16-bit, colour types 0/2/3/4/6, all filters, Adam7; encode 8-bit non-interlaced |
 | GIF  | yes | yes | decode first frame + de-interlace; encode exact-palette (≤256 colours) |
-| JPEG | yes | — | baseline (Huffman, 4:4:4/4:2:2/4:2:0), matches libjpeg within a few levels |
+| JPEG | yes | — | baseline + progressive (spectral selection, successive approximation), fancy chroma upsampling; matches libjpeg within ±3 |
 | TIFF | yes | — | II/MM, strips, uncompressed / PackBits / LZW / DEFLATE (+ predictor 2); 8-bit gray/RGB/RGBA |
 | CSIF | yes | yes | native flagship — see below |
 | WebP | yes | — | VP8L lossless: meta-Huffman, LZ77 2D, colour cache, all 4 transforms (VP8 lossy deferred) |

@@ -53,6 +53,7 @@ run_case test_rans           tests/test_rans.cst
 run_case test_dispatch       tests/test_dispatch.cst
 run_case test_dct            tests/test_dct.cst
 run_case test_jpeg           tests/test_jpeg.cst
+run_case test_jpeg_prog      tests/test_jpeg_prog.cst
 run_case test_csif_dct       tests/test_csif_dct.cst
 run_case test_tiff           tests/test_tiff.cst
 run_case test_webp           tests/test_webp.cst

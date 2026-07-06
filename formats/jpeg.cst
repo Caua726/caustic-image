@@ -1,10 +1,12 @@
 // =======================================================
 // caustic-image/formats/jpeg.cst
-// Baseline (sequential DCT, Huffman) JPEG decoder. Parses the marker segments
-// (DQT/DHT/SOF0/SOS/DRI/APPn), decodes the entropy-coded MCUs (DC diff + AC
-// run/size), dequantizes, runs the shared fixed-point IDCT, upsamples chroma,
-// and converts YCbCr->RGB (or passes gray through). Progressive, arithmetic,
-// 12-bit, and CMYK are out of scope (loud I_UNSUPPORTED).
+// JPEG decoder — baseline (SOF0) and progressive (SOF2). Both paths decode
+// into per-component quantized-coefficient planes; a common finish stage then
+// dequantizes, runs the shared fixed-point IDCT, upsamples chroma, and
+// converts YCbCr->RGB (or passes gray through). Progressive handles DC/AC
+// first + refinement scans (spectral selection, successive approximation,
+// EOB runs). Restart markers handled in both. Arithmetic coding, 12-bit,
+// hierarchical, and CMYK are loud I_UNSUPPORTED.
 //   jpeg_decode(src, src_len, out) -> 0, or negative errno.
 //
 // Decoder state lives in module globals (one decode at a time).
@@ -28,18 +30,22 @@ let is [4]i64 as _chh with mut;       // per-component h_samp
 let is [4]i64 as _chv with mut;       // v_samp
 let is [4]i64 as _chqt with mut;      // quant table id
 let is [4]i64 as _chid with mut;      // component id
-let is [4]i64 as _chdc with mut;      // dc huff id (scan)
-let is [4]i64 as _chac with mut;      // ac huff id (scan)
+let is [4]i64 as _chdc with mut;      // dc huff id (current scan)
+let is [4]i64 as _chac with mut;      // ac huff id (current scan)
 let is [4]i64 as _chpred with mut;    // running DC predictor
-let is [4]i64 as _chplane with mut;   // plane base address
-let is [4]i64 as _chpw with mut;      // plane width
+let is [4]i64 as _chcoef with mut;    // coef plane base address (i64 per coef)
+let is [4]i64 as _chbw with mut;      // coef plane width in blocks (stride)
+let is [4]i64 as _chbh with mut;      // coef plane height in blocks
+let is [4]i64 as _chdw with mut;      // data blocks across (ceil(comp_w/8))
+let is [4]i64 as _chdh with mut;      // data blocks down
 
-let is *u8 as _bd with mut;           // bit reader: data
+let is *u8 as _bd with mut;           // bit reader over entropy data
 let is i64 as _blen with mut;
 let is i64 as _bpos with mut;
 let is i64 as _bbuf with mut;
 let is i64 as _bcnt with mut;
 let is i64 as _bmark with mut;
+let is i64 as _eobrun with mut;
 
 fn _be16(p as *u8, o as i64) as i64 { return (cast(i64, p[o]) << 8) | cast(i64, p[o + 1]); }
 
@@ -79,8 +85,8 @@ fn _bit() as i64 {
         if (b == 255) {
             let is i64 as nb with mut = 0;
             if (_bpos < _blen) { nb = cast(i64, _bd[_bpos]); }
-            if (nb == 0) { _bpos = _bpos + 1; }        // stuffed 0xFF00 -> 0xFF
-            else { _bpos = _bpos - 1; _bmark = nb; return 0; }   // marker; back up to the 0xFF
+            if (nb == 0) { _bpos = _bpos + 1; }
+            else { _bpos = _bpos - 1; _bmark = nb; return 0; }
         }
         _bbuf = b;
         _bcnt = 8;
@@ -118,56 +124,334 @@ fn _recv_huff(hidx as i64) as i64 {
     return 0 - 1;
 }
 
-// Decode one 8x8 block of component `c` into `coef` (natural order, dequantized).
-fn _decode_block(c as i64, coef as *i64) as i64 {
-    let is i64 as i with mut = 0;
-    while (i < 64) { coef[i] = 0; i = i + 1; }
-    let is [64]i64 as zz;
-    i = 0; while (i < 64) { zz[i] = 0; i = i + 1; }
+// Block (bx, by) of component c: address of its 64 i64 coefficients (zigzag order).
+fn _blk(c as i64, bx as i64, by as i64) as *i64 {
+    return cast(*i64, _chcoef[c] + ((by * _chbw[c] + bx) * 64) * 8);
+}
 
-    let is i64 as t = _recv_huff(_chdc[c]);            // DC table (class 0)
-    if (t < 0) { return 0 - 1; }
-    let is i64 as diff with mut = 0;
-    if (t > 0) { diff = _extend(_receive(t), t); }
-    _chpred[c] = _chpred[c] + diff;
-    zz[0] = _chpred[c];
-
-    let is i64 as acid = 4 + _chac[c];                 // AC table (class 1)
-    let is i64 as k with mut = 1;
+// Skip to the next restart marker and reset entropy + predictors.
+fn _resync(ncomp as i64) as void {
+    _bcnt = 0; _bmark = 0;
     let is i64 as go with mut = 1;
     while (go == 1) {
-        if (k >= 64) { go = 0; }
+        if (_bpos + 1 >= _blen) { go = 0; }
         else {
-            let is i64 as rs = _recv_huff(acid);
-            if (rs < 0) { go = 0; }
-            else {
-                let is i64 as r = rs >> 4;
-                let is i64 as sz = rs & 15;
-                if (sz == 0) {
-                    if (r == 15) { k = k + 16; }       // ZRL: 16 zeros
-                    else { go = 0; }                   // EOB
-                } else {
-                    k = k + r;
-                    if (k > 63) { go = 0; }
-                    else {
-                        zz[k] = _extend(_receive(sz), sz);
-                        k = k + 1;
-                    }
-                }
-            }
+            if (cast(i64, _bd[_bpos]) == 255) {
+                let is i64 as mm = cast(i64, _bd[_bpos + 1]);
+                if (mm >= 208) { if (mm <= 215) { _bpos = _bpos + 2; go = 0; } }
+                if (go == 1) { _bpos = _bpos + 1; }
+            } else { _bpos = _bpos + 1; }
         }
     }
-    // dequant (zigzag) + de-zigzag into natural order
-    let is i64 as qbase = _chqt[c] * 64;
-    i = 0;
-    while (i < 64) { coef[_zz[i]] = zz[i] * _qt[qbase + i]; i = i + 1; }
+    let is i64 as cc with mut = 0;
+    while (cc < ncomp) { _chpred[cc] = 0; cc = cc + 1; }
+    _eobrun = 0;
+}
+
+// ---- scan decoders (write quantized coefficients into the planes) ---------
+
+// Baseline (or progressive-DC-first when ss==0): full interleaved MCU scan.
+fn _scan_interleaved(scomp as *i64, ns as i64, mcus_x as i64, mcus_y as i64,
+                     progressive as i64, al as i64, restart as i64, ncomp as i64) as i64 {
+    let is i64 as rcount with mut = 0;
+    let is i64 as my with mut = 0;
+    while (my < mcus_y) {
+        let is i64 as mx with mut = 0;
+        while (mx < mcus_x) {
+            let is i64 as si with mut = 0;
+            while (si < ns) {
+                let is i64 as c = scomp[si];
+                let is i64 as by with mut = 0;
+                while (by < _chv[c]) {
+                    let is i64 as bx with mut = 0;
+                    while (bx < _chh[c]) {
+                        let is *i64 as blk = _blk(c, mx * _chh[c] + bx, my * _chv[c] + by);
+                        // DC
+                        let is i64 as t = _recv_huff(_chdc[c]);
+                        if (t < 0) { return errno.I_CORRUPT; }
+                        let is i64 as diff with mut = 0;
+                        if (t > 0) { diff = _extend(_receive(t), t); }
+                        _chpred[c] = _chpred[c] + diff;
+                        blk[0] = _chpred[c] << al;
+                        // AC (baseline only; progressive DC scans stop here)
+                        if (progressive == 0) {
+                            let is i64 as k with mut = 1;
+                            let is i64 as go with mut = 1;
+                            while (go == 1) {
+                                if (k >= 64) { go = 0; }
+                                else {
+                                    let is i64 as rs = _recv_huff(4 + _chac[c]);
+                                    if (rs < 0) { return errno.I_CORRUPT; }
+                                    let is i64 as r = rs >> 4;
+                                    let is i64 as sz = rs & 15;
+                                    if (sz == 0) {
+                                        if (r == 15) { k = k + 16; }
+                                        else { go = 0; }
+                                    } else {
+                                        k = k + r;
+                                        if (k > 63) { go = 0; }
+                                        else { blk[k] = _extend(_receive(sz), sz); k = k + 1; }
+                                    }
+                                }
+                            }
+                        }
+                        bx = bx + 1;
+                    }
+                    by = by + 1;
+                }
+                si = si + 1;
+            }
+            if (restart > 0) {
+                rcount = rcount + 1;
+                if (rcount == restart) {
+                    let is i64 as last with mut = 0;
+                    if (my == mcus_y - 1) { if (mx == mcus_x - 1) { last = 1; } }
+                    if (last == 0) { _resync(ncomp); }
+                    rcount = 0;
+                }
+            }
+            mx = mx + 1;
+        }
+        my = my + 1;
+    }
     return 0;
 }
 
+// Progressive DC refinement: one bit per block for every component in scan.
+fn _scan_dc_refine(scomp as *i64, ns as i64, mcus_x as i64, mcus_y as i64,
+                   al as i64, restart as i64, ncomp as i64) as i64 {
+    let is i64 as rcount with mut = 0;
+    let is i64 as my with mut = 0;
+    while (my < mcus_y) {
+        let is i64 as mx with mut = 0;
+        while (mx < mcus_x) {
+            let is i64 as si with mut = 0;
+            while (si < ns) {
+                let is i64 as c = scomp[si];
+                let is i64 as by with mut = 0;
+                while (by < _chv[c]) {
+                    let is i64 as bx with mut = 0;
+                    while (bx < _chh[c]) {
+                        let is *i64 as blk = _blk(c, mx * _chh[c] + bx, my * _chv[c] + by);
+                        if (_bit() == 1) { blk[0] = blk[0] | (1 << al); }
+                        bx = bx + 1;
+                    }
+                    by = by + 1;
+                }
+                si = si + 1;
+            }
+            if (restart > 0) {
+                rcount = rcount + 1;
+                if (rcount == restart) {
+                    let is i64 as last with mut = 0;
+                    if (my == mcus_y - 1) { if (mx == mcus_x - 1) { last = 1; } }
+                    if (last == 0) { _resync(ncomp); }
+                    rcount = 0;
+                }
+            }
+            mx = mx + 1;
+        }
+        my = my + 1;
+    }
+    return 0;
+}
+
+// Progressive AC first scan (Ah == 0): single component, band [ss..se] << al.
+fn _scan_ac_first(c as i64, ss as i64, se as i64, al as i64, restart as i64) as i64 {
+    let is i64 as rcount with mut = 0;
+    let is i64 as by with mut = 0;
+    while (by < _chdh[c]) {
+        let is i64 as bx with mut = 0;
+        while (bx < _chdw[c]) {
+            let is *i64 as blk = _blk(c, bx, by);
+            if (_eobrun > 0) { _eobrun = _eobrun - 1; }
+            else {
+                let is i64 as k with mut = ss;
+                let is i64 as go with mut = 1;
+                while (go == 1) {
+                    if (k > se) { go = 0; }
+                    else {
+                        let is i64 as rs = _recv_huff(4 + _chac[c]);
+                        if (rs < 0) { return errno.I_CORRUPT; }
+                        let is i64 as r = rs >> 4;
+                        let is i64 as sz = rs & 15;
+                        if (sz == 0) {
+                            if (r == 15) { k = k + 16; }
+                            else {
+                                _eobrun = (1 << r) - 1;
+                                if (r > 0) { _eobrun = _eobrun + _receive(r); }
+                                go = 0;
+                            }
+                        } else {
+                            k = k + r;
+                            if (k > se) { go = 0; }
+                            else {
+                                blk[k] = _extend(_receive(sz), sz) << al;
+                                k = k + 1;
+                            }
+                        }
+                    }
+                }
+            }
+            if (restart > 0) {
+                rcount = rcount + 1;
+                if (rcount == restart) {
+                    let is i64 as last with mut = 0;
+                    if (by == _chdh[c] - 1) { if (bx == _chdw[c] - 1) { last = 1; } }
+                    if (last == 0) { _resync(4); }
+                    rcount = 0;
+                }
+            }
+            bx = bx + 1;
+        }
+        by = by + 1;
+    }
+    return 0;
+}
+
+// Progressive AC refinement (Ah > 0): the correction-bit algorithm.
+fn _scan_ac_refine(c as i64, ss as i64, se as i64, al as i64, restart as i64) as i64 {
+    let is i64 as p1 = 1 << al;
+    let is i64 as rcount with mut = 0;
+    let is i64 as by with mut = 0;
+    while (by < _chdh[c]) {
+        let is i64 as bx with mut = 0;
+        while (bx < _chdw[c]) {
+            let is *i64 as blk = _blk(c, bx, by);
+            let is i64 as k with mut = ss;
+            if (_eobrun == 0) {
+                let is i64 as go with mut = 1;
+                while (go == 1) {
+                    if (k > se) { go = 0; }
+                    else {
+                        let is i64 as rs = _recv_huff(4 + _chac[c]);
+                        if (rs < 0) { return errno.I_CORRUPT; }
+                        let is i64 as r with mut = rs >> 4;
+                        let is i64 as sz = rs & 15;
+                        let is i64 as newval with mut = 0;
+                        if (sz == 0) {
+                            if (r < 15) {
+                                // INCLUSIVE of the current block: the tail below
+                                // refines this block's remaining coefs and decrements.
+                                _eobrun = 1 << r;
+                                if (r > 0) { _eobrun = _eobrun + _receive(r); }
+                                go = 0;
+                            }
+                            // r == 15: skip 16 zero-history coefficients below
+                        } else {
+                            if (_bit() == 1) { newval = p1; } else { newval = 0 - p1; }
+                        }
+                        if (go == 1) {
+                            // advance over r zero-history coefs, correcting nonzeros
+                            let is i64 as adv with mut = 1;
+                            while (adv == 1) {
+                                if (k > se) { adv = 0; }
+                                else {
+                                    let is i64 as v = blk[k];
+                                    if (v != 0) {
+                                        if (_bit() == 1) {
+                                            let is i64 as vm with mut = v; if (vm < 0) { vm = 0 - vm; }
+                                            if ((vm & p1) == 0) {
+                                                if (v >= 0) { blk[k] = v + p1; }
+                                                else { blk[k] = v - p1; }
+                                            }
+                                        }
+                                    } else {
+                                        if (r == 0) {
+                                            if (newval != 0) { blk[k] = newval; }
+                                            adv = 0;
+                                        }
+                                        r = r - 1;
+                                    }
+                                    k = k + 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if (_eobrun > 0) {
+                // refine every remaining nonzero coefficient in the band
+                while (k <= se) {
+                    let is i64 as v = blk[k];
+                    if (v != 0) {
+                        if (_bit() == 1) {
+                            let is i64 as vm with mut = v; if (vm < 0) { vm = 0 - vm; }
+                            if ((vm & p1) == 0) {
+                                if (v >= 0) { blk[k] = v + p1; }
+                                else { blk[k] = v - p1; }
+                            }
+                        }
+                    }
+                    k = k + 1;
+                }
+                _eobrun = _eobrun - 1;
+            }
+            if (restart > 0) {
+                rcount = rcount + 1;
+                if (rcount == restart) {
+                    let is i64 as last with mut = 0;
+                    if (by == _chdh[c] - 1) { if (bx == _chdw[c] - 1) { last = 1; } }
+                    if (last == 0) { _resync(4); }
+                    rcount = 0;
+                }
+            }
+            bx = bx + 1;
+        }
+        by = by + 1;
+    }
+    return 0;
+}
+
+// Fancy (triangle-filter) chroma upsampling for factor-2 axes — libjpeg's
+// h2v1/h2v2 weights and rounding; nearest for other factors. cw/chh are the
+// component's real sample dims; pw is the plane stride.
+fn _upsample(pl as *u8, pw as i64, cw as i64, chh as i64,
+             x as i64, y as i64, fx as i64, fy as i64) as i64 {
+    let is i64 as ix with mut = 0;
+    let is i64 as farx with mut = 0;
+    if (fx == 2) {
+        ix = x >> 1;
+        if ((x & 1) == 0) { farx = ix - 1; } else { farx = ix + 1; }
+        if (farx < 0) { farx = 0; }
+        if (farx >= cw) { farx = cw - 1; }
+        if (ix >= cw) { ix = cw - 1; }
+    } else { ix = x / fx; if (ix >= cw) { ix = cw - 1; } farx = ix; }
+    let is i64 as iy with mut = 0;
+    let is i64 as fary with mut = 0;
+    if (fy == 2) {
+        iy = y >> 1;
+        if ((y & 1) == 0) { fary = iy - 1; } else { fary = iy + 1; }
+        if (fary < 0) { fary = 0; }
+        if (fary >= chh) { fary = chh - 1; }
+        if (iy >= chh) { iy = chh - 1; }
+    } else { iy = y / fy; if (iy >= chh) { iy = chh - 1; } fary = iy; }
+
+    if (fx == 2) {
+        if (fy == 2) {
+            let is i64 as t0 = 3 * cast(i64, pl[iy * pw + ix]) + cast(i64, pl[fary * pw + ix]);
+            let is i64 as t1 = 3 * cast(i64, pl[iy * pw + farx]) + cast(i64, pl[fary * pw + farx]);
+            let is i64 as rnd with mut = 7;
+            if ((x & 1) == 0) { rnd = 8; }
+            return (3 * t0 + t1 + rnd) >> 4;
+        }
+        let is i64 as rnd with mut = 1;
+        if ((x & 1) == 0) { rnd = 2; }
+        return (3 * cast(i64, pl[iy * pw + ix]) + cast(i64, pl[iy * pw + farx]) + rnd) >> 2;
+    }
+    if (fy == 2) {
+        let is i64 as rnd with mut = 1;
+        if ((y & 1) == 0) { rnd = 2; }
+        return (3 * cast(i64, pl[iy * pw + ix]) + cast(i64, pl[fary * pw + ix]) + rnd) >> 2;
+    }
+    return cast(i64, pl[iy * pw + ix]);
+}
+
+// ---- top level -------------------------------------------------------------
 fn jpeg_decode(src as *u8, src_len as i64, out as *image.Image) as i64 {
     if (src_len < 4) { return errno.I_BADMAGIC; }
     if (cast(i64, src[0]) != 255) { return errno.I_BADMAGIC; }
-    if (cast(i64, src[1]) != 216) { return errno.I_BADMAGIC; }   // SOI
+    if (cast(i64, src[1]) != 216) { return errno.I_BADMAGIC; }
 
     _build_zz();
     dct.dct_build_cx(cast(*i64, &_cx));
@@ -176,191 +460,235 @@ fn jpeg_decode(src as *u8, src_len as i64, out as *image.Image) as i64 {
     let is i64 as height with mut = 0;
     let is i64 as ncomp with mut = 0;
     let is i64 as restart with mut = 0;
+    let is i64 as progressive with mut = 0;
+    let is i64 as have_sof with mut = 0;
+    let is i64 as mcus_x with mut = 0;
+    let is i64 as mcus_y with mut = 0;
+    let is i64 as maxh with mut = 1;
+    let is i64 as maxv with mut = 1;
 
     let is i64 as mp with mut = 2;
-    let is i64 as in_scan with mut = 0;
-    while (in_scan == 0) {
+    let is i64 as done with mut = 0;
+    while (done == 0) {
         if (mp + 2 > src_len) { return errno.I_CORRUPT; }
         if (cast(i64, src[mp]) != 255) { return errno.I_CORRUPT; }
         let is i64 as m = cast(i64, src[mp + 1]);
         mp = mp + 2;
-        if (m == 217) { return errno.I_CORRUPT; }           // EOI before scan
-        if (m == 194) { return errno.I_UNSUPPORTED; }       // SOF2 progressive
-        if (m == 192) {                                     // SOF0 baseline
-            let is i64 as seg = mp + 2;
-            height = _be16(src, seg + 1);
-            width = _be16(src, seg + 3);
-            ncomp = cast(i64, src[seg + 5]);
-            if (ncomp > 4) { return errno.I_UNSUPPORTED; }
-            let is i64 as cp with mut = seg + 6;
-            let is i64 as c with mut = 0;
-            while (c < ncomp) {
-                _chid[c] = cast(i64, src[cp]);
-                let is i64 as hv = cast(i64, src[cp + 1]);
-                _chh[c] = hv >> 4; _chv[c] = hv & 15;
-                _chqt[c] = cast(i64, src[cp + 2]);
-                _chpred[c] = 0;
-                cp = cp + 3;
-                c = c + 1;
-            }
-            mp = mp + _be16(src, mp);
-        } else {
-        if (m == 219) {                                     // DQT
-            let is i64 as end = mp + _be16(src, mp);
-            let is i64 as q with mut = mp + 2;
-            while (q < end) {
-                let is i64 as pqtq = cast(i64, src[q]); q = q + 1;
-                let is i64 as pq = pqtq >> 4;
-                let is i64 as tq = pqtq & 15;
-                let is i64 as k with mut = 0;
-                while (k < 64) {
-                    if (pq == 0) { _qt[tq * 64 + k] = cast(i64, src[q]); q = q + 1; }
-                    else { _qt[tq * 64 + k] = _be16(src, q); q = q + 2; }
-                    k = k + 1;
-                }
-            }
-            mp = end;
-        } else {
-        if (m == 196) {                                     // DHT
-            let is i64 as end = mp + _be16(src, mp);
-            let is i64 as q with mut = mp + 2;
-            while (q < end) {
-                let is i64 as tcth = cast(i64, src[q]); q = q + 1;
-                let is i64 as hidx = (tcth >> 4) * 4 + (tcth & 15);
-                let is [16]i64 as counts;
-                let is i64 as total with mut = 0;
-                let is i64 as i with mut = 0;
-                while (i < 16) { counts[i] = cast(i64, src[q]); total = total + counts[i]; q = q + 1; i = i + 1; }
-                _build_huff(hidx, cast(*i64, &counts), cast(*u8, cast(i64, src) + q), total);
-                q = q + total;
-            }
-            mp = end;
-        } else {
-        if (m == 221) {                                     // DRI
-            restart = _be16(src, mp + 2);
-            mp = mp + _be16(src, mp);
-        } else {
-        if (m == 218) {                                     // SOS
-            let is i64 as ns = cast(i64, src[mp + 2]);
-            let is i64 as sp with mut = mp + 3;
-            let is i64 as j with mut = 0;
-            while (j < ns) {
-                let is i64 as cs = cast(i64, src[sp]);
-                let is i64 as td = cast(i64, src[sp + 1]);
+        if (m == 217) { done = 1; }                          // EOI
+        else { if (m == 216) { }                             // stray SOI
+        else { if (m >= 208) { if (m <= 215) { } else { done = 2; } }   // RSTn alone: skip
+        else { done = 2; } } }
+        if (done == 2) {
+            done = 0;
+            if (m == 192) { progressive = 0; }               // SOF0
+            else { if (m == 194) { progressive = 1; }        // SOF2
+            else { if (m == 193) { progressive = 0; }        // SOF1 ext sequential
+            else { if (m >= 195) { if (m <= 207) { if (m != 196) { if (m != 200) { if (m != 204) {
+                return errno.I_UNSUPPORTED;                  // other SOFs
+            } } } } } } } }
+            if (m == 192) { done = 3; }
+            if (m == 193) { done = 3; }
+            if (m == 194) { done = 3; }
+            if (done == 3) {                                 // parse SOF
+                done = 0;
+                let is i64 as seg = mp + 2;
+                if (cast(i64, src[seg]) != 8) { return errno.I_UNSUPPORTED; }   // 12-bit
+                height = _be16(src, seg + 1);
+                width = _be16(src, seg + 3);
+                ncomp = cast(i64, src[seg + 5]);
+                if (ncomp > 4) { return errno.I_UNSUPPORTED; }
+                let is i64 as cp with mut = seg + 6;
                 let is i64 as c with mut = 0;
                 while (c < ncomp) {
-                    if (_chid[c] == cs) { _chdc[c] = td >> 4; _chac[c] = td & 15; }
+                    _chid[c] = cast(i64, src[cp]);
+                    let is i64 as hv = cast(i64, src[cp + 1]);
+                    _chh[c] = hv >> 4; _chv[c] = hv & 15;
+                    _chqt[c] = cast(i64, src[cp + 2]);
+                    _chpred[c] = 0;
+                    cp = cp + 3;
                     c = c + 1;
                 }
-                sp = sp + 2;
-                j = j + 1;
-            }
-            mp = sp + 3;                                    // skip Ss, Se, Ah/Al
-            in_scan = 1;
-        } else {
-            // APPn / COM / other: skip length-prefixed segment.
-            mp = mp + _be16(src, mp);
-        } } } } }
+                // geometry + coefficient planes
+                c = 0;
+                while (c < ncomp) {
+                    if (_chh[c] > maxh) { maxh = _chh[c]; }
+                    if (_chv[c] > maxv) { maxv = _chv[c]; }
+                    c = c + 1;
+                }
+                mcus_x = (width + maxh * 8 - 1) / (maxh * 8);
+                mcus_y = (height + maxv * 8 - 1) / (maxv * 8);
+                c = 0;
+                while (c < ncomp) {
+                    _chbw[c] = mcus_x * _chh[c];
+                    _chbh[c] = mcus_y * _chv[c];
+                    let is i64 as cw = (width * _chh[c] + maxh - 1) / maxh;
+                    let is i64 as chh2 = (height * _chv[c] + maxv - 1) / maxv;
+                    _chdw[c] = (cw + 7) / 8;
+                    _chdh[c] = (chh2 + 7) / 8;
+                    let is i64 as nco = _chbw[c] * _chbh[c] * 64;
+                    let is *u8 as pl = mem.core.mmap_anon(nco * 8);
+                    if (cast(i64, pl) <= 0) { return errno.I_OOM; }
+                    _chcoef[c] = cast(i64, pl);
+                    c = c + 1;
+                }
+                have_sof = 1;
+                mp = mp + _be16(src, mp);
+            } else {
+            if (m == 219) {                                  // DQT
+                let is i64 as end = mp + _be16(src, mp);
+                let is i64 as q with mut = mp + 2;
+                while (q < end) {
+                    let is i64 as pqtq = cast(i64, src[q]); q = q + 1;
+                    let is i64 as pq = pqtq >> 4;
+                    let is i64 as tq = pqtq & 15;
+                    let is i64 as k with mut = 0;
+                    while (k < 64) {
+                        if (pq == 0) { _qt[tq * 64 + k] = cast(i64, src[q]); q = q + 1; }
+                        else { _qt[tq * 64 + k] = _be16(src, q); q = q + 2; }
+                        k = k + 1;
+                    }
+                }
+                mp = end;
+            } else {
+            if (m == 196) {                                  // DHT
+                let is i64 as end = mp + _be16(src, mp);
+                let is i64 as q with mut = mp + 2;
+                while (q < end) {
+                    let is i64 as tcth = cast(i64, src[q]); q = q + 1;
+                    let is i64 as hidx = (tcth >> 4) * 4 + (tcth & 15);
+                    let is [16]i64 as counts;
+                    let is i64 as total with mut = 0;
+                    let is i64 as i with mut = 0;
+                    while (i < 16) { counts[i] = cast(i64, src[q]); total = total + counts[i]; q = q + 1; i = i + 1; }
+                    _build_huff(hidx, cast(*i64, &counts), cast(*u8, cast(i64, src) + q), total);
+                    q = q + total;
+                }
+                mp = end;
+            } else {
+            if (m == 221) {                                  // DRI
+                restart = _be16(src, mp + 2);
+                mp = mp + _be16(src, mp);
+            } else {
+            if (m == 218) {                                  // SOS
+                if (have_sof == 0) { return errno.I_CORRUPT; }
+                let is i64 as ns = cast(i64, src[mp + 2]);
+                let is [4]i64 as scomp;
+                let is i64 as sp with mut = mp + 3;
+                let is i64 as j with mut = 0;
+                while (j < ns) {
+                    let is i64 as cs = cast(i64, src[sp]);
+                    let is i64 as td = cast(i64, src[sp + 1]);
+                    let is i64 as c with mut = 0;
+                    while (c < ncomp) {
+                        if (_chid[c] == cs) {
+                            scomp[j] = c;
+                            _chdc[c] = td >> 4;
+                            _chac[c] = td & 15;
+                        }
+                        c = c + 1;
+                    }
+                    sp = sp + 2;
+                    j = j + 1;
+                }
+                let is i64 as ss = cast(i64, src[sp]);
+                let is i64 as se = cast(i64, src[sp + 1]);
+                let is i64 as ahal = cast(i64, src[sp + 2]);
+                let is i64 as ah = ahal >> 4;
+                let is i64 as al = ahal & 15;
+
+                // entropy-coded data starts here
+                _bd = src; _blen = src_len; _bpos = sp + 3; _bbuf = 0; _bcnt = 0; _bmark = 0;
+                _eobrun = 0;
+                let is i64 as cc with mut = 0;
+                while (cc < ncomp) { _chpred[cc] = 0; cc = cc + 1; }
+
+                let is i64 as rc with mut = 0;
+                if (progressive == 0) {
+                    rc = _scan_interleaved(cast(*i64, &scomp), ns, mcus_x, mcus_y, 0, 0, restart, ncomp);
+                } else {
+                    if (ss == 0) {
+                        if (ah == 0) {
+                            // DC first: interleaved over the scan's components
+                            rc = _scan_interleaved(cast(*i64, &scomp), ns, mcus_x, mcus_y, 1, al, restart, ncomp);
+                        } else {
+                            rc = _scan_dc_refine(cast(*i64, &scomp), ns, mcus_x, mcus_y, al, restart, ncomp);
+                        }
+                    } else {
+                        if (ns != 1) { return errno.I_CORRUPT; }   // AC scans are single-component
+                        if (ah == 0) { rc = _scan_ac_first(scomp[0], ss, se, al, restart); }
+                        else { rc = _scan_ac_refine(scomp[0], ss, se, al, restart); }
+                    }
+                }
+                if (rc < 0) { return rc; }
+                // resume marker parsing after the entropy data
+                mp = _bpos;
+                let is i64 as hunt with mut = 1;
+                while (hunt == 1) {
+                    if (mp + 2 > src_len) { return errno.I_CORRUPT; }
+                    if (cast(i64, src[mp]) == 255) {
+                        let is i64 as nx = cast(i64, src[mp + 1]);
+                        if (nx != 0) {
+                            // skip standalone RSTn between scans
+                            if (nx >= 208) { if (nx <= 215) { mp = mp + 2; } else { hunt = 0; } }
+                            else { hunt = 0; }
+                        } else { mp = mp + 2; }
+                    } else { mp = mp + 1; }
+                }
+            } else {
+                // APPn / COM / other: skip length-prefixed segment.
+                mp = mp + _be16(src, mp);
+            } } } } }
+        }
     }
 
+    if (have_sof == 0) { return errno.I_CORRUPT; }
     if (width < 1) { return errno.I_CORRUPT; }
-    if (height < 1) { return errno.I_CORRUPT; }
     if (ncomp != 1) { if (ncomp != 3) { return errno.I_UNSUPPORTED; } }
 
-    // MCU geometry.
-    let is i64 as maxh with mut = 1;
-    let is i64 as maxv with mut = 1;
+    // ---- finish: dequant + IDCT into sample planes ----
+    let is [4]i64 as plane;
+    let is [4]i64 as pw;
+    let is [64]i64 as f;
+    let is [64]u8 as blk8;
     let is i64 as c with mut = 0;
     while (c < ncomp) {
-        if (_chh[c] > maxh) { maxh = _chh[c]; }
-        if (_chv[c] > maxv) { maxv = _chv[c]; }
-        c = c + 1;
-    }
-    let is i64 as mcus_x = (width + maxh * 8 - 1) / (maxh * 8);
-    let is i64 as mcus_y = (height + maxv * 8 - 1) / (maxv * 8);
-
-    // Allocate component planes.
-    c = 0;
-    while (c < ncomp) {
-        let is i64 as pw = mcus_x * _chh[c] * 8;
-        let is i64 as ph = mcus_y * _chv[c] * 8;
-        _chpw[c] = pw;
-        let is *u8 as pl = mem.core.mmap_anon(pw * ph);
+        pw[c] = _chbw[c] * 8;
+        let is i64 as ph = _chbh[c] * 8;
+        let is *u8 as pl = mem.core.mmap_anon(pw[c] * ph);
         if (cast(i64, pl) <= 0) { return errno.I_OOM; }
-        _chplane[c] = cast(i64, pl);
-        _chpred[c] = 0;
+        plane[c] = cast(i64, pl);
+        let is i64 as qbase = _chqt[c] * 64;
+        let is i64 as by with mut = 0;
+        while (by < _chbh[c]) {
+            let is i64 as bx with mut = 0;
+            while (bx < _chbw[c]) {
+                let is *i64 as bq = _blk(c, bx, by);
+                let is i64 as i with mut = 0;
+                while (i < 64) { f[i] = 0; i = i + 1; }
+                i = 0;
+                while (i < 64) {
+                    f[_zz[i]] = bq[i] * _qt[qbase + i];   // zigzag -> natural + dequant
+                    i = i + 1;
+                }
+                dct.idct8x8(cast(*i64, &f), cast(*i64, &_cx), cast(*u8, &blk8));
+                let is i64 as yy with mut = 0;
+                while (yy < 8) {
+                    let is i64 as xx with mut = 0;
+                    while (xx < 8) {
+                        pl[(by * 8 + yy) * pw[c] + bx * 8 + xx] = blk8[yy * 8 + xx];
+                        xx = xx + 1;
+                    }
+                    yy = yy + 1;
+                }
+                bx = bx + 1;
+            }
+            by = by + 1;
+        }
+        mem.core.munmap(cast(*u8, _chcoef[c]), _chbw[c] * _chbh[c] * 64 * 8);
         c = c + 1;
     }
 
-    _bd = src; _blen = src_len; _bpos = mp; _bbuf = 0; _bcnt = 0; _bmark = 0;
-
-    // Decode MCUs.
-    let is [64]i64 as coef;
-    let is [64]u8 as blk;
-    let is i64 as rcount with mut = 0;
-    let is i64 as my with mut = 0;
-    while (my < mcus_y) {
-        let is i64 as mx with mut = 0;
-        while (mx < mcus_x) {
-            c = 0;
-            while (c < ncomp) {
-                let is i64 as pw = _chpw[c];
-                let is *u8 as pl = cast(*u8, _chplane[c]);
-                let is i64 as by with mut = 0;
-                while (by < _chv[c]) {
-                    let is i64 as bx with mut = 0;
-                    while (bx < _chh[c]) {
-                        if (_decode_block(c, cast(*i64, &coef)) < 0) { return errno.I_CORRUPT; }
-                        dct.idct8x8(cast(*i64, &coef), cast(*i64, &_cx), cast(*u8, &blk));
-                        let is i64 as px0 = (mx * _chh[c] + bx) * 8;
-                        let is i64 as py0 = (my * _chv[c] + by) * 8;
-                        let is i64 as yy with mut = 0;
-                        while (yy < 8) {
-                            let is i64 as xx with mut = 0;
-                            while (xx < 8) {
-                                pl[(py0 + yy) * pw + px0 + xx] = blk[yy * 8 + xx];
-                                xx = xx + 1;
-                            }
-                            yy = yy + 1;
-                        }
-                        bx = bx + 1;
-                    }
-                    by = by + 1;
-                }
-                c = c + 1;
-            }
-            // Restart interval handling.
-            if (restart > 0) {
-                rcount = rcount + 1;
-                let is i64 as last with mut = 0;
-                if (my == mcus_y - 1) { if (mx == mcus_x - 1) { last = 1; } }
-                if (rcount == restart) {
-                    if (last == 0) {
-                        // realign, skip to FF Dn, reset predictors
-                        _bcnt = 0; _bmark = 0;
-                        let is i64 as go with mut = 1;
-                        while (go == 1) {
-                            if (_bpos + 1 >= _blen) { go = 0; }
-                            else {
-                                if (cast(i64, _bd[_bpos]) == 255) {
-                                    let is i64 as mm = cast(i64, _bd[_bpos + 1]);
-                                    if (mm >= 208) { if (mm <= 215) { _bpos = _bpos + 2; go = 0; } }
-                                    if (go == 1) { _bpos = _bpos + 1; }
-                                } else { _bpos = _bpos + 1; }
-                            }
-                        }
-                        let is i64 as cc with mut = 0;
-                        while (cc < ncomp) { _chpred[cc] = 0; cc = cc + 1; }
-                        rcount = 0;
-                    }
-                }
-            }
-            mx = mx + 1;
-        }
-        my = my + 1;
-    }
-
-    // Materialise the Image: upsample + colour convert.
+    // ---- upsample + colour convert ----
     let is i64 as fmt with mut = pixfmt.FMT_RGB8;
     if (ncomp == 1) { fmt = pixfmt.FMT_GRAY8; }
     let is i64 as ir = image.image_init(out, width, height, fmt);
@@ -374,15 +702,17 @@ fn jpeg_decode(src as *u8, src_len as i64, out as *image.Image) as i64 {
         while (x < width) {
             let is i64 as di = (y * width + x) * obpp;
             if (ncomp == 1) {
-                let is *u8 as pl = cast(*u8, _chplane[0]);
-                dst[di] = pl[y * _chpw[0] + x];
+                let is *u8 as pl = cast(*u8, plane[0]);
+                dst[di] = pl[y * pw[0] + x];
             } else {
-                let is *u8 as pY = cast(*u8, _chplane[0]);
-                let is *u8 as pCb = cast(*u8, _chplane[1]);
-                let is *u8 as pCr = cast(*u8, _chplane[2]);
-                let is i64 as yy = cast(i64, pY[(y * _chv[0] / maxv) * _chpw[0] + (x * _chh[0] / maxh)]);
-                let is i64 as cb = cast(i64, pCb[(y * _chv[1] / maxv) * _chpw[1] + (x * _chh[1] / maxh)]) - 128;
-                let is i64 as cr = cast(i64, pCr[(y * _chv[2] / maxv) * _chpw[2] + (x * _chh[2] / maxh)]) - 128;
+                let is *u8 as pY = cast(*u8, plane[0]);
+                let is *u8 as pCb = cast(*u8, plane[1]);
+                let is *u8 as pCr = cast(*u8, plane[2]);
+                let is i64 as yy = cast(i64, pY[(y * _chv[0] / maxv) * pw[0] + (x * _chh[0] / maxh)]);
+                let is i64 as cw1 = (width * _chh[1] + maxh - 1) / maxh;
+                let is i64 as ch1 = (height * _chv[1] + maxv - 1) / maxv;
+                let is i64 as cb = _upsample(pCb, pw[1], cw1, ch1, x, y, maxh / _chh[1], maxv / _chv[1]) - 128;
+                let is i64 as cr = _upsample(pCr, pw[2], cw1, ch1, x, y, maxh / _chh[2], maxv / _chv[2]) - 128;
                 let is i64 as r with mut = yy + ((91881 * cr) >> 16);
                 let is i64 as g with mut = yy - ((22554 * cb + 46802 * cr) >> 16);
                 let is i64 as b with mut = yy + ((116130 * cb) >> 16);
@@ -395,11 +725,9 @@ fn jpeg_decode(src as *u8, src_len as i64, out as *image.Image) as i64 {
         }
         y = y + 1;
     }
-
-    // Free planes.
     c = 0;
     while (c < ncomp) {
-        mem.core.munmap(cast(*u8, _chplane[c]), _chpw[c] * (mcus_y * _chv[c] * 8));
+        mem.core.munmap(cast(*u8, plane[c]), pw[c] * _chbh[c] * 8);
         c = c + 1;
     }
     return 0;
