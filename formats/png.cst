@@ -426,3 +426,267 @@ fn png_encode(img as *image.Image, out as *cb.Bytes) as i64 {
     _png_chunk(out, "IEND", cast(*u8, 0), 0);
     return out.len;
 }
+
+// ============================ APNG =========================================
+// Animated PNG decode. Each frame's data chunks (IDAT for a leading frame 0,
+// fdAT minus its 4-byte sequence number otherwise) form a complete zlib stream
+// of that frame's filtered scanlines, so each frame is decoded by synthesizing
+// an in-memory single-frame PNG (same IHDR params, frame geometry) and running
+// the normal decoder; frames are composited onto an RGBA8 canvas per fcTL's
+// blend_op (SOURCE/OVER) and dispose_op (NONE/BACKGROUND/PREVIOUS).
+
+struct PngAnim {
+    width as i64;
+    height as i64;
+    count as i64;      // frames actually decoded
+    frames as i64;     // address of count * (width*height*4) RGBA8 bytes
+    delays as i64;     // address of count i64 delays in milliseconds
+}
+
+fn png_anim_frame(a as *PngAnim, i as i64) as *u8 {
+    return cast(*u8, a.frames + i * a.width * a.height * 4);
+}
+fn png_anim_free(a as *PngAnim) as void {
+    let is i64 as fsize = a.width * a.height * 4;
+    if (a.frames > 0) { mem.core.munmap(cast(*u8, a.frames), a.count * fsize); }
+    if (a.delays > 0) { mem.core.munmap(cast(*u8, a.delays), a.count * 8); }
+    a.frames = 0; a.delays = 0; a.count = 0;
+}
+
+fn _rd32be(p as *u8, o as i64) as i64 {
+    return (cast(i64, p[o]) << 24) | (cast(i64, p[o + 1]) << 16)
+         | (cast(i64, p[o + 2]) << 8) | cast(i64, p[o + 3]);
+}
+
+fn png_decode_anim(src as *u8, src_len as i64, out as *PngAnim) as i64 {
+    let is buf.Buf as bf;
+    buf.buf_init(&bf, src, src_len);
+    let is *u8 as sig with imut = "\x89\x50\x4e\x47\x0d\x0a\x1a\x0a";
+    let is i64 as si with mut = 0;
+    while (si < 8) {
+        if (buf.buf_u8(&bf) != cast(i64, sig[si])) { return errno.I_BADMAGIC; }
+        si = si + 1;
+    }
+
+    // ---- pass 1: gather IHDR bytes / PLTE / tRNS / acTL / frame layout ----
+    let is *u8 as ihdr_ptr with mut = cast(*u8, 0);
+    let is *u8 as plte_ptr with mut = cast(*u8, 0);
+    let is i64 as plte_len with mut = 0;
+    let is *u8 as trns_ptr with mut = cast(*u8, 0);
+    let is i64 as trns_len with mut = 0;
+    let is i64 as nframes with mut = 0;
+
+    let is i64 as done with mut = 0;
+    while (done == 0) {
+        let is i64 as clen = buf.buf_u32be(&bf);
+        if (clen < 0) { return errno.I_CORRUPT; }
+        let is i64 as t0 = buf.buf_u8(&bf);
+        let is i64 as t1 = buf.buf_u8(&bf);
+        let is i64 as t2 = buf.buf_u8(&bf);
+        let is i64 as t3 = buf.buf_u8(&bf);
+        if (t3 < 0) { return errno.I_CORRUPT; }
+        let is i64 as data_off = bf.pos;
+        if (buf.buf_remaining(&bf) < clen + 4) { return errno.I_CORRUPT; }
+        let is *u8 as data = cast(*u8, cast(i64, src) + data_off);
+        if (_type_is(t0,t1,t2,t3, 73,72,68,82) == 1) { ihdr_ptr = data; }         // IHDR
+        if (_type_is(t0,t1,t2,t3, 80,76,84,69) == 1) { plte_ptr = data; plte_len = clen; }
+        if (_type_is(t0,t1,t2,t3, 116,82,78,83) == 1) { trns_ptr = data; trns_len = clen; }
+        if (_type_is(t0,t1,t2,t3, 97,99,84,76) == 1) { nframes = _rd32be(data, 0); }  // acTL
+        if (_type_is(t0,t1,t2,t3, 73,69,78,68) == 1) { done = 1; }                // IEND
+        buf.buf_skip(&bf, clen + 4);
+    }
+    if (cast(i64, ihdr_ptr) == 0) { return errno.I_CORRUPT; }
+    if (nframes < 1) { return errno.I_UNSUPPORTED; }                              // not animated
+    if (nframes > 4096) { return errno.I_UNSUPPORTED; }
+    let is i64 as w = _rd32be(ihdr_ptr, 0);
+    let is i64 as h = _rd32be(ihdr_ptr, 4);
+    if (image.image_check_dims(w, h, pixfmt.FMT_RGBA8) < 0) { return errno.I_DIMS; }
+
+    let is i64 as fsize = w * h * 4;
+    let is *u8 as frames = mem.core.mmap_anon(nframes * fsize);
+    let is *i64 as delays = cast(*i64, mem.core.mmap_anon(nframes * 8));
+    let is *u8 as canvas = mem.core.mmap_anon(fsize);
+    let is *u8 as saved = mem.core.mmap_anon(fsize);
+    if (cast(i64, saved) <= 0) { return errno.I_OOM; }
+    mem.core.memset(canvas, cast(i32, 0), fsize);
+
+    // ---- pass 2: walk fcTL / IDAT / fdAT, decoding each finished frame ----
+    buf.buf_init(&bf, src, src_len);
+    buf.buf_skip(&bf, 8);
+    let is cb.Bytes as fdata = cb.bytes_new(4096);
+    let is i64 as have_fctl with mut = 0;
+    let is i64 as fx with mut = 0;
+    let is i64 as fy with mut = 0;
+    let is i64 as fw with mut = 0;
+    let is i64 as fh with mut = 0;
+    let is i64 as fdelay with mut = 0;
+    let is i64 as fdispose with mut = 0;
+    let is i64 as fblend with mut = 0;
+    let is i64 as fi with mut = 0;
+
+    done = 0;
+    while (done == 0) {
+        let is i64 as clen = buf.buf_u32be(&bf);
+        if (clen < 0) { done = 1; }
+        else {
+            let is i64 as t0 = buf.buf_u8(&bf);
+            let is i64 as t1 = buf.buf_u8(&bf);
+            let is i64 as t2 = buf.buf_u8(&bf);
+            let is i64 as t3 = buf.buf_u8(&bf);
+            let is i64 as data_off = bf.pos;
+            let is *u8 as data = cast(*u8, cast(i64, src) + data_off);
+            let is i64 as flush with mut = 0;
+
+            if (_type_is(t0,t1,t2,t3, 102,99,84,76) == 1) {          // fcTL
+                if (have_fctl == 1) { if (fdata.len > 0) { flush = 1; } }
+                if (flush == 0) {
+                    // start a new frame directly
+                    fw = _rd32be(data, 4); fh = _rd32be(data, 8);
+                    fx = _rd32be(data, 12); fy = _rd32be(data, 16);
+                    let is i64 as dnum = (cast(i64, data[20]) << 8) | cast(i64, data[21]);
+                    let is i64 as dden with mut = (cast(i64, data[22]) << 8) | cast(i64, data[23]);
+                    if (dden == 0) { dden = 100; }
+                    fdelay = dnum * 1000 / dden;
+                    fdispose = cast(i64, data[24]);
+                    fblend = cast(i64, data[25]);
+                    have_fctl = 1;
+                }
+            } else {
+            if (_type_is(t0,t1,t2,t3, 73,68,65,84) == 1) {           // IDAT
+                if (have_fctl == 1) { cb.bytes_append(&fdata, data, clen); }
+                // (IDAT before any fcTL = static image, not an animation frame)
+            } else {
+            if (_type_is(t0,t1,t2,t3, 102,100,65,84) == 1) {         // fdAT
+                if (have_fctl == 1) {
+                    cb.bytes_append(&fdata, cast(*u8, cast(i64, data) + 4), clen - 4);
+                }
+            } else {
+            if (_type_is(t0,t1,t2,t3, 73,69,78,68) == 1) {           // IEND
+                if (have_fctl == 1) { if (fdata.len > 0) { flush = 2; } }
+                done = 1;
+            } } } }
+
+            if (flush > 0) {
+                // decode the finished frame via a synthesized single-frame PNG
+                let is cb.Bytes as mini = cb.bytes_new(fdata.len + 256);
+                cb.bytes_append(&mini, sig, 8);
+                let is [13]u8 as ih;
+                let is i64 as k with mut = 0;
+                while (k < 13) { ih[k] = ihdr_ptr[k]; k = k + 1; }
+                ih[0] = cast(u8, (fw >> 24) & 255); ih[1] = cast(u8, (fw >> 16) & 255);
+                ih[2] = cast(u8, (fw >> 8) & 255);  ih[3] = cast(u8, fw & 255);
+                ih[4] = cast(u8, (fh >> 24) & 255); ih[5] = cast(u8, (fh >> 16) & 255);
+                ih[6] = cast(u8, (fh >> 8) & 255);  ih[7] = cast(u8, fh & 255);
+                _png_chunk(&mini, "IHDR", cast(*u8, &ih), 13);
+                if (plte_len > 0) { _png_chunk(&mini, "PLTE", plte_ptr, plte_len); }
+                if (trns_len > 0) { _png_chunk(&mini, "tRNS", trns_ptr, trns_len); }
+                _png_chunk(&mini, "IDAT", fdata.ptr, fdata.len);
+                _png_chunk(&mini, "IEND", cast(*u8, 0), 0);
+                let is image.Image as fr;
+                let is i64 as drc = png_decode(mini.ptr, mini.len, &fr);
+                cb.bytes_free(&mini);
+                if (drc < 0) { return errno.I_CORRUPT; }
+                if (fr.width != fw) { return errno.I_CORRUPT; }
+
+                if (fdispose == 2) { mem.core.memcpy(saved, canvas, fsize); }
+                // composite region (fx,fy,fw,fh)
+                let is i64 as fch = pixfmt.fmt_channels(fr.fmt);
+                let is i64 as ry with mut = 0;
+                while (ry < fh) {
+                    let is i64 as cy = fy + ry;
+                    if (cy >= 0) { if (cy < h) {
+                        let is i64 as rx with mut = 0;
+                        while (rx < fw) {
+                            let is i64 as cx = fx + rx;
+                            if (cx >= 0) { if (cx < w) {
+                                // source pixel as RGBA
+                                let is i64 as so = ry * fr.stride + rx * pixfmt.fmt_bpp(fr.fmt);
+                                let is i64 as sr with mut = cast(i64, fr.pixels[so]);
+                                let is i64 as sg with mut = sr;
+                                let is i64 as sb with mut = sr;
+                                let is i64 as sa with mut = 255;
+                                if (fch >= 3) { sg = cast(i64, fr.pixels[so + 1]); sb = cast(i64, fr.pixels[so + 2]); }
+                                if (fch == 2) { sa = cast(i64, fr.pixels[so + 1]); }
+                                if (fch == 4) { sa = cast(i64, fr.pixels[so + 3]); }
+                                let is i64 as co = (cy * w + cx) * 4;
+                                if (fblend == 0) {
+                                    canvas[co] = cast(u8, sr); canvas[co+1] = cast(u8, sg);
+                                    canvas[co+2] = cast(u8, sb); canvas[co+3] = cast(u8, sa);
+                                } else {
+                                    // OVER (Porter-Duff, integer)
+                                    let is i64 as da = cast(i64, canvas[co+3]);
+                                    let is i64 as oa = sa + da * (255 - sa) / 255;
+                                    if (oa == 0) {
+                                        canvas[co]=cast(u8,0); canvas[co+1]=cast(u8,0);
+                                        canvas[co+2]=cast(u8,0); canvas[co+3]=cast(u8,0);
+                                    } else {
+                                        let is i64 as c2 with mut = 0;
+                                        while (c2 < 3) {
+                                            let is i64 as sc with mut = cast(i64, fr.pixels[so + c2]);
+                                            if (fch <= 2) { sc = sr; }
+                                            let is i64 as dc = cast(i64, canvas[co + c2]);
+                                            canvas[co + c2] = cast(u8,
+                                                (sc * sa + dc * da * (255 - sa) / 255) / oa);
+                                            c2 = c2 + 1;
+                                        }
+                                        canvas[co+3] = cast(u8, oa);
+                                    }
+                                }
+                            } }
+                            rx = rx + 1;
+                        }
+                    } }
+                    ry = ry + 1;
+                }
+                image.image_free(&fr);
+                // snapshot
+                if (fi < nframes) {
+                    mem.core.memcpy(cast(*u8, cast(i64, frames) + fi * fsize), canvas, fsize);
+                    delays[fi] = fdelay;
+                    fi = fi + 1;
+                }
+                // dispose for next frame
+                if (fdispose == 1) {
+                    let is i64 as ry2 with mut = 0;
+                    while (ry2 < fh) {
+                        let is i64 as cy = fy + ry2;
+                        if (cy >= 0) { if (cy < h) {
+                            let is i64 as rx2 with mut = 0;
+                            while (rx2 < fw) {
+                                let is i64 as cx = fx + rx2;
+                                if (cx >= 0) { if (cx < w) {
+                                    let is i64 as co = (cy * w + cx) * 4;
+                                    canvas[co]=cast(u8,0); canvas[co+1]=cast(u8,0);
+                                    canvas[co+2]=cast(u8,0); canvas[co+3]=cast(u8,0);
+                                } }
+                                rx2 = rx2 + 1;
+                            }
+                        } }
+                        ry2 = ry2 + 1;
+                    }
+                }
+                if (fdispose == 2) { mem.core.memcpy(canvas, saved, fsize); }
+                cb.bytes_reset(&fdata);
+                if (flush == 1) {
+                    // the fcTL that triggered the flush starts the NEXT frame
+                    fw = _rd32be(data, 4); fh = _rd32be(data, 8);
+                    fx = _rd32be(data, 12); fy = _rd32be(data, 16);
+                    let is i64 as dnum = (cast(i64, data[20]) << 8) | cast(i64, data[21]);
+                    let is i64 as dden with mut = (cast(i64, data[22]) << 8) | cast(i64, data[23]);
+                    if (dden == 0) { dden = 100; }
+                    fdelay = dnum * 1000 / dden;
+                    fdispose = cast(i64, data[24]);
+                    fblend = cast(i64, data[25]);
+                }
+            }
+            buf.buf_seek(&bf, data_off);
+            buf.buf_skip(&bf, clen + 4);
+        }
+    }
+    cb.bytes_free(&fdata);
+    mem.core.munmap(canvas, fsize);
+    mem.core.munmap(saved, fsize);
+    out.width = w; out.height = h; out.count = fi;
+    out.frames = cast(i64, frames); out.delays = cast(i64, delays);
+    return 0;
+}
