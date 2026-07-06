@@ -1,0 +1,36 @@
+// test_png16_enc — png_encode of 16-bit images round-trips through png_decode
+// bit-exact (big-endian sample serialization + filtering).
+use "../core/image.cst"  as image;
+use "../core/pixfmt.cst" as pixfmt;
+use "../formats/png.cst" as png;
+use "caustic-compact/core/bytes.cst" as cb;
+
+fn rt(w as i64, h as i64, fmt as i64) as i64 {
+    let is image.Image as a;
+    image.image_init(&a, w, h, fmt);
+    let is i64 as ch = pixfmt.fmt_channels(fmt);
+    let is i64 as i with mut = 0;
+    while (i < w * h * ch) {
+        let is i64 as v = (i * 277 + 1000) & 65535;
+        a.pixels[i * 2] = cast(u8, v & 255); a.pixels[i * 2 + 1] = cast(u8, (v >> 8) & 255);
+        i = i + 1;
+    }
+    let is cb.Bytes as e = cb.bytes_new(4096);
+    if (png.png_encode(&a, &e) < 0) { return 1; }
+    let is image.Image as b;
+    if (png.png_decode(e.ptr, e.len, &b) != 0) { return 2; }
+    if (b.fmt != fmt) { return 3; }
+    let is i64 as nb = w * h * ch * 2;
+    i = 0;
+    while (i < nb) { if (a.pixels[i] != b.pixels[i]) { return 4; } i = i + 1; }
+    cb.bytes_free(&e); image.image_free(&a); image.image_free(&b);
+    return 0;
+}
+
+fn main() as i64 {
+    if (rt(17, 11, pixfmt.FMT_GRAY16)  != 0) { return 10; }
+    if (rt(17, 11, pixfmt.FMT_GRAYA16) != 0) { return 20; }
+    if (rt(17, 11, pixfmt.FMT_RGB16)   != 0) { return 30; }
+    if (rt(17, 11, pixfmt.FMT_RGBA16)  != 0) { return 40; }
+    return 0;
+}

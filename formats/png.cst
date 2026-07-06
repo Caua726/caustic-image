@@ -341,15 +341,21 @@ fn _png_chunk(out as *cb.Bytes, typ as *u8, data as *u8, len as i64) as void {
 fn png_encode(img as *image.Image, out as *cb.Bytes) as i64 {
     let is i64 as chan with mut = 0;
     let is i64 as colortype with mut = 0;
-    if (img.fmt == pixfmt.FMT_GRAY8)  { chan = 1; colortype = 0; }
-    if (img.fmt == pixfmt.FMT_GRAYA8) { chan = 2; colortype = 4; }
-    if (img.fmt == pixfmt.FMT_RGB8)   { chan = 3; colortype = 2; }
-    if (img.fmt == pixfmt.FMT_RGBA8)  { chan = 4; colortype = 6; }
+    if (img.fmt == pixfmt.FMT_GRAY8)   { chan = 1; colortype = 0; }
+    if (img.fmt == pixfmt.FMT_GRAYA8)  { chan = 2; colortype = 4; }
+    if (img.fmt == pixfmt.FMT_RGB8)    { chan = 3; colortype = 2; }
+    if (img.fmt == pixfmt.FMT_RGBA8)   { chan = 4; colortype = 6; }
+    if (img.fmt == pixfmt.FMT_GRAY16)  { chan = 1; colortype = 0; }
+    if (img.fmt == pixfmt.FMT_GRAYA16) { chan = 2; colortype = 4; }
+    if (img.fmt == pixfmt.FMT_RGB16)   { chan = 3; colortype = 2; }
+    if (img.fmt == pixfmt.FMT_RGBA16)  { chan = 4; colortype = 6; }
     if (chan == 0) { return errno.I_UNSUPPORTED; }
 
     let is i64 as w = img.width;
     let is i64 as h = img.height;
-    let is i64 as bpp = chan;
+    let is i64 as bit_depth = pixfmt.fmt_depth(img.fmt);
+    let is i64 as bps = bit_depth / 8;                 // bytes per sample (1 or 2)
+    let is i64 as bpp = chan * bps;                    // filter offset
     let is i64 as stride = w * bpp;
 
     // Signature.
@@ -364,18 +370,33 @@ fn png_encode(img as *image.Image, out as *cb.Bytes) as i64 {
     ih[2] = cast(u8, (w >> 8) & 255);  ih[3] = cast(u8, w & 255);
     ih[4] = cast(u8, (h >> 24) & 255); ih[5] = cast(u8, (h >> 16) & 255);
     ih[6] = cast(u8, (h >> 8) & 255);  ih[7] = cast(u8, h & 255);
-    ih[8] = cast(u8, 8);               // bit depth
+    ih[8] = cast(u8, bit_depth);       // bit depth (8 or 16)
     ih[9] = cast(u8, colortype);
     ih[10] = cast(u8, 0); ih[11] = cast(u8, 0); ih[12] = cast(u8, 0);
     _png_chunk(out, "IHDR", cast(*u8, &ih), 13);
 
-    // Build filtered scanlines.
+    // Build filtered scanlines. PNG stores samples big-endian, so 16-bit rows
+    // are byte-swapped into `berow` (the previous BE row is kept in `beprev`)
+    // before filtering; 8-bit is a straight copy.
     let is *u8 as px = img.pixels;
+    let is *u8 as berow = mem.core.mmap_anon(stride);
+    let is *u8 as beprev = mem.core.mmap_anon(stride);
+    mem.core.memset(beprev, cast(i32, 0), stride);
     let is cb.Bytes as raw = cb.bytes_new(h * (1 + stride) + 16);
     let is i64 as y with mut = 0;
     while (y < h) {
-        let is i64 as cur = y * img.stride;
-        let is i64 as prev = cur - img.stride;
+        let is i64 as srow = y * img.stride;
+        // Fill berow (big-endian for 16-bit).
+        if (bps == 1) {
+            mem.core.memcpy(berow, cast(*u8, cast(i64, px) + srow), stride);
+        } else {
+            let is i64 as s with mut = 0;
+            while (s < w * chan) {
+                berow[s * 2]     = px[srow + s * 2 + 1];   // high byte first
+                berow[s * 2 + 1] = px[srow + s * 2];
+                s = s + 1;
+            }
+        }
         // Choose the filter with the smallest sum of absolute filtered bytes.
         let is i64 as best_ft with mut = 0;
         let is i64 as best_cost with mut = 0 - 1;
@@ -384,13 +405,13 @@ fn png_encode(img as *image.Image, out as *cb.Bytes) as i64 {
             let is i64 as cost with mut = 0;
             let is i64 as i with mut = 0;
             while (i < stride) {
-                let is i64 as x = cast(i64, px[cur + i]);
+                let is i64 as x = cast(i64, berow[i]);
                 let is i64 as a with mut = 0;
-                if (i >= bpp) { a = cast(i64, px[cur + i - bpp]); }
+                if (i >= bpp) { a = cast(i64, berow[i - bpp]); }
                 let is i64 as b with mut = 0;
-                if (y > 0) { b = cast(i64, px[prev + i]); }
+                if (y > 0) { b = cast(i64, beprev[i]); }
                 let is i64 as cc with mut = 0;
-                if (y > 0) { if (i >= bpp) { cc = cast(i64, px[prev + i - bpp]); } }
+                if (y > 0) { if (i >= bpp) { cc = cast(i64, beprev[i - bpp]); } }
                 cost = cost + _sabs(_filt(ft, x, a, b, cc));
                 i = i + 1;
             }
@@ -402,18 +423,21 @@ fn png_encode(img as *image.Image, out as *cb.Bytes) as i64 {
         cb.bytes_push(&raw, cast(u8, best_ft));
         let is i64 as j with mut = 0;
         while (j < stride) {
-            let is i64 as x = cast(i64, px[cur + j]);
+            let is i64 as x = cast(i64, berow[j]);
             let is i64 as a with mut = 0;
-            if (j >= bpp) { a = cast(i64, px[cur + j - bpp]); }
+            if (j >= bpp) { a = cast(i64, berow[j - bpp]); }
             let is i64 as b with mut = 0;
-            if (y > 0) { b = cast(i64, px[prev + j]); }
+            if (y > 0) { b = cast(i64, beprev[j]); }
             let is i64 as cc with mut = 0;
-            if (y > 0) { if (j >= bpp) { cc = cast(i64, px[prev + j - bpp]); } }
+            if (y > 0) { if (j >= bpp) { cc = cast(i64, beprev[j - bpp]); } }
             cb.bytes_push(&raw, cast(u8, _filt(best_ft, x, a, b, cc)));
             j = j + 1;
         }
+        mem.core.memcpy(beprev, berow, stride);
         y = y + 1;
     }
+    mem.core.munmap(berow, stride);
+    mem.core.munmap(beprev, stride);
 
     // Compress to IDAT (zlib) and emit.
     let is cb.Bytes as idat = cb.bytes_new(raw.len / 2 + 64);

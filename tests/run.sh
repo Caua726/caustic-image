@@ -42,6 +42,7 @@ run_case test_png            tests/test_png.cst
 run_case test_png_filters    tests/test_png_filters.cst
 run_case test_png_adv        tests/test_png_adv.cst
 run_case test_apng           tests/test_apng.cst
+run_case test_png16_enc      tests/test_png16_enc.cst
 run_case test_gif            tests/test_gif.cst
 run_case test_gif_interlace  tests/test_gif_interlace.cst
 run_case test_gif_anim       tests/test_gif_anim.cst
