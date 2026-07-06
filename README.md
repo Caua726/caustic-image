@@ -24,7 +24,7 @@ in Pillow/giflib/libpng.
 | JPEG | yes | yes | decode baseline + progressive, fancy chroma upsampling (±3 of libjpeg); encode baseline 4:4:4 Annex-K tables, quality 90 (PSNR ~45 dB) |
 | TIFF | yes | — | II/MM, strips, uncompressed / PackBits / LZW / DEFLATE (+ predictor 2); 8-bit gray/RGB/RGBA |
 | CSIF | yes | yes | native flagship — see below |
-| WebP | yes | — | VP8L lossless: meta-Huffman, LZ77 2D, colour cache, all 4 transforms (VP8 lossy deferred) |
+| WebP | yes | yes | decode VP8L full (meta-Huffman, LZ77 2D, cache, 4 transforms); encode VP8L entropy tier (subtract-green + per-channel Huffman) — libwebp-exact |
 | AVIF | — | — | later phases |
 
 ### CSIF (native flagship)

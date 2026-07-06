@@ -631,3 +631,365 @@ fn webp_decode(src as *u8, src_len as i64, out as *image.Image) as i64 {
     mem.core.munmap(cast(*u8, buf), bw * h * 8);
     return 0;
 }
+
+// ============================ encoder =====================================
+// VP8L (lossless) encoder — honest entropy tier: subtract-green transform +
+// one group of canonical prefix codes (length-limited Huffman per channel),
+// literal-coded pixels (no LZ77 / colour cache yet). Output is a conformant
+// VP8L stream (browsers and libwebp decode it).
+//   webp_encode(img, out) -> out.len, or negative (RGB8/RGBA8).
+
+use "caustic-compact/core/bitwriter.cst" as bw;
+use "caustic-compact/core/bytes.cst" as cbb;
+
+// Length-limited Huffman: code lengths (<= maxlen) from symbol frequencies.
+// Two-queue merge with frequency-halving retry when the depth overflows.
+// Returns the number of used symbols.
+fn _hlens(freq as *i64, n as i64, maxlen as i64, lens as *i64) as i64 {
+    let is i64 as used with mut = 0;
+    let is i64 as s with mut = 0;
+    while (s < n) { lens[s] = 0; if (freq[s] > 0) { used = used + 1; } s = s + 1; }
+    if (used == 0) { return 0; }
+    if (used == 1) {
+        s = 0;
+        while (s < n) { if (freq[s] > 0) { lens[s] = 1; } s = s + 1; }
+        return 1;
+    }
+    // working copy of freqs (for the halving retry)
+    let is *i64 as wf = cast(*i64, mem.core.mmap_anon(n * 8));
+    s = 0; while (s < n) { wf[s] = freq[s]; s = s + 1; }
+
+    let is i64 as maxnodes = n * 2 + 2;
+    let is *i64 as nf = cast(*i64, mem.core.mmap_anon(maxnodes * 8));   // node freq
+    let is *i64 as np = cast(*i64, mem.core.mmap_anon(maxnodes * 8));   // parent
+    let is *i64 as na = cast(*i64, mem.core.mmap_anon(maxnodes * 8));   // active flag
+    let is *i64 as nsym = cast(*i64, mem.core.mmap_anon(maxnodes * 8)); // leaf symbol or -1
+    if (cast(i64, nsym) <= 0) { return 0 - 1; }
+
+    let is i64 as fits with mut = 0;
+    while (fits == 0) {
+        // build leaves
+        let is i64 as nn with mut = 0;
+        s = 0;
+        while (s < n) {
+            if (wf[s] > 0) {
+                nf[nn] = wf[s]; np[nn] = 0 - 1; na[nn] = 1; nsym[nn] = s;
+                nn = nn + 1;
+            }
+            s = s + 1;
+        }
+        let is i64 as roots with mut = nn;
+        while (roots > 1) {
+            // find two smallest active roots
+            let is i64 as a with mut = 0 - 1;
+            let is i64 as b with mut = 0 - 1;
+            let is i64 as i with mut = 0;
+            while (i < nn) {
+                if (na[i] == 1) {
+                    if (a < 0) { a = i; }
+                    else { if (nf[i] < nf[a]) { b = a; a = i; }
+                    else { if (b < 0) { b = i; } else { if (nf[i] < nf[b]) { b = i; } } } }
+                }
+                i = i + 1;
+            }
+            nf[nn] = nf[a] + nf[b]; np[nn] = 0 - 1; na[nn] = 1; nsym[nn] = 0 - 1;
+            na[a] = 0; na[b] = 0; np[a] = nn; np[b] = nn;
+            nn = nn + 1;
+            roots = roots - 1;
+        }
+        // depths
+        let is i64 as over with mut = 0;
+        let is i64 as i with mut = 0;
+        while (i < nn) {
+            if (nsym[i] >= 0) {
+                let is i64 as d with mut = 0;
+                let is i64 as k with mut = i;
+                while (np[k] >= 0) { d = d + 1; k = np[k]; }
+                lens[nsym[i]] = d;
+                if (d > maxlen) { over = 1; }
+            }
+            i = i + 1;
+        }
+        if (over == 0) { fits = 1; }
+        else {
+            // halve frequencies (keeping >=1) and retry
+            s = 0;
+            while (s < n) { if (wf[s] > 0) { wf[s] = (wf[s] + 1) >> 1; } s = s + 1; }
+        }
+    }
+    mem.core.munmap(cast(*u8, wf), n * 8);
+    mem.core.munmap(cast(*u8, nf), maxnodes * 8);
+    mem.core.munmap(cast(*u8, np), maxnodes * 8);
+    mem.core.munmap(cast(*u8, na), maxnodes * 8);
+    mem.core.munmap(cast(*u8, nsym), maxnodes * 8);
+    return used;
+}
+
+// Canonical code assignment (codes read MSB-first, shorter codes first,
+// within a length by ascending symbol — the decoder's convention).
+fn _canon(lens as *i64, n as i64, codes as *i64) as void {
+    let is [16]i64 as cnt;
+    let is i64 as l with mut = 0;
+    while (l < 16) { cnt[l] = 0; l = l + 1; }
+    let is i64 as s with mut = 0;
+    while (s < n) { if (lens[s] > 0) { cnt[lens[s]] = cnt[lens[s]] + 1; } s = s + 1; }
+    let is [16]i64 as next;
+    let is i64 as code with mut = 0;
+    l = 1;
+    while (l < 16) { next[l] = code; code = (code + cnt[l]) << 1; l = l + 1; }
+    s = 0;
+    while (s < n) {
+        if (lens[s] > 0) { codes[s] = next[lens[s]]; next[lens[s]] = next[lens[s]] + 1; }
+        s = s + 1;
+    }
+}
+
+// Write one prefix-code definition (simple for <=2 used symbols, else the
+// code-length-coded path with zero-run RLE).
+fn _write_htree(b as *bw.BitWriter, lens as *i64, n as i64, used as i64,
+                freq as *i64) as void {
+    if (used <= 2) {
+        bw.bw_bits(b, 1, 1);                       // simple
+        let is i64 as nsym with mut = used;
+        if (nsym < 1) { nsym = 1; }
+        bw.bw_bits(b, nsym - 1, 1);
+        // collect the used symbols (or symbol 0 for an unused tree)
+        let is i64 as s0 with mut = 0;
+        let is i64 as s1 with mut = 0;
+        let is i64 as found with mut = 0;
+        let is i64 as s with mut = 0;
+        while (s < n) {
+            if (freq[s] > 0) {
+                if (found == 0) { s0 = s; } else { s1 = s; }
+                found = found + 1;
+            }
+            s = s + 1;
+        }
+        if (s0 <= 1) { bw.bw_bits(b, 0, 1); bw.bw_bits(b, s0, 1); }
+        else { bw.bw_bits(b, 1, 1); bw.bw_bits(b, s0, 8); }
+        if (nsym == 2) { bw.bw_bits(b, s1, 8); }
+        return;
+    }
+    bw.bw_bits(b, 0, 1);                           // code-length-coded
+
+    // RLE tokenization of the length sequence: literals 0..15, 17 (3-10 zeros),
+    // 18 (11-138 zeros). (16 prev-repeat omitted for simplicity.)
+    let is *i64 as toks = cast(*i64, mem.core.mmap_anon(n * 2 * 8));
+    let is i64 as ntok with mut = 0;
+    let is i64 as s with mut = 0;
+    while (s < n) {
+        if (lens[s] == 0) {
+            let is i64 as run with mut = 0;
+            while (s + run < n) {
+                if (lens[s + run] != 0) { run = run + n; }   // break
+                else { run = run + 1; }
+            }
+            if (run > n) { run = run - n; }
+            let is i64 as left with mut = run;
+            while (left > 0) {
+                if (left >= 11) {
+                    let is i64 as take with mut = left;
+                    if (take > 138) { take = 138; }
+                    toks[ntok * 2] = 18; toks[ntok * 2 + 1] = take - 11;
+                    ntok = ntok + 1;
+                    left = left - take;
+                } else {
+                    if (left >= 3) {
+                        toks[ntok * 2] = 17; toks[ntok * 2 + 1] = left - 3;
+                        ntok = ntok + 1;
+                        left = 0;
+                    } else {
+                        let is i64 as k with mut = 0;
+                        while (k < left) {
+                            toks[ntok * 2] = 0; toks[ntok * 2 + 1] = 0;
+                            ntok = ntok + 1;
+                            k = k + 1;
+                        }
+                        left = 0;
+                    }
+                }
+            }
+            s = s + run;
+        } else {
+            toks[ntok * 2] = lens[s]; toks[ntok * 2 + 1] = 0;
+            ntok = ntok + 1;
+            s = s + 1;
+        }
+    }
+
+    // CL-code Huffman over the token symbols (19-symbol alphabet, <=7 bits).
+    let is [19]i64 as clf;
+    let is i64 as i with mut = 0;
+    while (i < 19) { clf[i] = 0; i = i + 1; }
+    i = 0;
+    while (i < ntok) { clf[toks[i * 2]] = clf[toks[i * 2] ] + 1; i = i + 1; }
+    let is [19]i64 as cll;
+    let is [19]i64 as clc;
+    let is i64 as clused = _hlens(cast(*i64, &clf), 19, 7, cast(*i64, &cll));
+    _canon(cast(*i64, &cll), 19, cast(*i64, &clc));
+    // Emission lengths: a single-symbol CL tree decodes with ZERO bits per
+    // token (its definition is still written with length 1 below).
+    let is [19]i64 as cle;
+    i = 0;
+    while (i < 19) {
+        cle[i] = cll[i];
+        if (clused == 1) { cle[i] = 0; }
+        i = i + 1;
+    }
+
+    // num_code_lengths: last nonzero position in kCodeLengthCodeOrder.
+    let is i64 as numcl with mut = 4;
+    i = 0;
+    while (i < 19) {
+        if (cll[cast(i64, _CLO[i])] != 0) { if (i + 1 > numcl) { numcl = i + 1; } }
+        i = i + 1;
+    }
+    bw.bw_bits(b, numcl - 4, 4);
+    i = 0;
+    while (i < numcl) { bw.bw_bits(b, cll[cast(i64, _CLO[i])], 3); i = i + 1; }
+    bw.bw_bits(b, 0, 1);                           // no max_symbol shortcut
+
+    // emit tokens
+    i = 0;
+    while (i < ntok) {
+        let is i64 as t = toks[i * 2];
+        bw.bw_huff(b, clc[t], cle[t]);
+        if (t == 17) { bw.bw_bits(b, toks[i * 2 + 1], 3); }
+        if (t == 18) { bw.bw_bits(b, toks[i * 2 + 1], 7); }
+        i = i + 1;
+    }
+    mem.core.munmap(cast(*u8, toks), n * 2 * 8);
+}
+
+fn webp_encode(img as *image.Image, out as *cbb.Bytes) as i64 {
+    let is i64 as ch with mut = 0;
+    if (img.fmt == pixfmt.FMT_RGB8)  { ch = 3; }
+    if (img.fmt == pixfmt.FMT_RGBA8) { ch = 4; }
+    if (ch == 0) { return errno.I_UNSUPPORTED; }
+    let is i64 as w = img.width;
+    let is i64 as h = img.height;
+    let is i64 as npx = w * h;
+    let is *u8 as px = img.pixels;
+
+    // channel streams with subtract-green applied
+    let is *u8 as gs = mem.core.mmap_anon(npx);
+    let is *u8 as rs = mem.core.mmap_anon(npx);
+    let is *u8 as bs = mem.core.mmap_anon(npx);
+    let is *u8 as as2 = mem.core.mmap_anon(npx);
+    if (cast(i64, as2) <= 0) { return errno.I_OOM; }
+    let is i64 as alpha_used with mut = 0;
+    let is i64 as p with mut = 0;
+    while (p < npx) {
+        let is i64 as r = cast(i64, px[p * ch]);
+        let is i64 as g = cast(i64, px[p * ch + 1]);
+        let is i64 as bl = cast(i64, px[p * ch + 2]);
+        let is i64 as a with mut = 255;
+        if (ch == 4) { a = cast(i64, px[p * ch + 3]); }
+        if (a != 255) { alpha_used = 1; }
+        gs[p] = cast(u8, g);
+        rs[p] = cast(u8, (r - g) & 255);
+        bs[p] = cast(u8, (bl - g) & 255);
+        as2[p] = cast(u8, a);
+        p = p + 1;
+    }
+
+    // histograms
+    let is [280]i64 as gf;
+    let is [256]i64 as rf;
+    let is [256]i64 as bf;
+    let is [256]i64 as af;
+    let is [40]i64 as df;
+    let is i64 as i with mut = 0;
+    while (i < 280) { gf[i] = 0; i = i + 1; }
+    i = 0; while (i < 256) { rf[i] = 0; bf[i] = 0; af[i] = 0; i = i + 1; }
+    i = 0; while (i < 40) { df[i] = 0; i = i + 1; }
+    df[0] = 1;                                    // dist tree: 1 dummy symbol
+    p = 0;
+    while (p < npx) {
+        gf[cast(i64, gs[p])] = gf[cast(i64, gs[p])] + 1;
+        rf[cast(i64, rs[p])] = rf[cast(i64, rs[p])] + 1;
+        bf[cast(i64, bs[p])] = bf[cast(i64, bs[p])] + 1;
+        af[cast(i64, as2[p])] = af[cast(i64, as2[p])] + 1;
+        p = p + 1;
+    }
+
+    // code lengths + canonical codes
+    let is [280]i64 as gl; let is [280]i64 as gc;
+    let is [256]i64 as rl; let is [256]i64 as rc;
+    let is [256]i64 as bl2; let is [256]i64 as bc;
+    let is [256]i64 as al; let is [256]i64 as ac;
+    let is [40]i64 as dl; let is [40]i64 as dc;
+    let is i64 as gu = _hlens(cast(*i64, &gf), 280, 15, cast(*i64, &gl));
+    let is i64 as ru = _hlens(cast(*i64, &rf), 256, 15, cast(*i64, &rl));
+    let is i64 as bu = _hlens(cast(*i64, &bf), 256, 15, cast(*i64, &bl2));
+    let is i64 as au = _hlens(cast(*i64, &af), 256, 15, cast(*i64, &al));
+    let is i64 as du = _hlens(cast(*i64, &df), 40, 15, cast(*i64, &dl));
+    // A single-symbol tree decodes with ZERO bits per symbol (libwebp special
+    // case) — clear its lengths so the pixel loop emits nothing for it.
+    if (gu == 1) { i = 0; while (i < 280) { gl[i] = 0; i = i + 1; } }
+    if (ru == 1) { i = 0; while (i < 256) { rl[i] = 0; i = i + 1; } }
+    if (bu == 1) { i = 0; while (i < 256) { bl2[i] = 0; i = i + 1; } }
+    if (au == 1) { i = 0; while (i < 256) { al[i] = 0; i = i + 1; } }
+    _canon(cast(*i64, &gl), 280, cast(*i64, &gc));
+    _canon(cast(*i64, &rl), 256, cast(*i64, &rc));
+    _canon(cast(*i64, &bl2), 256, cast(*i64, &bc));
+    _canon(cast(*i64, &al), 256, cast(*i64, &ac));
+    _canon(cast(*i64, &dl), 40, cast(*i64, &dc));
+
+    // ---- VP8L payload ----
+    let is cbb.Bytes as pay = cbb.bytes_new(npx + 4096);
+    cbb.bytes_push(&pay, cast(u8, 47));            // 0x2f signature
+    let is bw.BitWriter as b;
+    bw.bw_init(&b, &pay);
+    bw.bw_bits(&b, w - 1, 14);
+    bw.bw_bits(&b, h - 1, 14);
+    bw.bw_bits(&b, alpha_used, 1);
+    bw.bw_bits(&b, 0, 3);                          // version
+    bw.bw_bits(&b, 1, 1);                          // transform present
+    bw.bw_bits(&b, 2, 2);                          // SUBTRACT_GREEN
+    bw.bw_bits(&b, 0, 1);                          // no more transforms
+    bw.bw_bits(&b, 0, 1);                          // no colour cache
+    bw.bw_bits(&b, 0, 1);                          // no meta-Huffman
+    _write_htree(&b, cast(*i64, &gl), 280, gu, cast(*i64, &gf));
+    _write_htree(&b, cast(*i64, &rl), 256, ru, cast(*i64, &rf));
+    _write_htree(&b, cast(*i64, &bl2), 256, bu, cast(*i64, &bf));
+    _write_htree(&b, cast(*i64, &al), 256, au, cast(*i64, &af));
+    _write_htree(&b, cast(*i64, &dl), 40, du, cast(*i64, &df));
+    p = 0;
+    while (p < npx) {
+        let is i64 as g = cast(i64, gs[p]);
+        bw.bw_huff(&b, gc[g], gl[g]);
+        let is i64 as r = cast(i64, rs[p]);
+        bw.bw_huff(&b, rc[r], rl[r]);
+        let is i64 as v = cast(i64, bs[p]);
+        bw.bw_huff(&b, bc[v], bl2[v]);
+        let is i64 as a = cast(i64, as2[p]);
+        bw.bw_huff(&b, ac[a], al[a]);
+        p = p + 1;
+    }
+    bw.bw_align(&b);
+    mem.core.munmap(gs, npx); mem.core.munmap(rs, npx);
+    mem.core.munmap(bs, npx); mem.core.munmap(as2, npx);
+
+    // ---- RIFF container ----
+    let is i64 as vlen = pay.len;
+    let is i64 as riff_size = 4 + 8 + vlen + (vlen & 1);
+    cbb.bytes_push(out, cast(u8, 82)); cbb.bytes_push(out, cast(u8, 73));
+    cbb.bytes_push(out, cast(u8, 70)); cbb.bytes_push(out, cast(u8, 70));   // RIFF
+    cbb.bytes_push(out, cast(u8, riff_size & 255));
+    cbb.bytes_push(out, cast(u8, (riff_size >> 8) & 255));
+    cbb.bytes_push(out, cast(u8, (riff_size >> 16) & 255));
+    cbb.bytes_push(out, cast(u8, (riff_size >> 24) & 255));
+    cbb.bytes_push(out, cast(u8, 87)); cbb.bytes_push(out, cast(u8, 69));
+    cbb.bytes_push(out, cast(u8, 66)); cbb.bytes_push(out, cast(u8, 80));   // WEBP
+    cbb.bytes_push(out, cast(u8, 86)); cbb.bytes_push(out, cast(u8, 80));
+    cbb.bytes_push(out, cast(u8, 56)); cbb.bytes_push(out, cast(u8, 76));   // VP8L
+    cbb.bytes_push(out, cast(u8, vlen & 255));
+    cbb.bytes_push(out, cast(u8, (vlen >> 8) & 255));
+    cbb.bytes_push(out, cast(u8, (vlen >> 16) & 255));
+    cbb.bytes_push(out, cast(u8, (vlen >> 24) & 255));
+    cbb.bytes_append(out, pay.ptr, pay.len);
+    if ((vlen & 1) == 1) { cbb.bytes_push(out, cast(u8, 0)); }
+    cbb.bytes_free(&pay);
+    return out.len;
+}

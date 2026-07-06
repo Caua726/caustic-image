@@ -1,0 +1,56 @@
+// test_webp_enc — VP8L encode -> our own decode must be byte-exact (RGB +
+// RGBA, smooth + constant-channel + noisy shapes). Bitstream conformance was
+// verified against libwebp/Pillow at development time (lossless-exact).
+use "../core/image.cst"  as image;
+use "../core/pixfmt.cst" as pixfmt;
+use "../formats/webp.cst" as webp;
+use "caustic-compact/core/bytes.cst" as cb;
+use "rt.cst" as rt;
+
+fn rt_webp(w as i64, h as i64, fmt as i64) as i64 {
+    let is image.Image as a;
+    if (rt.make_image(&a, w, h, fmt) != 0) { return 1; }
+    let is cb.Bytes as e = cb.bytes_new(1024);
+    if (webp.webp_encode(&a, &e) < 0) { return 2; }
+    let is image.Image as b;
+    if (webp.webp_decode(e.ptr, e.len, &b) != 0) { return 3; }
+    // decoder always yields RGBA8; compare channel-aware
+    let is i64 as sch = pixfmt.fmt_channels(a.fmt);
+    let is i64 as p with mut = 0;
+    while (p < w * h) {
+        let is i64 as c with mut = 0;
+        while (c < 3) {
+            if (a.pixels[p * sch + c] != b.pixels[p * 4 + c]) { return 4; }
+            c = c + 1;
+        }
+        if (sch == 4) { if (a.pixels[p * 4 + 3] != b.pixels[p * 4 + 3]) { return 5; } }
+        p = p + 1;
+    }
+    cb.bytes_free(&e); image.image_free(&a); image.image_free(&b);
+    return 0;
+}
+
+fn main() as i64 {
+    if (rt_webp(40, 30, pixfmt.FMT_RGB8)  != 0) { return 10; }
+    if (rt_webp(24, 18, pixfmt.FMT_RGBA8) != 0) { return 20; }
+    // all-256-symbols flat-tree shape (the single-CL-symbol regression)
+    let is image.Image as a;
+    if (image.image_init(&a, 40, 30, pixfmt.FMT_RGB8) != 0) { return 30; }
+    let is i64 as p with mut = 0;
+    while (p < 1200) {
+        a.pixels[p*3] = cast(u8, (10 + 5 * (p % 40) + 250 * (p / 40)) & 255);
+        a.pixels[p*3+1] = cast(u8, 50);
+        a.pixels[p*3+2] = cast(u8, 80);
+        p = p + 1;
+    }
+    let is cb.Bytes as e = cb.bytes_new(1024);
+    if (webp.webp_encode(&a, &e) < 0) { return 31; }
+    let is image.Image as b;
+    if (webp.webp_decode(e.ptr, e.len, &b) != 0) { return 32; }
+    p = 0;
+    while (p < 1200) {
+        if (a.pixels[p*3] != b.pixels[p*4]) { return 33; }
+        p = p + 1;
+    }
+    return 0;
+}
