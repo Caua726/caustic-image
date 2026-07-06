@@ -25,7 +25,7 @@ in Pillow/giflib/libpng.
 | TIFF | yes | — | II/MM, strips, uncompressed / PackBits / LZW / DEFLATE (+ predictor 2); 8-bit gray/RGB/RGBA |
 | ICO  | yes | — | favicon: largest entry, embedded-PNG or DIB+AND-mask |
 | CSIF | yes | yes | native flagship — see below |
-| WebP | yes | yes | decode VP8L full (meta-Huffman, LZ77 2D, cache, 4 transforms); encode VP8L (subtract-green + per-tile predictor + per-channel Huffman) — libwebp-exact |
+| WebP | yes | yes | decode VP8L full + **VP8 lossy** (boolean coder, intra prediction, loop filter — bit-exact vs libwebp); encode VP8L (subtract-green + predictor + Huffman) |
 | AVIF | — | — | later phases |
 
 ### CSIF (native flagship)

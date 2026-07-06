@@ -62,6 +62,7 @@ run_case test_csif_dct       tests/test_csif_dct.cst
 run_case test_tiff           tests/test_tiff.cst
 run_case test_webp           tests/test_webp.cst
 run_case test_webp_enc       tests/test_webp_enc.cst
+run_case test_vp8            tests/test_vp8.cst
 run_case test_ops            tests/test_ops.cst
 run_case test_lowbit         tests/test_lowbit.cst
 run_case test_ico            tests/test_ico.cst
