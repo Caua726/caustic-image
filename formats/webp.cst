@@ -861,6 +861,88 @@ fn _write_htree(b as *bw.BitWriter, lens as *i64, n as i64, used as i64,
     mem.core.munmap(cast(*u8, toks), n * 2 * 8);
 }
 
+// Write one literal-coded image stream (5 trees + per-pixel g,r,b,a codes).
+// Channel arrays are the values to code (green may use 0..255 of its 280
+// alphabet). The caller writes the cache/meta bits.
+fn _enc_literal_stream(b as *bw.BitWriter, gs as *u8, rs as *u8, bs as *u8,
+                       as2 as *u8, npx as i64) as i64 {
+    let is [280]i64 as gf;
+    let is [256]i64 as rf;
+    let is [256]i64 as bf;
+    let is [256]i64 as af;
+    let is [40]i64 as df;
+    let is i64 as i with mut = 0;
+    while (i < 280) { gf[i] = 0; i = i + 1; }
+    i = 0; while (i < 256) { rf[i] = 0; bf[i] = 0; af[i] = 0; i = i + 1; }
+    i = 0; while (i < 40) { df[i] = 0; i = i + 1; }
+    df[0] = 1;
+    let is i64 as p with mut = 0;
+    while (p < npx) {
+        gf[cast(i64, gs[p])] = gf[cast(i64, gs[p])] + 1;
+        rf[cast(i64, rs[p])] = rf[cast(i64, rs[p])] + 1;
+        bf[cast(i64, bs[p])] = bf[cast(i64, bs[p])] + 1;
+        af[cast(i64, as2[p])] = af[cast(i64, as2[p])] + 1;
+        p = p + 1;
+    }
+    let is [280]i64 as gl; let is [280]i64 as gc;
+    let is [256]i64 as rl; let is [256]i64 as rc;
+    let is [256]i64 as bl2; let is [256]i64 as bc;
+    let is [256]i64 as al; let is [256]i64 as ac;
+    let is [40]i64 as dl; let is [40]i64 as dc;
+    let is i64 as gu = _hlens(cast(*i64, &gf), 280, 15, cast(*i64, &gl));
+    let is i64 as ru = _hlens(cast(*i64, &rf), 256, 15, cast(*i64, &rl));
+    let is i64 as bu = _hlens(cast(*i64, &bf), 256, 15, cast(*i64, &bl2));
+    let is i64 as au = _hlens(cast(*i64, &af), 256, 15, cast(*i64, &al));
+    let is i64 as du = _hlens(cast(*i64, &df), 40, 15, cast(*i64, &dl));
+    if (gu == 1) { i = 0; while (i < 280) { gl[i] = 0; i = i + 1; } }
+    if (ru == 1) { i = 0; while (i < 256) { rl[i] = 0; i = i + 1; } }
+    if (bu == 1) { i = 0; while (i < 256) { bl2[i] = 0; i = i + 1; } }
+    if (au == 1) { i = 0; while (i < 256) { al[i] = 0; i = i + 1; } }
+    _canon(cast(*i64, &gl), 280, cast(*i64, &gc));
+    _canon(cast(*i64, &rl), 256, cast(*i64, &rc));
+    _canon(cast(*i64, &bl2), 256, cast(*i64, &bc));
+    _canon(cast(*i64, &al), 256, cast(*i64, &ac));
+    _canon(cast(*i64, &dl), 40, cast(*i64, &dc));
+    // tree definitions need lens with the single-symbol entry visible; rebuild
+    // definitional lens from freq for the simple path (it uses freq directly).
+    _write_htree(b, cast(*i64, &gl), 280, gu, cast(*i64, &gf));
+    _write_htree(b, cast(*i64, &rl), 256, ru, cast(*i64, &rf));
+    _write_htree(b, cast(*i64, &bl2), 256, bu, cast(*i64, &bf));
+    _write_htree(b, cast(*i64, &al), 256, au, cast(*i64, &af));
+    _write_htree(b, cast(*i64, &dl), 40, du, cast(*i64, &df));
+    p = 0;
+    while (p < npx) {
+        let is i64 as g = cast(i64, gs[p]);
+        bw.bw_huff(b, gc[g], gl[g]);
+        let is i64 as r = cast(i64, rs[p]);
+        bw.bw_huff(b, rc[r], rl[r]);
+        let is i64 as v = cast(i64, bs[p]);
+        bw.bw_huff(b, bc[v], bl2[v]);
+        let is i64 as a = cast(i64, as2[p]);
+        bw.bw_huff(b, ac[a], al[a]);
+        p = p + 1;
+    }
+    return 0;
+}
+
+// Per-channel predictor value for `mode`, from already-final neighbour
+// channel values (l, t, tl, tr each 0..255).
+fn _predc(mode as i64, l as i64, t as i64, tl as i64, tr as i64) as i64 {
+    if (mode == 0) { return 0; }
+    if (mode == 1) { return l; }
+    if (mode == 2) { return t; }
+    if (mode == 3) { return tr; }
+    if (mode == 4) { return tl; }
+    if (mode == 5) { return (((l + tr) >> 1) + t) >> 1; }
+    if (mode == 6) { return (l + tl) >> 1; }
+    if (mode == 7) { return (l + t) >> 1; }
+    if (mode == 8) { return (tl + t) >> 1; }
+    if (mode == 9) { return (t + tr) >> 1; }
+    if (mode == 10) { return (((l + tl) >> 1) + ((t + tr) >> 1)) >> 1; }
+    // 11..13 need full-pixel context; handled by the caller (not offered here)
+    return (l + t) >> 1;
+}
+
 fn webp_encode(img as *image.Image, out as *cbb.Bytes) as i64 {
     let is i64 as ch with mut = 0;
     if (img.fmt == pixfmt.FMT_RGB8)  { ch = 3; }
@@ -893,48 +975,103 @@ fn webp_encode(img as *image.Image, out as *cbb.Bytes) as i64 {
         p = p + 1;
     }
 
-    // histograms
-    let is [280]i64 as gf;
-    let is [256]i64 as rf;
-    let is [256]i64 as bf;
-    let is [256]i64 as af;
-    let is [40]i64 as df;
-    let is i64 as i with mut = 0;
-    while (i < 280) { gf[i] = 0; i = i + 1; }
-    i = 0; while (i < 256) { rf[i] = 0; bf[i] = 0; af[i] = 0; i = i + 1; }
-    i = 0; while (i < 40) { df[i] = 0; i = i + 1; }
-    df[0] = 1;                                    // dist tree: 1 dummy symbol
-    p = 0;
-    while (p < npx) {
-        gf[cast(i64, gs[p])] = gf[cast(i64, gs[p])] + 1;
-        rf[cast(i64, rs[p])] = rf[cast(i64, rs[p])] + 1;
-        bf[cast(i64, bs[p])] = bf[cast(i64, bs[p])] + 1;
-        af[cast(i64, as2[p])] = af[cast(i64, as2[p])] + 1;
-        p = p + 1;
-    }
+    // ---- predictor transform (16x16 tiles, best of modes 0..10 per tile) ----
+    let is i64 as pbits = 4;
+    let is i64 as ptw = _sub(w, pbits);
+    let is i64 as pth = _sub(h, pbits);
+    let is *u8 as modes = mem.core.mmap_anon(ptw * pth + 1);
+    let is *u8 as res_g = mem.core.mmap_anon(npx);
+    let is *u8 as res_r = mem.core.mmap_anon(npx);
+    let is *u8 as res_b = mem.core.mmap_anon(npx);
+    let is *u8 as res_a = mem.core.mmap_anon(npx);
+    if (cast(i64, res_a) <= 0) { return errno.I_OOM; }
 
-    // code lengths + canonical codes
-    let is [280]i64 as gl; let is [280]i64 as gc;
-    let is [256]i64 as rl; let is [256]i64 as rc;
-    let is [256]i64 as bl2; let is [256]i64 as bc;
-    let is [256]i64 as al; let is [256]i64 as ac;
-    let is [40]i64 as dl; let is [40]i64 as dc;
-    let is i64 as gu = _hlens(cast(*i64, &gf), 280, 15, cast(*i64, &gl));
-    let is i64 as ru = _hlens(cast(*i64, &rf), 256, 15, cast(*i64, &rl));
-    let is i64 as bu = _hlens(cast(*i64, &bf), 256, 15, cast(*i64, &bl2));
-    let is i64 as au = _hlens(cast(*i64, &af), 256, 15, cast(*i64, &al));
-    let is i64 as du = _hlens(cast(*i64, &df), 40, 15, cast(*i64, &dl));
-    // A single-symbol tree decodes with ZERO bits per symbol (libwebp special
-    // case) — clear its lengths so the pixel loop emits nothing for it.
-    if (gu == 1) { i = 0; while (i < 280) { gl[i] = 0; i = i + 1; } }
-    if (ru == 1) { i = 0; while (i < 256) { rl[i] = 0; i = i + 1; } }
-    if (bu == 1) { i = 0; while (i < 256) { bl2[i] = 0; i = i + 1; } }
-    if (au == 1) { i = 0; while (i < 256) { al[i] = 0; i = i + 1; } }
-    _canon(cast(*i64, &gl), 280, cast(*i64, &gc));
-    _canon(cast(*i64, &rl), 256, cast(*i64, &rc));
-    _canon(cast(*i64, &bl2), 256, cast(*i64, &bc));
-    _canon(cast(*i64, &al), 256, cast(*i64, &ac));
-    _canon(cast(*i64, &dl), 40, cast(*i64, &dc));
+    let is i64 as ty with mut = 0;
+    while (ty < pth) {
+        let is i64 as tx with mut = 0;
+        while (tx < ptw) {
+            // pick the mode with the smallest wrap-aware residual magnitude
+            let is i64 as best with mut = 0;
+            let is i64 as bestcost with mut = 0 - 1;
+            let is i64 as m with mut = 0;
+            while (m <= 10) {
+                let is i64 as cost with mut = 0;
+                let is i64 as y with mut = ty << pbits;
+                while (y < ((ty + 1) << pbits)) {
+                    if (y < h) {
+                        let is i64 as x with mut = tx << pbits;
+                        while (x < ((tx + 1) << pbits)) {
+                            if (x < w) {
+                                let is i64 as q = y * w + x;
+                                let is i64 as c2 with mut = 0;
+                                while (c2 < 4) {
+                                    let is *u8 as chp with mut = gs;
+                                    if (c2 == 1) { chp = rs; }
+                                    if (c2 == 2) { chp = bs; }
+                                    if (c2 == 3) { chp = as2; }
+                                    let is i64 as cur = cast(i64, chp[q]);
+                                    let is i64 as pred with mut = 0;
+                                    if (q == 0) { if (c2 == 3) { pred = 255; } }
+                                    else { if (y == 0) { pred = cast(i64, chp[q - 1]); }
+                                    else { if (x == 0) { pred = cast(i64, chp[q - w]); }
+                                    else {
+                                        pred = _predc(m,
+                                            cast(i64, chp[q - 1]), cast(i64, chp[q - w]),
+                                            cast(i64, chp[q - w - 1]), cast(i64, chp[q - w + 1]));
+                                        if (m == 0) { if (c2 == 3) { pred = 255; } }
+                                    } } }
+                                    let is i64 as d with mut = (cur - pred) & 255;
+                                    if (d > 128) { d = 256 - d; }
+                                    cost = cost + d;
+                                    c2 = c2 + 1;
+                                }
+                            }
+                            x = x + 1;
+                        }
+                    }
+                    y = y + 1;
+                }
+                if (bestcost < 0) { bestcost = cost; best = m; }
+                else { if (cost < bestcost) { bestcost = cost; best = m; } }
+                m = m + 1;
+            }
+            modes[ty * ptw + tx] = cast(u8, best);
+            tx = tx + 1;
+        }
+        ty = ty + 1;
+    }
+    // residuals under the chosen per-tile modes (border rules fixed by spec)
+    let is i64 as y2 with mut = 0;
+    while (y2 < h) {
+        let is i64 as x2 with mut = 0;
+        while (x2 < w) {
+            let is i64 as q = y2 * w + x2;
+            let is i64 as m = cast(i64, modes[(y2 >> pbits) * ptw + (x2 >> pbits)]);
+            let is i64 as c2 with mut = 0;
+            while (c2 < 4) {
+                let is *u8 as chp with mut = gs;
+                let is *u8 as rp with mut = res_g;
+                if (c2 == 1) { chp = rs; rp = res_r; }
+                if (c2 == 2) { chp = bs; rp = res_b; }
+                if (c2 == 3) { chp = as2; rp = res_a; }
+                let is i64 as cur = cast(i64, chp[q]);
+                let is i64 as pred with mut = 0;
+                if (q == 0) { if (c2 == 3) { pred = 255; } }
+                else { if (y2 == 0) { pred = cast(i64, chp[q - 1]); }
+                else { if (x2 == 0) { pred = cast(i64, chp[q - w]); }
+                else {
+                    pred = _predc(m,
+                        cast(i64, chp[q - 1]), cast(i64, chp[q - w]),
+                        cast(i64, chp[q - w - 1]), cast(i64, chp[q - w + 1]));
+                    if (m == 0) { if (c2 == 3) { pred = 255; } }
+                } } }
+                rp[q] = cast(u8, (cur - pred) & 255);
+                c2 = c2 + 1;
+            }
+            x2 = x2 + 1;
+        }
+        y2 = y2 + 1;
+    }
 
     // ---- VP8L payload ----
     let is cbb.Bytes as pay = cbb.bytes_new(npx + 4096);
@@ -947,29 +1084,29 @@ fn webp_encode(img as *image.Image, out as *cbb.Bytes) as i64 {
     bw.bw_bits(&b, 0, 3);                          // version
     bw.bw_bits(&b, 1, 1);                          // transform present
     bw.bw_bits(&b, 2, 2);                          // SUBTRACT_GREEN
+    bw.bw_bits(&b, 1, 1);                          // another transform
+    bw.bw_bits(&b, 0, 2);                          // PREDICTOR
+    bw.bw_bits(&b, pbits - 2, 3);                  // size_bits
+    // predictor image substream: green = mode, other channels constant
+    let is i64 as pn = ptw * pth;
+    let is *u8 as z0 = mem.core.mmap_anon(pn + 1);
+    let is *u8 as z255 = mem.core.mmap_anon(pn + 1);
+    if (cast(i64, z255) <= 0) { return errno.I_OOM; }
+    mem.core.memset(z0, cast(i32, 0), pn);
+    mem.core.memset(z255, cast(i32, 255), pn);
+    bw.bw_bits(&b, 0, 1);                          // aux: no colour cache
+    _enc_literal_stream(&b, modes, z0, z0, z255, pn);
     bw.bw_bits(&b, 0, 1);                          // no more transforms
     bw.bw_bits(&b, 0, 1);                          // no colour cache
     bw.bw_bits(&b, 0, 1);                          // no meta-Huffman
-    _write_htree(&b, cast(*i64, &gl), 280, gu, cast(*i64, &gf));
-    _write_htree(&b, cast(*i64, &rl), 256, ru, cast(*i64, &rf));
-    _write_htree(&b, cast(*i64, &bl2), 256, bu, cast(*i64, &bf));
-    _write_htree(&b, cast(*i64, &al), 256, au, cast(*i64, &af));
-    _write_htree(&b, cast(*i64, &dl), 40, du, cast(*i64, &df));
-    p = 0;
-    while (p < npx) {
-        let is i64 as g = cast(i64, gs[p]);
-        bw.bw_huff(&b, gc[g], gl[g]);
-        let is i64 as r = cast(i64, rs[p]);
-        bw.bw_huff(&b, rc[r], rl[r]);
-        let is i64 as v = cast(i64, bs[p]);
-        bw.bw_huff(&b, bc[v], bl2[v]);
-        let is i64 as a = cast(i64, as2[p]);
-        bw.bw_huff(&b, ac[a], al[a]);
-        p = p + 1;
-    }
+    _enc_literal_stream(&b, res_g, res_r, res_b, res_a, npx);
     bw.bw_align(&b);
     mem.core.munmap(gs, npx); mem.core.munmap(rs, npx);
     mem.core.munmap(bs, npx); mem.core.munmap(as2, npx);
+    mem.core.munmap(res_g, npx); mem.core.munmap(res_r, npx);
+    mem.core.munmap(res_b, npx); mem.core.munmap(res_a, npx);
+    mem.core.munmap(modes, pn + 1);
+    mem.core.munmap(z0, pn + 1); mem.core.munmap(z255, pn + 1);
 
     // ---- RIFF container ----
     let is i64 as vlen = pay.len;
