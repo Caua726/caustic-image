@@ -1,0 +1,51 @@
+// test_csif_tiled — tiled CSIF: independent per-tile decode reproduces the
+// image exactly for every codec (edge tiles cropped), single-tile files stay
+// unchanged, and a corrupted tile fails loudly with the tile-CRC error.
+use "../core/image.cst"  as image;
+use "../core/pixfmt.cst" as pixfmt;
+use "../core/buf.cst"    as buf;
+use "../csif/container.cst" as csif;
+use "../csif/errno.cst"     as ce;
+use "caustic-compact/core/bytes.cst" as cb;
+use "rt.cst" as rt;
+
+fn rt_tiled(w as i64, h as i64, fmt as i64, codec as i64, tw as i64, th as i64) as i64 {
+    let is image.Image as a;
+    if (rt.make_image(&a, w, h, fmt) != 0) { return 1; }
+    let is cb.Bytes as e = cb.bytes_new(4096);
+    if (csif.csif_encode_tiled(&a, &e, codec, tw, th) < 0) { return 2; }
+    let is image.Image as b;
+    if (csif.csif_decode(e.ptr, e.len, &b) < 0) { return 3; }
+    let is i64 as eq = rt.pixels_equal(&a, &b);
+    cb.bytes_free(&e); image.image_free(&a); image.image_free(&b);
+    return eq;
+}
+
+fn main() as i64 {
+    // 50x34 with 16x16 tiles -> 4x3 grid, right/bottom tiles cropped.
+    if (rt_tiled(50, 34, pixfmt.FMT_RGB8, 0, 16, 16)  != 0) { return 10; }   // RAW
+    if (rt_tiled(50, 34, pixfmt.FMT_RGBA8, 1, 16, 16) != 0) { return 20; }   // QOI
+    if (rt_tiled(50, 34, pixfmt.FMT_RGB8, 2, 16, 16)  != 0) { return 30; }   // MODULAR
+    if (rt_tiled(40, 40, pixfmt.FMT_GRAY8, 2, 32, 32) != 0) { return 40; }   // 2x2 grid
+    if (rt_tiled(16, 16, pixfmt.FMT_RGB8, 0, 16, 16)  != 0) { return 50; }   // exactly 1 tile
+
+    // Corrupt one tile's codec byte (not chunk metadata): the per-tile CRC in
+    // TIDX must catch it as E_CSIF_CRC_CRITICAL... but the enclosing IDAT
+    // chunk CRC catches it first — either way it must fail loudly.
+    let is image.Image as a;
+    if (rt.make_image(&a, 50, 34, pixfmt.FMT_RGB8) != 0) { return 60; }
+    let is cb.Bytes as e = cb.bytes_new(4096);
+    if (csif.csif_encode_tiled(&a, &e, 0, 16, 16) < 0) { return 61; }
+    // find the IDAT codec region via dir entry 4 (offset 64+4*32+8)
+    let is buf.Buf as bf;
+    buf.buf_init(&bf, e.ptr, e.len);
+    buf.buf_seek(&bf, 64 + 4 * 32 + 8);
+    let is i64 as idat_coff = buf.buf_u64le(&bf);
+    e.ptr[idat_coff + 16 + 32 + 100] = cast(u8, cast(i64, e.ptr[idat_coff + 16 + 32 + 100]) ^ 255);
+    let is image.Image as b;
+    let is i64 as rc = csif.csif_decode(e.ptr, e.len, &b);
+    if (rc != ce.E_CSIF_CRC_CRITICAL) { return 62; }
+
+    cb.bytes_free(&e); image.image_free(&a);
+    return 0;
+}

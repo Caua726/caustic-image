@@ -39,7 +39,9 @@ ILIM resource limits, IHDR geometry, ICOL/CICP colour with "Unspecified" banned)
 | MODULAR (2) | lossless | subtract-green + MED predictor + rANS entropy |
 | DCT (3)     | lossy    | forward DCT + quantise + rANS |
 
-Decode is fail-loud: bad magic/CRC/geometry/colour/codec each return a distinct numbered error
+Tiled images (ICOD tile grid + TIDX per-tile index with CRC and byte ranges) decode each tile
+independently — the scalability substrate for partial/parallel decode. Decode is fail-loud: bad
+magic/CRC/geometry/colour/codec each return a distinct numbered error
 (exercised by a corruption corpus). rANS lives in `caustic-compact/entropy`.
 
 Every decoder validates dimensions in widened arithmetic **before allocating** (`image_check_dims`,

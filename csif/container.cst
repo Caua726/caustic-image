@@ -14,6 +14,7 @@
 //   csif_decode(src, len, out) -> 0, or negative E_CSIF_*.
 // =======================================================
 
+use "std/mem.cst" only bins, core as mem;
 use "../core/image.cst"  as image;
 use "../core/pixfmt.cst" as pixfmt;
 use "../core/buf.cst"    as buf;
@@ -103,7 +104,8 @@ fn _pl_icol(p as *cb.Bytes) as void {
     _w8(p, 1);       // v_subsample
 }
 
-fn _pl_icod(p as *cb.Bytes, codec_id as i64, ch as i64) as void {
+fn _pl_icod(p as *cb.Bytes, codec_id as i64, ch as i64,
+            tw as i64, th as i64, ntx as i64, nty as i64) as void {
     _w64(p, 0);      // item_id
     _w16(p, codec_id);
     _w16(p, 1);      // codec_version
@@ -113,8 +115,8 @@ fn _pl_icod(p as *cb.Bytes, codec_id as i64, ch as i64) as void {
     _w8(p, 0);       // color_transform NONE
     _w8(p, 0);       // supercompress_id
     _w8(p, 0);       // cross_tile_prediction
-    _w32(p, 0); _w32(p, 0);        // tile_w, tile_h (0 = full image)
-    _w32(p, 1); _w32(p, 1);        // n_tiles_x, n_tiles_y
+    _w32(p, tw); _w32(p, th);      // tile size (0 = full image)
+    _w32(p, ntx); _w32(p, nty);    // tile grid
     _w32(p, 1); _w32(p, 1);        // n_resolution_levels, n_quality_layers
     _w32(p, 0);                    // progression_order NONE
     let is i64 as em with mut = 3;         // entropy_method_id: raw
@@ -166,8 +168,24 @@ fn csif_encode(img as *image.Image, out as *cb.Bytes) as i64 {
     return csif_encode_ex(img, out, 0);
 }
 
-// Encode with an explicit codec: 0=RAW (any 8-bit), 1=QOI (RGB8/RGBA8 only).
+// Single-tile encode with an explicit codec (0=RAW, 1=QOI, 2=MODULAR, 3=DCT).
 fn csif_encode_ex(img as *image.Image, out as *cb.Bytes, codec_id as i64) as i64 {
+    return csif_encode_tiled(img, out, codec_id, 0, 0);
+}
+
+// Run one codec's encoder over a (tile) image, appending its bytes to `p`.
+fn _codec_encode(img as *image.Image, codec_id as i64, ch as i64, p as *cb.Bytes) as i64 {
+    if (codec_id == 1) { return qoi.qoi_tile_encode(img.pixels, img.width * img.height, ch, p); }
+    if (codec_id == 2) { return modular.modular_encode(img, p); }
+    if (codec_id == 3) { return dctc.dct_encode(img, p); }
+    return cb.bytes_append(p, img.pixels, img.stride * img.height);   // RAW
+}
+
+// Tiled encode: tw/th = tile size in pixels (0 = single whole-image tile).
+// Tiles are independently decodable (codec state resets per tile, §5.0.3);
+// a TIDX chunk records each tile's byte range + CRC when tiled.
+fn csif_encode_tiled(img as *image.Image, out as *cb.Bytes, codec_id as i64,
+                     tw_in as i64, th_in as i64) as i64 {
     let is [1]i64 as cmv;
     let is [1]i64 as chv;
     _fmt_axes(img.fmt, cast(*i64, &cmv), cast(*i64, &chv));
@@ -175,29 +193,123 @@ fn csif_encode_ex(img as *image.Image, out as *cb.Bytes, codec_id as i64) as i64
     let is i64 as ch = chv[0];
     if (ch == 0) { return ce.E_CSIF_UNSUPPORTED_SAMPLE; }
     if (codec_id == 1) { if (ch != 3) { if (ch != 4) { return ce.E_CSIF_UNSUPPORTED_SAMPLE; } } }
+    let is i64 as tw with mut = tw_in;
+    let is i64 as th with mut = th_in;
+    if (tw < 1) { tw = 0; th = 0; }
+    let is i64 as ntx with mut = 1;
+    let is i64 as nty with mut = 1;
+    if (tw > 0) {
+        ntx = (img.width + tw - 1) / tw;
+        nty = (img.height + th - 1) / th;
+    }
+    let is i64 as tiled with mut = 0;
+    if (ntx * nty > 1) { tiled = 1; }
 
-    // Build the six framed chunks.
+    let is i64 as ntiles = ntx * nty;
+    if (ntiles > 4096) { return ce.E_CSIF_LIMIT; }
+    let is i64 as nchunks with mut = 6;
+    if (tiled == 1) { nchunks = 7; }
+
+    // Build the framed chunks (ILIM IHDR ICOL ICOD IDAT [TIDX] IEND).
     let is cb.Bytes as p = cb.bytes_new(4096);
     let is cb.Bytes as c0 = cb.bytes_new(256);
     let is cb.Bytes as c1 = cb.bytes_new(128);
     let is cb.Bytes as c2 = cb.bytes_new(64);
     let is cb.Bytes as c3 = cb.bytes_new(128);
     let is cb.Bytes as c4 = cb.bytes_new(256);
+    let is cb.Bytes as ctx = cb.bytes_new(64);
     let is cb.Bytes as c5 = cb.bytes_new(64);
     cb.bytes_reset(&p); _pl_ilim(&p);          _emit_chunk(&c0, "ILIM", 11, p.ptr, p.len);
     cb.bytes_reset(&p); _pl_ihdr(&p, img, cm, ch); _emit_chunk(&c1, "IHDR", 19, p.ptr, p.len);
     cb.bytes_reset(&p); _pl_icol(&p);          _emit_chunk(&c2, "ICOL", 19, p.ptr, p.len);
-    cb.bytes_reset(&p); _pl_icod(&p, codec_id, ch); _emit_chunk(&c3, "ICOD", 19, p.ptr, p.len);
-    cb.bytes_reset(&p); _pl_idat(&p, img, codec_id, ch); _emit_chunk(&c4, "IDAT", 51, p.ptr, p.len);
+    cb.bytes_reset(&p); _pl_icod(&p, codec_id, ch, tw, th, ntx, nty); _emit_chunk(&c3, "ICOD", 19, p.ptr, p.len);
+
+    // IDAT payload: 32-byte head + tile streams (one stream when untiled).
+    let is *i64 as trel with mut = cast(*i64, 0);
+    let is *i64 as tsz with mut = cast(*i64, 0);
+    let is *i64 as tcrc with mut = cast(*i64, 0);
+    cb.bytes_reset(&p);
+    if (tiled == 0) {
+        _pl_idat(&p, img, codec_id, ch);
+    } else {
+        trel = cast(*i64, mem.core.mmap_anon(ntiles * 8));
+        tsz  = cast(*i64, mem.core.mmap_anon(ntiles * 8));
+        tcrc = cast(*i64, mem.core.mmap_anon(ntiles * 8));
+        if (cast(i64, tcrc) <= 0) { return ce.E_CSIF_LIMIT; }
+        _w64(&p, 0); _w32(&p, 0); _w32(&p, 0);
+        _w32(&p, 0); _w32(&p, 0); _w32(&p, 0); _w32(&p, 0);   // head (32B)
+        let is i64 as ti with mut = 0;
+        let is i64 as ty with mut = 0;
+        while (ty < nty) {
+            let is i64 as tx with mut = 0;
+            while (tx < ntx) {
+                let is i64 as tweff with mut = tw;
+                if (tx * tw + tweff > img.width) { tweff = img.width - tx * tw; }
+                let is i64 as theff with mut = th;
+                if (ty * th + theff > img.height) { theff = img.height - ty * th; }
+                let is image.Image as tile;
+                if (image.image_init(&tile, tweff, theff, img.fmt) < 0) { return ce.E_CSIF_LIMIT; }
+                let is i64 as r with mut = 0;
+                while (r < theff) {
+                    mem.core.memcpy(image.image_row(&tile, r),
+                        cast(*u8, cast(i64, img.pixels) + (ty * th + r) * img.stride + tx * tw * ch),
+                        tweff * ch);
+                    r = r + 1;
+                }
+                let is i64 as start = p.len;
+                _codec_encode(&tile, codec_id, ch, &p);
+                image.image_free(&tile);
+                trel[ti] = start - 32;
+                tsz[ti] = p.len - start;
+                tcrc[ti] = checksum.crc32(cast(*u8, cast(i64, p.ptr) + start), p.len - start);
+                ti = ti + 1;
+                tx = tx + 1;
+            }
+            ty = ty + 1;
+        }
+    }
+    _emit_chunk(&c4, "IDAT", 51, p.ptr, p.len);
     cb.bytes_reset(&p); _w64(&p, 0);           _emit_chunk(&c5, "IEND", 11, p.ptr, p.len);
 
     // Lay out offsets (8-byte aligned) after header + directory.
-    let is i64 as o0 = 64 + 6 * 32;
+    let is i64 as o0 = 64 + nchunks * 32;
     let is i64 as o1 = _align8(o0 + c0.len);
     let is i64 as o2 = _align8(o1 + c1.len);
     let is i64 as o3 = _align8(o2 + c2.len);
     let is i64 as o4 = _align8(o3 + c3.len);
-    let is i64 as o5 = _align8(o4 + c4.len);
+    let is i64 as o5 with mut = _align8(o4 + c4.len);
+    let is i64 as otx with mut = 0;
+    if (tiled == 1) {
+        // TIDX needs IDAT's absolute codec-bytes offset (chunk + 16B header + 32B head).
+        let is i64 as idat_abs = o4 + 16 + 32;
+        cb.bytes_reset(&p);
+        _w64(&p, 0);                 // item_id
+        _w32(&p, ntiles);            // entry_count
+        _w8(&p, 1); _wz(&p, 3);      // integrity_algo CRC32 + reserved
+        let is i64 as ti with mut = 0;
+        let is i64 as ty with mut = 0;
+        while (ty < nty) {
+            let is i64 as tx with mut = 0;
+            while (tx < ntx) {
+                let is i64 as tweff with mut = tw;
+                if (tx * tw + tweff > img.width) { tweff = img.width - tx * tw; }
+                let is i64 as theff with mut = th;
+                if (ty * th + theff > img.height) { theff = img.height - ty * th; }
+                _w32(&p, tx); _w32(&p, ty);
+                _w64(&p, idat_abs + trel[ti]);
+                _w64(&p, tsz[ti]);
+                _w64(&p, tweff * theff * ch);
+                _w32(&p, tcrc[ti]);
+                _w32(&p, 1);          // flags: independently decodable
+                ti = ti + 1;
+                tx = tx + 1;
+            }
+            ty = ty + 1;
+        }
+        _emit_chunk(&ctx, "TIDX", 27, p.ptr, p.len);
+        otx = o5;
+        o5 = _align8(otx + ctx.len);
+    }
     let is i64 as file_size = _align8(o5 + c5.len);
 
     // Header (64 bytes).
@@ -212,7 +324,7 @@ fn csif_encode_ex(img as *image.Image, out as *cb.Bytes, codec_id as i64) as i64
     _w8(out, 0);         // profile BASELINE
     _w8(out, 1);         // level
     _w16(out, 0);        // header_flags
-    _w32(out, 6);        // chunk_count
+    _w32(out, nchunks);  // chunk_count
     _w64(out, 64);       // directory_offset
     _w64(out, file_size);
     _w64(out, 0);        // primary_item_id
@@ -226,19 +338,35 @@ fn csif_encode_ex(img as *image.Image, out as *cb.Bytes, codec_id as i64) as i64
     _emit_dir(out, "ICOL", 19, o2, c2.len, 2);
     _emit_dir(out, "ICOD", 19, o3, c3.len, 3);
     _emit_dir(out, "IDAT", 51, o4, c4.len, 4);
-    _emit_dir(out, "IEND", 11, o5, c5.len, 5);
+    if (tiled == 1) {
+        _emit_dir(out, "TIDX", 27, otx, ctx.len, 5);
+        _emit_dir(out, "IEND", 11, o5, c5.len, 6);
+    } else {
+        _emit_dir(out, "IEND", 11, o5, c5.len, 5);
+    }
 
     // Chunks, each padded to the next 8-byte offset.
     cb.bytes_append(out, c0.ptr, c0.len); _wz(out, o1 - (o0 + c0.len));
     cb.bytes_append(out, c1.ptr, c1.len); _wz(out, o2 - (o1 + c1.len));
     cb.bytes_append(out, c2.ptr, c2.len); _wz(out, o3 - (o2 + c2.len));
     cb.bytes_append(out, c3.ptr, c3.len); _wz(out, o4 - (o3 + c3.len));
-    cb.bytes_append(out, c4.ptr, c4.len); _wz(out, o5 - (o4 + c4.len));
+    if (tiled == 1) {
+        cb.bytes_append(out, c4.ptr, c4.len); _wz(out, otx - (o4 + c4.len));
+        cb.bytes_append(out, ctx.ptr, ctx.len); _wz(out, o5 - (otx + ctx.len));
+    } else {
+        cb.bytes_append(out, c4.ptr, c4.len); _wz(out, o5 - (o4 + c4.len));
+    }
     cb.bytes_append(out, c5.ptr, c5.len); _wz(out, file_size - (o5 + c5.len));
 
+    if (tiled == 1) {
+        mem.core.munmap(cast(*u8, trel), ntiles * 8);
+        mem.core.munmap(cast(*u8, tsz), ntiles * 8);
+        mem.core.munmap(cast(*u8, tcrc), ntiles * 8);
+    }
     cb.bytes_free(&p);
     cb.bytes_free(&c0); cb.bytes_free(&c1); cb.bytes_free(&c2);
     cb.bytes_free(&c3); cb.bytes_free(&c4); cb.bytes_free(&c5);
+    cb.bytes_free(&ctx);
     return out.len;
 }
 
@@ -300,6 +428,7 @@ fn csif_decode(src as *u8, len as i64, out as *image.Image) as i64 {
     let is i64 as icod_off with mut = 0 - 1;
     let is i64 as idat_off with mut = 0 - 1;
     let is i64 as idat_plen with mut = 0;
+    let is i64 as tidx_off with mut = 0 - 1;
 
     let is i64 as di with mut = 0;
     while (di < chunk_count) {
@@ -342,12 +471,13 @@ fn csif_decode(src as *u8, len as i64, out as *image.Image) as i64 {
         else { if (_is(t0,t1,t2,t3, "ICOL") == 1) { icol_off = poff; }
         else { if (_is(t0,t1,t2,t3, "ICOD") == 1) { icod_off = poff; }
         else { if (_is(t0,t1,t2,t3, "IDAT") == 1) { idat_off = poff; idat_plen = plen; }
+        else { if (_is(t0,t1,t2,t3, "TIDX") == 1) { tidx_off = poff; }
         else { if (_is(t0,t1,t2,t3, "ILIM") == 1) { }
         else { if (_is(t0,t1,t2,t3, "IEND") == 1) { }
         else {
             // Unknown type: fail only if critical.
             if (critical == 1) { return ce.E_CSIF_UNKNOWN_CRITICAL; }
-        } } } } } }
+        } } } } } } }
         di = di + 1;
     }
 
@@ -384,12 +514,21 @@ fn csif_decode(src as *u8, len as i64, out as *image.Image) as i64 {
         if (color_model <= 3) { if (mtx != 0) { return ce.E_CSIF_COLOR_MATRIX_MISMATCH; } }
     }
 
-    // Parse ICOD: dispatch by codec_id (only RAW implemented).
+    // Parse ICOD: codec dispatch id + tile geometry.
     buf.buf_seek(&bf, icod_off);
     buf.buf_u64le(&bf);                       // item_id
     let is i64 as codec_id = buf.buf_u16le(&bf);
     if (codec_id != 0) { if (codec_id != 1) { if (codec_id != 2) { if (codec_id != 3) { return ce.E_CSIF_UNKNOWN_CODEC; } } } }
     if (codec_id == 1) { if (component_count != 3) { if (component_count != 4) { return ce.E_CSIF_UNSUPPORTED_SAMPLE; } } }
+    buf.buf_u16le(&bf);                       // codec_version
+    buf.buf_u8(&bf);                          // is_lossless
+    buf.buf_u8(&bf);                          // color_transform
+    buf.buf_u8(&bf);                          // supercompress_id
+    buf.buf_u8(&bf);                          // cross_tile_prediction
+    let is i64 as tw = buf.buf_u32le(&bf);
+    let is i64 as th = buf.buf_u32le(&bf);
+    let is i64 as ntx = buf.buf_u32le(&bf);
+    let is i64 as nty = buf.buf_u32le(&bf);
 
     // Resolve the pixel format from color_model + component_count.
     let is i64 as fmt with mut = 0;
@@ -401,6 +540,72 @@ fn csif_decode(src as *u8, len as i64, out as *image.Image) as i64 {
 
     let is i64 as dchk = image.image_check_dims(w, h, fmt);
     if (dchk < 0) { return ce.E_CSIF_DIMS; }
+
+    // ---- tiled path: decode each TIDX-addressed tile independently ----
+    if (ntx * nty > 1) {
+        if (tw < 1) { return ce.E_CSIF_GEOM; }
+        if (tidx_off < 0) { return ce.E_CSIF_ORDER; }
+        if (ntx != (w + tw - 1) / tw) { return ce.E_CSIF_GEOM; }
+        if (nty != (h + th - 1) / th) { return ce.E_CSIF_GEOM; }
+        let is i64 as rc0 = image.image_init(out, w, h, fmt);
+        if (rc0 < 0) { return rc0; }
+        buf.buf_seek(&bf, tidx_off);
+        buf.buf_u64le(&bf);                       // item_id
+        let is i64 as ecount = buf.buf_u32le(&bf);
+        let is i64 as ialgo = buf.buf_u8(&bf);
+        buf.buf_skip(&bf, 3);
+        if (ecount != ntx * nty) { image.image_free(out); return ce.E_CSIF_GEOM; }
+        let is i64 as ch = component_count;
+        let is i64 as tmpcap = tw * th * ch;
+        let is *u8 as tmp = mem.core.mmap_anon(tmpcap + 1);
+        if (cast(i64, tmp) <= 0) { image.image_free(out); return ce.E_CSIF_LIMIT; }
+        let is i64 as e with mut = 0;
+        while (e < ecount) {
+            let is i64 as tx = buf.buf_u32le(&bf);
+            let is i64 as ty = buf.buf_u32le(&bf);
+            let is i64 as toff = buf.buf_u64le(&bf);
+            let is i64 as tstored = buf.buf_u64le(&bf);
+            let is i64 as tunc = buf.buf_u64le(&bf);
+            let is i64 as tsum = buf.buf_u32le(&bf);
+            buf.buf_u32le(&bf);                   // flags
+            if (tx >= ntx) { image.image_free(out); return ce.E_CSIF_GEOM; }
+            if (ty >= nty) { image.image_free(out); return ce.E_CSIF_GEOM; }
+            // C-4: the tile's byte range must lie inside IDAT's codec region.
+            if (toff < idat_off + 32) { image.image_free(out); return ce.E_CSIF_RANGE; }
+            if (toff + tstored > idat_off + idat_plen) { image.image_free(out); return ce.E_CSIF_RANGE; }
+            let is *u8 as tb = cast(*u8, cast(i64, src) + toff);
+            if (ialgo == 1) {
+                if (checksum.crc32(tb, tstored) != tsum) { image.image_free(out); return ce.E_CSIF_CRC_CRITICAL; }
+            }
+            let is i64 as tweff with mut = tw;
+            if (tx * tw + tweff > w) { tweff = w - tx * tw; }
+            let is i64 as theff with mut = th;
+            if (ty * th + theff > h) { theff = h - ty * th; }
+            if (tunc != tweff * theff * ch) { image.image_free(out); return ce.E_CSIF_GEOM; }
+            let is i64 as trc with mut = 0;
+            if (codec_id == 0) {
+                if (tstored != tunc) { trc = 0 - 1; }
+                else { mem.core.memcpy(tmp, tb, tunc); }
+            } else {
+                if (codec_id == 1) { trc = qoi.qoi_tile_decode(tb, tstored, tweff * theff, ch, tmp); }
+                else { if (codec_id == 2) { trc = modular.modular_decode(tb, tstored, tweff, theff, ch, tmp); }
+                else { trc = dctc.dct_decode(tb, tstored, tweff, theff, ch, tmp); } }
+            }
+            if (trc < 0) { image.image_free(out); return ce.E_CSIF_PAYLOAD_TRUNC; }
+            // blit into the canvas
+            let is i64 as r with mut = 0;
+            while (r < theff) {
+                mem.core.memcpy(
+                    cast(*u8, cast(i64, out.pixels) + (ty * th + r) * out.stride + tx * tw * ch),
+                    cast(*u8, cast(i64, tmp) + r * tweff * ch),
+                    tweff * ch);
+                r = r + 1;
+            }
+            e = e + 1;
+        }
+        mem.core.munmap(tmp, tmpcap + 1);
+        return 0;
+    }
 
     // Codec bytes begin after IDAT's 32-byte head.
     let is i64 as codlen = idat_plen - 32;

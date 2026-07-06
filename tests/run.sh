@@ -49,6 +49,7 @@ run_case test_qoi_rt         tests/test_qoi_rt.cst
 run_case test_encode_rt      tests/test_encode_rt.cst
 run_case test_csif_rt        tests/test_csif_rt.cst
 run_case test_csif_corrupt   tests/test_csif_corrupt.cst
+run_case test_csif_tiled     tests/test_csif_tiled.cst
 run_case test_rans           tests/test_rans.cst
 run_case test_dispatch       tests/test_dispatch.cst
 run_case test_dct            tests/test_dct.cst
