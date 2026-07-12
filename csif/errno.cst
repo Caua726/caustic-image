@@ -40,3 +40,9 @@ let is i64 as E_CSIF_UNSUPPORTED_SAMPLE with imut = 0 - 40;
 let is i64 as E_CSIF_BAD_PARAMS         with imut = 0 - 41;
 let is i64 as E_CSIF_PAYLOAD_OVERRUN    with imut = 0 - 42;
 let is i64 as E_CSIF_PAYLOAD_TRUNC      with imut = 0 - 43;
+
+// ---- animation (§1.19 / §9.5) ----
+let is i64 as E_CSIF_TICKBASE          with imut = 0 - 44;   // IANI timescale/den = 0
+let is i64 as E_CSIF_NOT_ANIMATED      with imut = 0 - 45;   // HAS_ANIMATION not set
+let is i64 as E_CSIF_ANIM_UNSUPPORTED  with imut = 0 - 46;   // declared but unimplemented
+                                                             // (sub-rect frames, ADD/MUL blend)

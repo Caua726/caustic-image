@@ -44,6 +44,39 @@ fn _emit_chunk(c as *cb.Bytes, typ as *u8, flags as i64, payload as *u8, plen as
     _w32(c, crc);
 }
 
+// Frame one chunk into a growing staging buffer; returns its start offset.
+// (Unlike _emit_chunk, the CRC covers only this chunk's own bytes.)
+fn _emit_chunk_into(s as *cb.Bytes, typ as *u8, flags as i64, payload as *u8, plen as i64) as i64 {
+    let is i64 as start = s.len;
+    cb.bytes_push(s, typ[0]); cb.bytes_push(s, typ[1]); cb.bytes_push(s, typ[2]); cb.bytes_push(s, typ[3]);
+    _w32(s, flags);
+    _w64(s, plen);
+    cb.bytes_append(s, payload, plen);
+    let is i64 as crc = checksum.crc32(cast(*u8, cast(i64, s.ptr) + start), s.len - start);
+    _w32(s, crc);
+    return start;
+}
+
+// Run one codec's decoder over a coded unit into `dst`.
+fn _codec_decode(codbytes as *u8, codlen as i64, w as i64, h as i64, ch as i64,
+                 bps as i64, codec_id as i64, dst as *u8) as i64 {
+    if (codec_id == 0) {
+        if (codlen != w * h * ch * bps) { return ce.E_CSIF_PAYLOAD_TRUNC; }
+        mem.core.memcpy(dst, codbytes, codlen);
+        return 0;
+    }
+    if (codec_id == 1) {
+        if (qoi.qoi_tile_decode(codbytes, codlen, w * h, ch, dst) < 0) { return ce.E_CSIF_PAYLOAD_TRUNC; }
+        return 0;
+    }
+    if (codec_id == 2) {
+        if (modular.modular_decode(codbytes, codlen, w, h, ch, bps, dst) < 0) { return ce.E_CSIF_PAYLOAD_TRUNC; }
+        return 0;
+    }
+    if (dctc.dct_decode(codbytes, codlen, w, h, ch, dst) < 0) { return ce.E_CSIF_PAYLOAD_TRUNC; }
+    return 0;
+}
+
 // Map Image format to (color_model, channels), or channels=0 if unsupported.
 fn _fmt_axes(fmt as i64, cm as *i64, ch as *i64) as void {
     cm[0] = 0; ch[0] = 0;
@@ -479,7 +512,11 @@ fn csif_decode(src as *u8, len as i64, out as *image.Image) as i64 {
         if (_is(t0,t1,t2,t3, "IHDR") == 1) { ihdr_off = poff; }
         else { if (_is(t0,t1,t2,t3, "ICOL") == 1) { icol_off = poff; }
         else { if (_is(t0,t1,t2,t3, "ICOD") == 1) { icod_off = poff; }
-        else { if (_is(t0,t1,t2,t3, "IDAT") == 1) { idat_off = poff; idat_plen = plen; }
+        // First IDAT wins: in an animated file that is the primary item (frame 0),
+        // so a still-only reader renders the canonical default rendition (§9.5.4).
+        else { if (_is(t0,t1,t2,t3, "IDAT") == 1) {
+            if (idat_off < 0) { idat_off = poff; idat_plen = plen; }
+        }
         else { if (_is(t0,t1,t2,t3, "TIDX") == 1) { tidx_off = poff; }
         else { if (_is(t0,t1,t2,t3, "ILIM") == 1) { }
         else { if (_is(t0,t1,t2,t3, "IEND") == 1) { }
@@ -656,5 +693,371 @@ fn csif_decode(src as *u8, len as i64, out as *image.Image) as i64 {
             }
         }
     }
+    return 0;
+}
+
+// ============================ animation ====================================
+// CSIF native animation (spec §1.19 / §9.5): an IANI header declares the
+// timeline (frame count, loop, explicit timebase, canvas, background, bounded
+// reference slots) and one IFRM chunk carries the frame_count-long array of
+// per-frame control records — duration, crop rect, and the *closed enums*
+// blend_op {SOURCE, OVER, ADD, MUL} and dispose_op {NONE, BACKGROUND,
+// PREVIOUS}. Each frame's pixels are a separate coded item (its own IDAT), so
+// every frame is directly addressable.
+//
+// Honest scope: all frames are keyframes (the codecs are intra-only) and are
+// emitted full-canvas; the decoder supports SOURCE/OVER blending and all three
+// disposals. Inter-frame prediction and sub-rect frames are sequenced later —
+// a cropped frame needs a per-item IHDR, which is the multi-item (ITBL) path.
+//
+//   csif_encode_anim(anim, out, codec_id) -> 0, or negative.
+//   csif_decode_anim(src, len, out)       -> 0, or negative.
+// A still-only reader (csif_decode) renders the primary item = frame 0.
+
+struct CsifAnim {
+    width as i64;
+    height as i64;
+    count as i64;      // frames
+    frames as i64;     // address of count * (width*height*4) RGBA8 bytes
+    delays as i64;     // address of count i64 durations in milliseconds
+}
+
+fn csif_anim_frame(a as *CsifAnim, i as i64) as *u8 {
+    return cast(*u8, a.frames + i * a.width * a.height * 4);
+}
+fn csif_anim_free(a as *CsifAnim) as void {
+    let is i64 as fsize = a.width * a.height * 4;
+    if (a.frames > 0) { mem.core.munmap(cast(*u8, a.frames), a.count * fsize); }
+    if (a.delays > 0) { mem.core.munmap(cast(*u8, a.delays), a.count * 8); }
+    a.frames = 0; a.delays = 0; a.count = 0;
+}
+
+fn _pl_iani(p as *cb.Bytes, nf as i64, w as i64, h as i64) as void {
+    _w32(p, nf);        // frame_count
+    _w32(p, 0);         // loop_count (0 = INFINITE, a declared sentinel)
+    _w32(p, 1000);      // timescale_hz — explicit timebase (ms), never implied
+    _w32(p, 1);         // n_reference_slots (bounded playback memory)
+    _w32(p, 1);         // max_snapshot_depth (PREVIOUS disposal bound)
+    _w32(p, w);         // canvas_w
+    _w32(p, h);         // canvas_h
+    _w32(p, 0);         // background_rgba (transparent)
+}
+
+// One 56-byte IFRM record.
+fn _pl_ifrm_rec(p as *cb.Bytes, idx as i64, dur_ms as i64, w as i64, h as i64) as void {
+    _w32(p, idx);       // frame_index
+    _w64(p, idx);       // item_id (this frame's coded item)
+    _w32(p, dur_ms);    // duration_ticks numerator (ticks at timescale_hz)
+    _w32(p, 1);         // duration denominator
+    _w32(p, 0); _w32(p, 0); _w32(p, w); _w32(p, h);   // crop rect (full canvas)
+    _w32(p, 0);         // blend_op SOURCE
+    _w32(p, 0);         // dispose_op NONE
+    _w32(p, 1);         // is_keyframe (codecs are intra-only)
+    _w32(p, 4294967295); // reference_slot = none
+    _w32(p, 0);         // save_as_reference
+}
+
+fn _tstr(i as i64) as *u8 {
+    if (i == 0) { return "ILIM"; }
+    if (i == 1) { return "IHDR"; }
+    if (i == 2) { return "ICOL"; }
+    if (i == 3) { return "ICOD"; }
+    if (i == 4) { return "IANI"; }
+    if (i == 5) { return "IFRM"; }
+    if (i == 6) { return "IDAT"; }
+    return "IEND";
+}
+
+fn csif_encode_anim(anim as *CsifAnim, out as *cb.Bytes, codec_id as i64) as i64 {
+    let is i64 as w = anim.width;
+    let is i64 as h = anim.height;
+    let is i64 as nf = anim.count;
+    if (nf < 1) { return ce.E_CSIF_GEOM; }
+    if (nf > 65536) { return ce.E_CSIF_LIMIT; }
+    if (image.image_check_dims(w, h, pixfmt.FMT_RGBA8) < 0) { return ce.E_CSIF_DIMS; }
+    if (codec_id == 3) { return ce.E_CSIF_UNSUPPORTED_SAMPLE; }   // lossy frames: later
+    let is i64 as ch = 4;
+    let is i64 as fsize = w * h * 4;
+
+    // ILIM IHDR ICOL ICOD IANI IFRM IDAT×nf IEND
+    let is i64 as nchunks = 7 + nf;
+    let is cb.Bytes as stage = cb.bytes_new(nf * fsize / 2 + 4096);
+    let is *i64 as ctyp = cast(*i64, mem.core.mmap_anon(nchunks * 8));
+    let is *i64 as cflg = cast(*i64, mem.core.mmap_anon(nchunks * 8));
+    let is *i64 as cst  = cast(*i64, mem.core.mmap_anon(nchunks * 8));
+    let is *i64 as clen = cast(*i64, mem.core.mmap_anon(nchunks * 8));
+    if (cast(i64, clen) <= 0) { return ce.E_CSIF_LIMIT; }
+    let is cb.Bytes as p = cb.bytes_new(4096);
+    let is i64 as ci with mut = 0;
+
+    // A canvas proxy for the geometry payloads.
+    let is image.Image as canvas;
+    canvas.pixels = cast(*u8, anim.frames);
+    canvas.width = w; canvas.height = h; canvas.stride = w * 4;
+    canvas.fmt = pixfmt.FMT_RGBA8; canvas.owned = 0;
+
+    cb.bytes_reset(&p); _pl_ilim(&p);
+    ctyp[ci] = 0; cflg[ci] = 11; cst[ci] = _emit_chunk_into(&stage, _tstr(0), 11, p.ptr, p.len);
+    clen[ci] = stage.len - cst[ci]; ci = ci + 1;
+
+    cb.bytes_reset(&p); _pl_ihdr(&p, &canvas, 3, ch);
+    ctyp[ci] = 1; cflg[ci] = 19; cst[ci] = _emit_chunk_into(&stage, _tstr(1), 19, p.ptr, p.len);
+    clen[ci] = stage.len - cst[ci]; ci = ci + 1;
+
+    cb.bytes_reset(&p); _pl_icol(&p);
+    ctyp[ci] = 2; cflg[ci] = 19; cst[ci] = _emit_chunk_into(&stage, _tstr(2), 19, p.ptr, p.len);
+    clen[ci] = stage.len - cst[ci]; ci = ci + 1;
+
+    cb.bytes_reset(&p); _pl_icod(&p, codec_id, ch, 0, 0, 1, 1);
+    ctyp[ci] = 3; cflg[ci] = 19; cst[ci] = _emit_chunk_into(&stage, _tstr(3), 19, p.ptr, p.len);
+    clen[ci] = stage.len - cst[ci]; ci = ci + 1;
+
+    // IANI + IFRM are non-critical (a still reader skips them, §9.5.4).
+    cb.bytes_reset(&p); _pl_iani(&p, nf, w, h);
+    ctyp[ci] = 4; cflg[ci] = 10; cst[ci] = _emit_chunk_into(&stage, _tstr(4), 10, p.ptr, p.len);
+    clen[ci] = stage.len - cst[ci]; ci = ci + 1;
+
+    cb.bytes_reset(&p);
+    let is *i64 as dl = cast(*i64, anim.delays);
+    let is i64 as f with mut = 0;
+    while (f < nf) {
+        let is i64 as dur with mut = 100;
+        if (anim.delays > 0) { dur = dl[f]; }
+        _pl_ifrm_rec(&p, f, dur, w, h);
+        f = f + 1;
+    }
+    ctyp[ci] = 5; cflg[ci] = 10; cst[ci] = _emit_chunk_into(&stage, _tstr(5), 10, p.ptr, p.len);
+    clen[ci] = stage.len - cst[ci]; ci = ci + 1;
+
+    // One IDAT per frame (item_id = frame index).
+    f = 0;
+    while (f < nf) {
+        cb.bytes_reset(&p);
+        _w64(&p, f);                                   // item_id
+        _w32(&p, 0); _w32(&p, 0);                      // idat_index, coord_kind WHOLE
+        _w32(&p, 0); _w32(&p, 0); _w32(&p, 0); _w32(&p, 0);   // coords
+        let is image.Image as fimg;
+        fimg.pixels = csif_anim_frame(anim, f);
+        fimg.width = w; fimg.height = h; fimg.stride = w * 4;
+        fimg.fmt = pixfmt.FMT_RGBA8; fimg.owned = 0;
+        _codec_encode(&fimg, codec_id, ch, &p);
+        ctyp[ci] = 6; cflg[ci] = 51; cst[ci] = _emit_chunk_into(&stage, _tstr(6), 51, p.ptr, p.len);
+        clen[ci] = stage.len - cst[ci]; ci = ci + 1;
+        f = f + 1;
+    }
+
+    cb.bytes_reset(&p); _w64(&p, 0);
+    ctyp[ci] = 7; cflg[ci] = 11; cst[ci] = _emit_chunk_into(&stage, _tstr(7), 11, p.ptr, p.len);
+    clen[ci] = stage.len - cst[ci]; ci = ci + 1;
+
+    // Lay out final offsets (8-byte aligned) after header + directory.
+    let is *i64 as coff = cast(*i64, mem.core.mmap_anon(nchunks * 8));
+    if (cast(i64, coff) <= 0) { return ce.E_CSIF_LIMIT; }
+    let is i64 as cur with mut = 64 + nchunks * 32;
+    let is i64 as i with mut = 0;
+    while (i < nchunks) {
+        coff[i] = cur;
+        cur = _align8(cur + clen[i]);
+        i = i + 1;
+    }
+    let is i64 as file_size = cur;
+
+    // Header (64 bytes) — header_flags bit2 = HAS_ANIMATION.
+    cb.bytes_push(out, cast(u8, 67)); cb.bytes_push(out, cast(u8, 83));
+    cb.bytes_push(out, cast(u8, 73)); cb.bytes_push(out, cast(u8, 70));   // "CSIF"
+    _w8(out, 137); _w8(out, 13); _w8(out, 10); _w8(out, 26); _w8(out, 10); _w8(out, 0);
+    _w16(out, 1); _w8(out, 0); _w8(out, 1); _w8(out, 0); _w8(out, 1); _w8(out, 0); _w8(out, 1);
+    _w16(out, 4);                 // header_flags: HAS_ANIMATION
+    _w32(out, nchunks);
+    _w64(out, 64);                // directory_offset
+    _w64(out, file_size);
+    _w64(out, 0);                 // primary_item_id = frame 0
+    _w64(out, 0);                 // directory_offset_tail
+    let is i64 as hcrc = checksum.crc32(out.ptr, 56);
+    _w64(out, hcrc);
+
+    // Directory.
+    i = 0;
+    while (i < nchunks) {
+        _emit_dir(out, _tstr(ctyp[i]), cflg[i], coff[i], clen[i], i);
+        i = i + 1;
+    }
+    // Chunks, each padded to its successor's 8-aligned offset.
+    i = 0;
+    while (i < nchunks) {
+        cb.bytes_append(out, cast(*u8, cast(i64, stage.ptr) + cst[i]), clen[i]);
+        let is i64 as nxt with mut = file_size;
+        if (i + 1 < nchunks) { nxt = coff[i + 1]; }
+        _wz(out, nxt - (coff[i] + clen[i]));
+        i = i + 1;
+    }
+
+    cb.bytes_free(&p); cb.bytes_free(&stage);
+    mem.core.munmap(cast(*u8, ctyp), nchunks * 8);
+    mem.core.munmap(cast(*u8, cflg), nchunks * 8);
+    mem.core.munmap(cast(*u8, cst), nchunks * 8);
+    mem.core.munmap(cast(*u8, clen), nchunks * 8);
+    mem.core.munmap(cast(*u8, coff), nchunks * 8);
+    return out.len;
+}
+
+fn _rd32(p as *u8, o as i64) as i64 {
+    return cast(i64, p[o]) | (cast(i64, p[o + 1]) << 8)
+        | (cast(i64, p[o + 2]) << 16) | (cast(i64, p[o + 3]) << 24);
+}
+
+fn csif_decode_anim(src as *u8, src_len as i64, out as *CsifAnim) as i64 {
+    let is buf.Buf as bf;
+    buf.buf_init(&bf, src, src_len);
+    if (src_len < 64) { return ce.E_CSIF_TOO_SMALL; }
+    if (cast(i64, src[0]) != 67) { return ce.E_CSIF_MAGIC; }
+    if (cast(i64, src[1]) != 83) { return ce.E_CSIF_MAGIC; }
+    if (cast(i64, src[2]) != 73) { return ce.E_CSIF_MAGIC; }
+    if (cast(i64, src[3]) != 70) { return ce.E_CSIF_MAGIC; }
+    let is i64 as hflags = cast(i64, src[18]) | (cast(i64, src[19]) << 8);
+    if ((hflags & 4) == 0) { return ce.E_CSIF_NOT_ANIMATED; }
+    let is i64 as chunk_count = _rd32(src, 20);
+    let is i64 as dir_off = _rd32(src, 24);
+    if (dir_off + chunk_count * 32 > src_len) { return ce.E_CSIF_DIR_RANGE; }
+    if (checksum.crc32(src, 56) != _rd32(src, 56)) { return ce.E_CSIF_HEADER_CRC; }
+
+    let is i64 as ihdr_off with mut = 0 - 1;
+    let is i64 as icod_off with mut = 0 - 1;
+    let is i64 as iani_off with mut = 0 - 1;
+    let is i64 as ifrm_off with mut = 0 - 1;
+    let is i64 as ifrm_len with mut = 0;
+    let is i64 as nidat with mut = 0;
+    let is *i64 as idoff = cast(*i64, mem.core.mmap_anon(chunk_count * 8 + 8));
+    let is *i64 as idlen = cast(*i64, mem.core.mmap_anon(chunk_count * 8 + 8));
+    if (cast(i64, idlen) <= 0) { return ce.E_CSIF_LIMIT; }
+
+    let is i64 as di with mut = 0;
+    while (di < chunk_count) {
+        buf.buf_seek(&bf, dir_off + di * 32);
+        let is i64 as t0 = buf.buf_u8(&bf); let is i64 as t1 = buf.buf_u8(&bf);
+        let is i64 as t2 = buf.buf_u8(&bf); let is i64 as t3 = buf.buf_u8(&bf);
+        let is i64 as dflags = buf.buf_u32le(&bf);
+        let is i64 as coff = buf.buf_u64le(&bf);
+        let is i64 as clen = buf.buf_u64le(&bf);
+        if (coff < 64) { return ce.E_CSIF_RANGE; }
+        if (coff + clen > src_len) { return ce.E_CSIF_RANGE; }
+        let is i64 as plen = cast(i64, src[coff + 8]) | (cast(i64, src[coff + 9]) << 8)
+            | (cast(i64, src[coff + 10]) << 16) | (cast(i64, src[coff + 11]) << 24);
+        let is i64 as critical = dflags & 1;
+        let is i64 as calc = checksum.crc32(cast(*u8, cast(i64, src) + coff), 16 + plen);
+        let is i64 as stored = _rd32(src, coff + 16 + plen);
+        if (calc != stored) { if (critical == 1) { return ce.E_CSIF_CRC_CRITICAL; } }
+        let is i64 as poff = coff + 16;
+        if (_is(t0,t1,t2,t3, "IHDR") == 1) { ihdr_off = poff; }
+        if (_is(t0,t1,t2,t3, "ICOD") == 1) { icod_off = poff; }
+        if (_is(t0,t1,t2,t3, "IANI") == 1) { iani_off = poff; }
+        if (_is(t0,t1,t2,t3, "IFRM") == 1) { ifrm_off = poff; ifrm_len = plen; }
+        if (_is(t0,t1,t2,t3, "IDAT") == 1) {
+            idoff[nidat] = poff; idlen[nidat] = plen; nidat = nidat + 1;
+        }
+        di = di + 1;
+    }
+    if (iani_off < 0) { return ce.E_CSIF_ORDER; }
+    if (ifrm_off < 0) { return ce.E_CSIF_ORDER; }
+    if (ihdr_off < 0) { return ce.E_CSIF_ORDER; }
+    if (icod_off < 0) { return ce.E_CSIF_ORDER; }
+
+    // IANI
+    let is i64 as nf = _rd32(src, iani_off);
+    let is i64 as timescale = _rd32(src, iani_off + 8);
+    let is i64 as w = _rd32(src, iani_off + 20);
+    let is i64 as h = _rd32(src, iani_off + 24);
+    if (timescale < 1) { return ce.E_CSIF_TICKBASE; }
+    if (nf < 1) { return ce.E_CSIF_GEOM; }
+    if (nf != nidat) { return ce.E_CSIF_GEOM; }
+    if (ifrm_len != nf * 56) { return ce.E_CSIF_GEOM; }
+    if (image.image_check_dims(w, h, pixfmt.FMT_RGBA8) < 0) { return ce.E_CSIF_DIMS; }
+
+    // ICOD: codec + component count from IHDR
+    let is i64 as codec_id = cast(i64, src[icod_off + 8]) | (cast(i64, src[icod_off + 9]) << 8);
+    if (codec_id > 3) { return ce.E_CSIF_UNKNOWN_CODEC; }
+    // IHDR payload: item_id(8) w(4) h(4) depth(4) sample_format(1) endian(1)
+    // bit_depth(1) layout(1) color_model(1) component_count(1) ...
+    let is i64 as bit_depth = cast(i64, src[ihdr_off + 22]);
+    let is i64 as ch = cast(i64, src[ihdr_off + 25]);
+    if (ch != 4) { return ce.E_CSIF_UNSUPPORTED_SAMPLE; }     // animation canvas is RGBA8
+    if (bit_depth != 8) { return ce.E_CSIF_UNSUPPORTED_SAMPLE; }
+
+    let is i64 as fsize = w * h * 4;
+    let is *u8 as frames = mem.core.mmap_anon(nf * fsize);
+    let is *i64 as delays = cast(*i64, mem.core.mmap_anon(nf * 8));
+    let is *u8 as canvas = mem.core.mmap_anon(fsize);
+    let is *u8 as saved = mem.core.mmap_anon(fsize);
+    let is *u8 as tmp = mem.core.mmap_anon(fsize);
+    if (cast(i64, tmp) <= 0) { return ce.E_CSIF_LIMIT; }
+    mem.core.memset(canvas, cast(i32, 0), fsize);
+
+    let is i64 as f with mut = 0;
+    while (f < nf) {
+        let is i64 as ro = ifrm_off + f * 56;
+        let is i64 as dur_num = _rd32(src, ro + 12);
+        let is i64 as dur_den with mut = _rd32(src, ro + 16);
+        if (dur_den < 1) { dur_den = 1; }
+        let is i64 as cx = _rd32(src, ro + 20);
+        let is i64 as cy = _rd32(src, ro + 24);
+        let is i64 as cw = _rd32(src, ro + 28);
+        let is i64 as chh = _rd32(src, ro + 32);
+        let is i64 as blend = _rd32(src, ro + 36);
+        let is i64 as dispose = _rd32(src, ro + 40);
+        if (blend > 1) { return ce.E_CSIF_ANIM_UNSUPPORTED; }   // SOURCE / OVER only
+        if (dispose > 2) { return ce.E_CSIF_ENUM; }
+        if (cx != 0) { return ce.E_CSIF_ANIM_UNSUPPORTED; }     // sub-rect frames: later
+        if (cy != 0) { return ce.E_CSIF_ANIM_UNSUPPORTED; }
+        if (cw != w) { return ce.E_CSIF_ANIM_UNSUPPORTED; }
+        if (chh != h) { return ce.E_CSIF_ANIM_UNSUPPORTED; }
+        delays[f] = dur_num * 1000 / (timescale * dur_den);   // -> milliseconds
+
+        // The frame's coded item is the f-th IDAT (item_id ascending).
+        let is *u8 as cod = cast(*u8, cast(i64, src) + idoff[f] + 32);
+        let is i64 as codlen = idlen[f] - 32;
+        let is i64 as drc = _codec_decode(cod, codlen, w, h, 4, 1, codec_id, tmp);
+        if (drc < 0) { return drc; }
+
+        if (dispose == 2) { mem.core.memcpy(saved, canvas, fsize); }
+        // composite
+        let is i64 as p with mut = 0;
+        while (p < w * h) {
+            let is i64 as o = p * 4;
+            if (blend == 0) {
+                canvas[o] = tmp[o]; canvas[o+1] = tmp[o+1];
+                canvas[o+2] = tmp[o+2]; canvas[o+3] = tmp[o+3];
+            } else {
+                let is i64 as sa = cast(i64, tmp[o + 3]);
+                let is i64 as da = cast(i64, canvas[o + 3]);
+                let is i64 as oa = sa + da * (255 - sa) / 255;
+                if (oa == 0) {
+                    canvas[o]=cast(u8,0); canvas[o+1]=cast(u8,0);
+                    canvas[o+2]=cast(u8,0); canvas[o+3]=cast(u8,0);
+                } else {
+                    let is i64 as c2 with mut = 0;
+                    while (c2 < 3) {
+                        let is i64 as sc = cast(i64, tmp[o + c2]);
+                        let is i64 as dc = cast(i64, canvas[o + c2]);
+                        canvas[o + c2] = cast(u8, (sc * sa + dc * da * (255 - sa) / 255) / oa);
+                        c2 = c2 + 1;
+                    }
+                    canvas[o + 3] = cast(u8, oa);
+                }
+            }
+            p = p + 1;
+        }
+        mem.core.memcpy(cast(*u8, cast(i64, frames) + f * fsize), canvas, fsize);
+        if (dispose == 1) { mem.core.memset(canvas, cast(i32, 0), fsize); }
+        if (dispose == 2) { mem.core.memcpy(canvas, saved, fsize); }
+        f = f + 1;
+    }
+
+    mem.core.munmap(canvas, fsize);
+    mem.core.munmap(saved, fsize);
+    mem.core.munmap(tmp, fsize);
+    mem.core.munmap(cast(*u8, idoff), chunk_count * 8 + 8);
+    mem.core.munmap(cast(*u8, idlen), chunk_count * 8 + 8);
+    out.width = w; out.height = h; out.count = nf;
+    out.frames = cast(i64, frames); out.delays = cast(i64, delays);
     return 0;
 }

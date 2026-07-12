@@ -1,0 +1,89 @@
+// test_csif_anim — CSIF native animation (IANI timeline + IFRM control array +
+// one coded item per frame). Frames round-trip bit-exact through MODULAR, QOI
+// and RAW; milliseconds survive the explicit tick base; and a *still* reader
+// (csif_decode) renders the primary item — frame 0 — from the animated file.
+use "std/mem.cst" only bins, core as mem;
+use "../core/image.cst"  as image;
+use "../core/pixfmt.cst" as pixfmt;
+use "../csif/container.cst" as csif;
+use "../csif/errno.cst"     as ce;
+use "caustic-compact/core/bytes.cst" as cb;
+
+fn build(a as *csif.CsifAnim, w as i64, h as i64, nf as i64) as i64 {
+    a.width = w; a.height = h; a.count = nf;
+    a.frames = cast(i64, mem.core.mmap_anon(nf * w * h * 4));
+    a.delays = cast(i64, mem.core.mmap_anon(nf * 8));
+    if (a.delays == 0) { return 1; }
+    let is *i64 as dl = cast(*i64, a.delays);
+    let is i64 as f with mut = 0;
+    while (f < nf) {
+        dl[f] = 40 + f * 10;                       // distinct durations (ms)
+        let is *u8 as fp = csif.csif_anim_frame(a, f);
+        let is i64 as p with mut = 0;
+        while (p < w * h) {
+            let is i64 as x = p % w;
+            let is i64 as y = p / w;
+            fp[p * 4]     = cast(u8, (30 + x * 5 + f * 40) & 255);
+            fp[p * 4 + 1] = cast(u8, (20 + y * 7) & 255);
+            fp[p * 4 + 2] = cast(u8, (f * 60 + x) & 255);
+            fp[p * 4 + 3] = cast(u8, 255);
+            p = p + 1;
+        }
+        f = f + 1;
+    }
+    return 0;
+}
+
+fn rt(w as i64, h as i64, nf as i64, codec as i64) as i64 {
+    let is csif.CsifAnim as a;
+    if (build(&a, w, h, nf) != 0) { return 1; }
+    let is cb.Bytes as e = cb.bytes_new(4096);
+    if (csif.csif_encode_anim(&a, &e, codec) < 0) { return 2; }
+    let is csif.CsifAnim as b;
+    if (csif.csif_decode_anim(e.ptr, e.len, &b) != 0) { return 3; }
+    if (b.count != nf) { return 4; }
+    if (b.width != w) { return 5; }
+    let is *u8 as pa = cast(*u8, a.frames);
+    let is *u8 as pb = cast(*u8, b.frames);
+    let is i64 as i with mut = 0;
+    while (i < nf * w * h * 4) { if (pa[i] != pb[i]) { return 6; } i = i + 1; }
+    let is *i64 as da = cast(*i64, a.delays);
+    let is *i64 as db = cast(*i64, b.delays);
+    i = 0;
+    while (i < nf) { if (da[i] != db[i]) { return 7; } i = i + 1; }
+    cb.bytes_free(&e);
+    csif.csif_anim_free(&a); csif.csif_anim_free(&b);
+    return 0;
+}
+
+fn main() as i64 {
+    if (rt(20, 14, 4, 2) != 0) { return 10; }    // MODULAR
+    if (rt(20, 14, 3, 1) != 0) { return 20; }    // QOI
+    if (rt(20, 14, 2, 0) != 0) { return 30; }    // RAW
+    if (rt(9, 7, 1, 2)   != 0) { return 40; }    // single frame
+
+    // A still reader must render frame 0 of the animated file.
+    let is csif.CsifAnim as a;
+    if (build(&a, 20, 14, 3) != 0) { return 50; }
+    let is cb.Bytes as e = cb.bytes_new(4096);
+    if (csif.csif_encode_anim(&a, &e, 2) < 0) { return 51; }
+    let is image.Image as still;
+    if (csif.csif_decode(e.ptr, e.len, &still) != 0) { return 52; }
+    if (still.width != 20) { return 53; }
+    if (still.fmt != pixfmt.FMT_RGBA8) { return 54; }
+    let is *u8 as f0 = csif.csif_anim_frame(&a, 0);
+    let is i64 as i with mut = 0;
+    while (i < 20 * 14 * 4) { if (still.pixels[i] != f0[i]) { return 55; } i = i + 1; }
+
+    // A non-animated file must be rejected by the animation reader, loudly.
+    let is image.Image as one;
+    if (image.image_init(&one, 8, 8, pixfmt.FMT_RGB8) != 0) { return 60; }
+    let is cb.Bytes as se = cb.bytes_new(1024);
+    csif.csif_encode_ex(&one, &se, 2);
+    let is csif.CsifAnim as bad;
+    if (csif.csif_decode_anim(se.ptr, se.len, &bad) != ce.E_CSIF_NOT_ANIMATED) { return 61; }
+
+    cb.bytes_free(&e); cb.bytes_free(&se);
+    csif.csif_anim_free(&a); image.image_free(&still); image.image_free(&one);
+    return 0;
+}

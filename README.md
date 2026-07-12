@@ -26,7 +26,7 @@ both by an internal round-trip and by decoding its output in the reference libra
 | JPEG | yes | yes | decode baseline + progressive, fancy chroma upsampling (±3 of libjpeg); encode baseline 4:4:4 Annex-K tables, quality 90 (PSNR ~45 dB) |
 | TIFF | yes | — | II/MM, strips, uncompressed / PackBits / LZW / DEFLATE (+ predictor 2); 8-bit gray/RGB/RGBA |
 | ICO  | yes | — | favicon: largest entry, embedded-PNG or DIB+AND-mask |
-| CSIF | yes | yes | native flagship — see below |
+| CSIF | yes | yes | native flagship (tiling, 16-bit, animation) — see below |
 | WebP | yes | yes | decode VP8L, VP8 lossy, VP8X + **ALPH alpha** (raw + lossless, all unfilters) — bit-exact vs libwebp; encode VP8L |
 | AVIF | — | — | later phase (AV1 intra) |
 
@@ -46,8 +46,16 @@ ILIM resource limits, IHDR geometry, ICOL/CICP colour with "Unspecified" banned)
 | DCT (3)     | lossy    | YCbCr 4:2:0 + forward DCT + quality-scaled quant (luma/chroma) + rANS; ~42 dB PSNR, beats our JPEG on photos (8-bit) |
 
 Tiled images (ICOD tile grid + TIDX per-tile index with CRC and byte ranges) decode each tile
-independently — the scalability substrate for partial/parallel decode. Decode is fail-loud: bad
-magic/CRC/geometry/colour/codec each return a distinct numbered error
+independently — the scalability substrate for partial/parallel decode.
+
+**Animation** is designed in, not bolted on: an `IANI` header declares the timeline (frame count, loop,
+an *explicit* tick base — never implied centiseconds — canvas, background, and the bounded reference-slot
+count), and an `IFRM` array carries per-frame control records whose `blend_op` and `dispose_op` are closed
+enums with no default. Each frame is its own coded item (its own `IDAT`), so any frame is directly
+addressable; `IANI`/`IFRM` are non-critical, so a still-only reader skips them and renders the primary
+item — frame 0 — as the canonical default rendition.
+
+Decode is fail-loud: bad magic/CRC/geometry/colour/codec/tick-base each return a distinct numbered error
 (exercised by a corruption corpus). rANS lives in `caustic-compact/entropy`.
 
 Every decoder validates dimensions in widened arithmetic **before allocating** (`image_check_dims`,

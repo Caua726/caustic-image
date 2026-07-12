@@ -54,6 +54,7 @@ run_case test_csif_rt        tests/test_csif_rt.cst
 run_case test_csif_corrupt   tests/test_csif_corrupt.cst
 run_case test_csif_tiled     tests/test_csif_tiled.cst
 run_case test_csif16         tests/test_csif16.cst
+run_case test_csif_anim      tests/test_csif_anim.cst
 run_case test_rans           tests/test_rans.cst
 run_case test_dispatch       tests/test_dispatch.cst
 run_case test_dct            tests/test_dct.cst
