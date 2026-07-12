@@ -5,11 +5,13 @@ no libc, no libpng/libjpeg/giflib, no external libraries. Just the Caustic stand
 syscalls, and the sibling [`caustic-compact`](../caustic-compact) for the heavy entropy/compression
 work (DEFLATE, CRC-32, LZW, and later the CSIF rANS substrate).
 
-The long-term target is a world-class native format, **CSIF** (spec under `causticos/docs/`), plus
-decode/encode of the common foreign formats at libpng/libjpeg-turbo quality. Phases 1–2 are done: the
-`Image` model, offset-driven parsing, sniffing, and decode **and encode** of the self-contained +
-PNG/GIF families. Every encoder is verified both by an internal round-trip and by decoding its output
-in Pillow/giflib/libpng.
+The target is a world-class native format, **CSIF** (spec under `causticos/docs/`), plus decode/encode
+of the common foreign formats at libpng/libjpeg-turbo quality.
+
+Eleven formats decode and nine encode. Where a reference implementation exists, correctness is pinned
+against it: PNG/GIF/TIFF/BMP/QOI decode **byte-exact** vs libpng/giflib/libtiff, WebP (VP8L *and* VP8
+lossy *and* ALPH alpha) **bit-exact** vs libwebp, JPEG within ±3 of libjpeg. Every encoder is verified
+both by an internal round-trip and by decoding its output in the reference library.
 
 ## Status
 
@@ -26,7 +28,10 @@ in Pillow/giflib/libpng.
 | ICO  | yes | — | favicon: largest entry, embedded-PNG or DIB+AND-mask |
 | CSIF | yes | yes | native flagship — see below |
 | WebP | yes | yes | decode VP8L, VP8 lossy, VP8X + **ALPH alpha** (raw + lossless, all unfilters) — bit-exact vs libwebp; encode VP8L |
-| AVIF | — | — | later phases |
+| AVIF | — | — | later phase (AV1 intra) |
+
+**Animation**: GIF (decode + encode, full compositing with disposal/transparency) and APNG (decode,
+OP_SOURCE/OP_OVER blend + all disposals). **Deep colour**: PNG 16-bit decode+encode, CSIF 16-bit RAW/MODULAR.
 
 ### CSIF (native flagship)
 
@@ -51,13 +56,19 @@ the ILIM posture), so a malformed header can never trigger an allocation overflo
 ## Layout
 
 ```
-core/     errno · image (mmap-backed pixel buffer) · pixfmt · buf (offset-driven cursor) · sniff
-formats/  qoi · bmp · pnm · tga · png · gif
-decode.cst          sniff -> codec dispatch
+core/       errno · image (mmap-backed pixel buffer) · pixfmt · buf (offset-driven cursor) · sniff
+formats/    qoi · bmp · pnm · tga · png (+APNG) · gif (+anim) · jpeg · tiff · webp · vp8 · ico
+transform/  dct (shared fixed-point 8x8 FDCT/IDCT — JPEG + the CSIF DCT codec)
+csif/       container (header/directory/chunks/TIDX tiling) · modular · dctc · errno
+ops/        convert · crop · flips · rotations · resize (nearest + bilinear) · premultiply
+decode.cst  sniff -> decoder dispatch        encode.cst  format id -> encoder dispatch
 caustic_image.cst   library facade
-examples/ identify  (print "FMT WxH")
-tests/    run.sh + test_*.cst + fixtures/ (committed vectors)
+examples/   identify ("FMT WxH")   convert (transcode any -> any)
+tests/      run.sh + 39 test_*.cst (embedded vectors, cross-checked against reference decoders)
 ```
+
+Heavy entropy/compression lives in the sibling `caustic-compact` and is shared, never duplicated:
+DEFLATE/zlib, CRC-32, LZW (GIF + TIFF flavours), and the static/context rANS coders the CSIF codecs use.
 
 ## Build & test
 
