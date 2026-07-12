@@ -2,7 +2,11 @@
 // examples/convert.cst — transcode between image formats.
 //   convert <in> <out.ext>
 // Decodes <in> by content sniffing, encodes to the format named by <out>'s
-// extension (.png/.qoi/.bmp/.tga/.gif/.csif/.p[pgn]m), and writes <out>.
+// extension (.png/.qoi/.bmp/.tga/.gif/.jpg/.webp/.csif/.p[pgn]m), and writes it.
+//
+// Animation is preserved when both sides support it: an animated GIF, APNG or
+// CSIF transcodes to an animated GIF or CSIF with its frames and per-frame
+// durations intact. Otherwise the first/still frame is converted.
 // =======================================================
 
 use "std/io.cst"  as io;
@@ -10,9 +14,32 @@ use "std/env.cst" as env;
 use "std/mem.cst" only bins, core as mem;
 use "../core/image.cst" as image;
 use "../core/sniff.cst" as sniff;
+use "../formats/gif.cst" as gif;
+use "../formats/png.cst" as png;
+use "../csif/container.cst" as csif;
 use "../decode.cst"     as decode;
 use "../encode.cst"     as encode;
 use "caustic-compact/core/bytes.cst" as cb;
+
+fn _write_out(path as *u8, out as *cb.Bytes) as i64 {
+    let is i64 as ofd = io._open_write(path);
+    if (ofd < 0) { return 0 - 1; }
+    io.write_bytes(ofd, out.ptr, out.len);
+    io._close_fd(ofd);
+    return 0;
+}
+
+fn _report(infmt as i64, outfmt as i64, w as i64, h as i64, nf as i64, len as i64) as void {
+    io.write_str(io.STDOUT, decode.format_name(infmt));
+    io.write_str(io.STDOUT, " ");
+    io.write_int(io.STDOUT, w); io.write_str(io.STDOUT, "x"); io.write_int(io.STDOUT, h);
+    if (nf > 0) { io.write_str(io.STDOUT, " x"); io.write_int(io.STDOUT, nf); io.write_str(io.STDOUT, "f"); }
+    io.write_str(io.STDOUT, " -> ");
+    io.write_str(io.STDOUT, decode.format_name(outfmt));
+    io.write_str(io.STDOUT, " (");
+    io.write_int(io.STDOUT, len);
+    io.write_str(io.STDOUT, " bytes)\n");
+}
 
 fn main(argc as i64, argv as *u8) as i32 {
     env.init(argc, argv);
@@ -34,6 +61,77 @@ fn main(argc as i64, argv as *u8) as i32 {
     if (got != sz) { io.write_str(io.STDERR, "convert: read error\n"); return 1; }
 
     let is i64 as infmt = sniff.sniff(data, sz);
+    let is i64 as outfmt = encode.ext_to_fmt(outpath);
+    if (outfmt < 0) { io.write_str(io.STDERR, "convert: unknown output extension\n"); return 1; }
+
+    // ---- animation path (GIF / APNG / CSIF in; GIF / CSIF out) ----
+    let is i64 as anim_out with mut = 0;
+    if (outfmt == sniff.SNIFF_GIF)  { anim_out = 1; }
+    if (outfmt == sniff.SNIFF_CSIF) { anim_out = 1; }
+    if (anim_out == 1) {
+        // Decode as an animation if the input carries one. The three models are
+        // the same shape; normalise to (w, h, count, frames, delays-in-ms).
+        let is i64 as aw with mut = 0;
+        let is i64 as ah with mut = 0;
+        let is i64 as an with mut = 0;
+        let is i64 as af with mut = 0;
+        let is i64 as ad with mut = 0;     // milliseconds
+        if (infmt == sniff.SNIFF_GIF) {
+            let is gif.GifAnim as g;
+            if (gif.gif_decode_anim(data, sz, &g) == 0) {
+                if (g.count > 1) {
+                    aw = g.width; ah = g.height; an = g.count; af = g.frames;
+                    ad = cast(i64, mem.core.mmap_anon(an * 8));
+                    let is *i64 as dsrc = cast(*i64, g.delays);
+                    let is *i64 as ddst = cast(*i64, ad);
+                    let is i64 as i with mut = 0;
+                    while (i < an) { ddst[i] = dsrc[i] * 10; i = i + 1; }   // cs -> ms
+                }
+            }
+        }
+        if (infmt == sniff.SNIFF_PNG) {
+            let is png.PngAnim as p;
+            if (png.png_decode_anim(data, sz, &p) == 0) {
+                if (p.count > 1) { aw = p.width; ah = p.height; an = p.count; af = p.frames; ad = p.delays; }
+            }
+        }
+        if (infmt == sniff.SNIFF_CSIF) {
+            let is csif.CsifAnim as c;
+            if (csif.csif_decode_anim(data, sz, &c) == 0) {
+                if (c.count > 1) { aw = c.width; ah = c.height; an = c.count; af = c.frames; ad = c.delays; }
+            }
+        }
+        if (an > 1) {
+            let is cb.Bytes as out = cb.bytes_new(4096);
+            let is i64 as er with mut = 0;
+            if (outfmt == sniff.SNIFF_CSIF) {
+                let is csif.CsifAnim as ca;
+                ca.width = aw; ca.height = ah; ca.count = an; ca.frames = af; ca.delays = ad;
+                er = csif.csif_encode_anim(&ca, &out, 2);
+            } else {
+                // GIF delays are centiseconds.
+                let is i64 as cs = cast(i64, mem.core.mmap_anon(an * 8));
+                let is *i64 as msrc = cast(*i64, ad);
+                let is *i64 as cdst = cast(*i64, cs);
+                let is i64 as i with mut = 0;
+                while (i < an) { cdst[i] = msrc[i] / 10; i = i + 1; }
+                let is gif.GifAnim as ga;
+                ga.width = aw; ga.height = ah; ga.count = an; ga.frames = af; ga.delays = cs;
+                er = gif.gif_encode_anim(&ga, &out);
+            }
+            if (er < 0) {
+                io.write_str(io.STDERR, "convert: animation encode failed (");
+                io.write_int(io.STDERR, er); io.write_str(io.STDERR, ")\n");
+                return 1;
+            }
+            if (_write_out(outpath, &out) < 0) { io.write_str(io.STDERR, "convert: cannot open output\n"); return 1; }
+            _report(infmt, outfmt, aw, ah, an, out.len);
+            cb.bytes_free(&out);
+            return 0;
+        }
+    }
+
+    // ---- still path ----
     let is image.Image as img;
     let is i64 as rc = decode.decode(data, sz, &img);
     if (rc < 0) {
@@ -41,10 +139,6 @@ fn main(argc as i64, argv as *u8) as i32 {
         io.write_int(io.STDERR, rc); io.write_str(io.STDERR, ")\n");
         return 1;
     }
-
-    let is i64 as outfmt = encode.ext_to_fmt(outpath);
-    if (outfmt < 0) { io.write_str(io.STDERR, "convert: unknown output extension\n"); return 1; }
-
     let is cb.Bytes as out = cb.bytes_new(4096);
     let is i64 as er = encode.encode(&img, outfmt, &out);
     if (er < 0) {
@@ -52,23 +146,8 @@ fn main(argc as i64, argv as *u8) as i32 {
         io.write_int(io.STDERR, er); io.write_str(io.STDERR, ")\n");
         return 1;
     }
-
-    let is i64 as ofd = io._open_write(outpath);
-    if (ofd < 0) { io.write_str(io.STDERR, "convert: cannot open output\n"); return 1; }
-    io.write_bytes(ofd, out.ptr, out.len);
-    io._close_fd(ofd);
-
-    io.write_str(io.STDOUT, decode.format_name(infmt));
-    io.write_str(io.STDOUT, " ");
-    io.write_int(io.STDOUT, img.width);
-    io.write_str(io.STDOUT, "x");
-    io.write_int(io.STDOUT, img.height);
-    io.write_str(io.STDOUT, " -> ");
-    io.write_str(io.STDOUT, decode.format_name(outfmt));
-    io.write_str(io.STDOUT, " (");
-    io.write_int(io.STDOUT, out.len);
-    io.write_str(io.STDOUT, " bytes)\n");
-
+    if (_write_out(outpath, &out) < 0) { io.write_str(io.STDERR, "convert: cannot open output\n"); return 1; }
+    _report(infmt, outfmt, img.width, img.height, 0, out.len);
     image.image_free(&img);
     cb.bytes_free(&out);
     return 0;
