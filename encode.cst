@@ -10,6 +10,7 @@
 use "core/errno.cst"  as errno;
 use "core/image.cst"  as image;
 use "core/sniff.cst"  as sniff;
+use "core/opts.cst"   as opts;
 use "formats/png.cst" as png;
 use "formats/qoi.cst" as qoi;
 use "formats/bmp.cst" as bmp;
@@ -21,8 +22,11 @@ use "formats/webp.cst" as webp;
 use "csif/container.cst" as csif;
 use "caustic-compact/core/bytes.cst" as cb;
 
-fn encode(img as *image.Image, fmt as i64, out as *cb.Bytes) as i64 {
-    if (fmt == sniff.SNIFF_PNG)  { return png.png_encode(img, out); }
+// Encode under an explicit engine/quality. Formats with more than one engine
+// (PNG, JPEG, WebP) read `o`; the simple ones (QOI, BMP, PNM, TGA, GIF) have a
+// single sensible encoding and ignore it.
+fn encode_ex(img as *image.Image, fmt as i64, out as *cb.Bytes, o as *opts.EncOpts) as i64 {
+    if (fmt == sniff.SNIFF_PNG)  { return png.png_encode_ex(img, out, o); }
     if (fmt == sniff.SNIFF_QOI)  { return qoi.qoi_encode(img, out); }
     if (fmt == sniff.SNIFF_BMP)  { return bmp.bmp_encode(img, out); }
     if (fmt == sniff.SNIFF_PNM)  { return pnm.pnm_encode(img, out); }
@@ -32,6 +36,12 @@ fn encode(img as *image.Image, fmt as i64, out as *cb.Bytes) as i64 {
     if (fmt == sniff.SNIFF_WEBP) { return webp.webp_encode(img, out); }
     if (fmt == sniff.SNIFF_CSIF) { return csif.csif_encode_ex(img, out, 2); }
     return errno.I_UNSUPPORTED;
+}
+
+fn encode(img as *image.Image, fmt as i64, out as *cb.Bytes) as i64 {
+    let is opts.EncOpts as o;
+    opts.enc_defaults(&o);
+    return encode_ex(img, fmt, out, &o);
 }
 
 fn _strlen(s as *u8) as i64 {

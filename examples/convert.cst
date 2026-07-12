@@ -14,6 +14,7 @@ use "std/env.cst" as env;
 use "std/mem.cst" only bins, core as mem;
 use "../core/image.cst" as image;
 use "../core/sniff.cst" as sniff;
+use "../core/opts.cst"  as opts;
 use "../formats/gif.cst" as gif;
 use "../formats/png.cst" as png;
 use "../csif/container.cst" as csif;
@@ -41,14 +42,63 @@ fn _report(infmt as i64, outfmt as i64, w as i64, h as i64, nf as i64, len as i6
     io.write_str(io.STDOUT, " bytes)\n");
 }
 
+// Parse a base-10 integer; -1 on a non-digit.
+fn _atoi(s as *u8) as i64 {
+    let is i64 as v with mut = 0;
+    let is i64 as i with mut = 0;
+    if (cast(i64, s[0]) == 0) { return 0 - 1; }
+    while (cast(i64, s[i]) != 0) {
+        let is i64 as d = cast(i64, s[i]) - 48;
+        if (d < 0 || d > 9) { return 0 - 1; }
+        v = v * 10 + d;
+        i = i + 1;
+    }
+    return v;
+}
+
+fn _streq(a as *u8, b as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (cast(i64, a[i]) != 0) {
+        if (cast(i64, a[i]) != cast(i64, b[i])) { return 0; }
+        i = i + 1;
+    }
+    if (cast(i64, b[i]) != 0) { return 0; }
+    return 1;
+}
+
 fn main(argc as i64, argv as *u8) as i32 {
     env.init(argc, argv);
     if (env.argc() < 3) {
-        io.write_str(io.STDERR, "usage: convert <in> <out.ext>\n");
+        io.write_str(io.STDERR, "usage: convert [-e fast|default|best] [-q 1..100] [-l] <in> <out.ext>\n");
+        io.write_str(io.STDERR, "  -e  encoder engine (default: default)\n");
+        io.write_str(io.STDERR, "  -q  quality 1..100 for lossy output\n");
+        io.write_str(io.STDERR, "  -l  force the lossless mode where the format has one (WebP)\n");
         return 2;
     }
-    let is *u8 as inpath = env.argv(1);
-    let is *u8 as outpath = env.argv(2);
+    let is opts.EncOpts as eo;
+    opts.enc_defaults(&eo);
+    let is i64 as ai with mut = 1;
+    while (ai < env.argc() - 2) {
+        let is *u8 as a = env.argv(ai);
+        if (_streq(a, "-e") == 1) {
+            let is *u8 as v = env.argv(ai + 1);
+            if (_streq(v, "fast") == 1)    { opts.enc_engine(&eo, opts.ENG_FAST); }
+            if (_streq(v, "default") == 1) { opts.enc_engine(&eo, opts.ENG_DEFAULT); }
+            if (_streq(v, "best") == 1)    { opts.enc_engine(&eo, opts.ENG_BEST); }
+            ai = ai + 2;
+        } else {
+            if (_streq(a, "-q") == 1) {
+                let is i64 as q = _atoi(env.argv(ai + 1));
+                if (q >= 1 && q <= 100) { eo.quality = q; }
+                ai = ai + 2;
+            } else {
+                if (_streq(a, "-l") == 1) { eo.lossless = 1; ai = ai + 1; }
+                else { ai = ai + 1; }
+            }
+        }
+    }
+    let is *u8 as inpath = env.argv(env.argc() - 2);
+    let is *u8 as outpath = env.argv(env.argc() - 1);
 
     let is i64 as sz = io.file_size(inpath);
     if (sz < 0) { io.write_str(io.STDERR, "convert: cannot stat input\n"); return 1; }
@@ -140,7 +190,7 @@ fn main(argc as i64, argv as *u8) as i32 {
         return 1;
     }
     let is cb.Bytes as out = cb.bytes_new(4096);
-    let is i64 as er = encode.encode(&img, outfmt, &out);
+    let is i64 as er = encode.encode_ex(&img, outfmt, &out, &eo);
     if (er < 0) {
         io.write_str(io.STDERR, "convert: encode failed (");
         io.write_int(io.STDERR, er); io.write_str(io.STDERR, ")\n");

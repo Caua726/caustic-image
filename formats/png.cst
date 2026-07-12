@@ -16,6 +16,7 @@ use "../core/errno.cst"  as errno;
 use "../core/image.cst"  as image;
 use "../core/pixfmt.cst" as pixfmt;
 use "../core/buf.cst"    as buf;
+use "../core/opts.cst"   as opts;
 
 use "caustic-compact/core/bytes.cst"    as cb;
 use "caustic-compact/core/checksum.cst" as checksum;
@@ -335,120 +336,577 @@ fn _png_chunk(out as *cb.Bytes, typ as *u8, data as *u8, len as i64) as void {
     cb.bytes_push(out, cast(u8, c & 255));
 }
 
-// Encode GRAY8/GRAYA8/RGB8/RGBA8 as a non-interlaced 8-bit PNG into `out`,
-// choosing a per-row filter by the minimum-sum-of-absolute-differences
-// heuristic. IDAT is a zlib stream from caustic-compact. Returns out.len.
-fn png_encode(img as *image.Image, out as *cb.Bytes) as i64 {
-    let is i64 as chan with mut = 0;
-    let is i64 as colortype with mut = 0;
-    if (img.fmt == pixfmt.FMT_GRAY8)   { chan = 1; colortype = 0; }
-    if (img.fmt == pixfmt.FMT_GRAYA8)  { chan = 2; colortype = 4; }
-    if (img.fmt == pixfmt.FMT_RGB8)    { chan = 3; colortype = 2; }
-    if (img.fmt == pixfmt.FMT_RGBA8)   { chan = 4; colortype = 6; }
-    if (img.fmt == pixfmt.FMT_GRAY16)  { chan = 1; colortype = 0; }
-    if (img.fmt == pixfmt.FMT_GRAYA16) { chan = 2; colortype = 4; }
-    if (img.fmt == pixfmt.FMT_RGB16)   { chan = 3; colortype = 2; }
-    if (img.fmt == pixfmt.FMT_RGBA16)  { chan = 4; colortype = 6; }
-    if (chan == 0) { return errno.I_UNSUPPORTED; }
+// ============================ encoder ======================================
+// A PNG's size is largely decided before DEFLATE ever runs. Three levers, in
+// descending order of how much they actually move the number:
+//
+//   1. The *representation*. A screenshot with eight distinct colours stored as
+//      RGB8 spends 24 bits per pixel carrying three bits of information.
+//      Re-expressing it as a 4-bit palette is worth more than every filter and
+//      entropy-coder trick combined — on our benchmark UI image it is the
+//      difference between 878 bytes and 338.
+//   2. The *filter*, chosen per row from None/Sub/Up/Average/Paeth.
+//   3. DEFLATE itself.
+//
+// So the engines differ in how hard they work at (1) and (2):
+//   ENG_FAST     take the image as it comes; one heuristic filter pass.
+//   ENG_DEFAULT  reduce the representation; libpng's minimum-sum-of-absolute-
+//                differences filter heuristic. (This is what libpng+pngcrush do.)
+//   ENG_BEST     reduce, then encode the whole image once per filter strategy
+//                and keep the smallest — the zopflipng/OxiPNG approach.
 
+// Whole-image filter strategies. 0..4 force one filter on every row; the last
+// two decide per row.
+let is i64 as _FS_MINSUM  with imut = 5;   // libpng: min sum of |filtered bytes|
+let is i64 as _FS_ENTROPY with imut = 6;   // min entropy of the filtered row
+
+// One candidate encoding of the image: a colour type, a bit depth, and the
+// packed, big-endian scanlines that go with them.
+struct _Cand {
+    ct as i64;        // colour type 0/2/3/4/6
+    bd as i64;        // bit depth 1/2/4/8/16
+    chan as i64;      // samples per pixel (1 for palette)
+    raw as i64;       // address of h * stride packed rows
+    stride as i64;    // bytes per row
+    bpp as i64;       // filter offset in bytes: max(1, chan * bd / 8)
+    plte as i64;      // address of 3 * ncol bytes (colour type 3)
+    trns as i64;      // address of ncol alpha bytes
+    ncol as i64;
+    ntrns as i64;     // tRNS entries to write; 0 omits the chunk
+}
+
+fn _cand_free(c as *_Cand, h as i64) as void {
+    if (c.raw != 0)  { mem.core.munmap(cast(*u8, c.raw), h * c.stride); }
+    if (c.plte != 0) { mem.core.munmap(cast(*u8, c.plte), 3 * 256); }
+    if (c.trns != 0) { mem.core.munmap(cast(*u8, c.trns), 256); }
+    c.raw = 0; c.plte = 0; c.trns = 0;
+}
+
+// The pixel at (x, y) as 0xRRGGBBAA, for any 8-bit format.
+fn _px8(img as *image.Image, x as i64, y as i64) as i64 {
+    let is *u8 as p = img.pixels;
+    let is i64 as o = y * img.stride;
+    if (img.fmt == pixfmt.FMT_GRAY8) {
+        let is i64 as g = cast(i64, p[o + x]);
+        return (g << 24) | (g << 16) | (g << 8) | 255;
+    }
+    if (img.fmt == pixfmt.FMT_GRAYA8) {
+        let is i64 as g = cast(i64, p[o + x * 2]);
+        return (g << 24) | (g << 16) | (g << 8) | cast(i64, p[o + x * 2 + 1]);
+    }
+    if (img.fmt == pixfmt.FMT_RGB8) {
+        return (cast(i64, p[o + x * 3]) << 24) | (cast(i64, p[o + x * 3 + 1]) << 16)
+             | (cast(i64, p[o + x * 3 + 2]) << 8) | 255;
+    }
+    return (cast(i64, p[o + x * 4]) << 24) | (cast(i64, p[o + x * 4 + 1]) << 16)
+         | (cast(i64, p[o + x * 4 + 2]) << 8) | cast(i64, p[o + x * 4 + 3]);
+}
+
+// Write sample `v` (bd bits) at index `i` of a packed row, MSB-first.
+fn _pack(row as *u8, i as i64, bd as i64, v as i64) as void {
+    if (bd == 8) { row[i] = cast(u8, v & 255); return; }
+    let is i64 as bit = i * bd;
+    let is i64 as by = bit >> 3;
+    let is i64 as sh = 8 - bd - (bit & 7);
+    row[by] = cast(u8, cast(i64, row[by]) | ((v & ((1 << bd) - 1)) << sh));
+}
+
+// Colour census over an 8-bit image. Fills col[] with the distinct RGBA values
+// (packed 0xRRGGBBAA) and cnt[] with their frequencies, and returns how many
+// there are — or -1 once it passes 256, at which point a palette is off the
+// table and the exact count stops mattering. `flags` gets bit 0 if any pixel is
+// non-opaque and bit 1 if every pixel has r == g == b.
+fn _census(img as *image.Image, col as *i64, cnt as *i64, flags as *i64) as i64 {
+    let is i64 as HN with imut = 1024;                 // open-addressed, power of two
+    let is *i64 as slot = cast(*i64, mem.core.mmap_anon(HN * 8));
+    mem.core.memset(cast(*u8, slot), cast(i32, 0), HN * 8);   // 0 = empty, else index+1
+    let is i64 as n with mut = 0;
+    let is i64 as over with mut = 0;
+    let is i64 as has_alpha with mut = 0;
+    let is i64 as is_gray with mut = 1;
+    let is i64 as y with mut = 0;
+    while (y < img.height) {
+        let is i64 as x with mut = 0;
+        while (x < img.width) {
+            let is i64 as c = _px8(img, x, y);
+            if ((c & 255) != 255) { has_alpha = 1; }
+            let is i64 as r = (c >> 24) & 255;
+            if (((c >> 16) & 255) != r) { is_gray = 0; }
+            if (((c >> 8) & 255) != r) { is_gray = 0; }
+            if (over == 0) {
+                // Knuth multiplicative hash, then linear probing.
+                let is i64 as hh with mut = ((c * 2654435761) >> 12) & (HN - 1);
+                let is i64 as placed with mut = 0;
+                while (placed == 0) {
+                    let is i64 as s = slot[hh];
+                    if (s == 0) {
+                        if (n >= 256) { over = 1; placed = 1; }
+                        else {
+                            col[n] = c; cnt[n] = 1;
+                            slot[hh] = n + 1; n = n + 1; placed = 1;
+                        }
+                    } else {
+                        if (col[s - 1] == c) { cnt[s - 1] = cnt[s - 1] + 1; placed = 1; }
+                        else { hh = (hh + 1) & (HN - 1); }
+                    }
+                }
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    mem.core.munmap(cast(*u8, slot), HN * 8);
+    flags[0] = has_alpha;
+    flags[1] = is_gray;
+    if (over == 1) { return 0 - 1; }
+    return n;
+}
+
+// The smallest bit depth that indexes `n` palette entries.
+fn _pal_depth(n as i64) as i64 {
+    if (n <= 2)  { return 1; }
+    if (n <= 4)  { return 2; }
+    if (n <= 16) { return 4; }
+    return 8;
+}
+
+// Build the direct (non-palette) candidate: drop alpha if every pixel is
+// opaque, drop colour if every pixel is grey, and shrink an opaque greyscale to
+// 1/2/4 bits when every sample lands exactly on that depth's scale (a 1-bit
+// grey sample can only be 0 or 255, a 2-bit one only a multiple of 85).
+fn _cand_direct(img as *image.Image, c as *_Cand, has_alpha as i64, is_gray as i64) as i64 {
     let is i64 as w = img.width;
     let is i64 as h = img.height;
-    let is i64 as bit_depth = pixfmt.fmt_depth(img.fmt);
-    let is i64 as bps = bit_depth / 8;                 // bytes per sample (1 or 2)
-    let is i64 as bpp = chan * bps;                    // filter offset
-    let is i64 as stride = w * bpp;
+    c.plte = 0; c.trns = 0; c.ncol = 0; c.ntrns = 0;
+    c.bd = 8;
+    if (is_gray == 1) {
+        if (has_alpha == 1) { c.ct = 4; c.chan = 2; } else { c.ct = 0; c.chan = 1; }
+    } else {
+        if (has_alpha == 1) { c.ct = 6; c.chan = 4; } else { c.ct = 2; c.chan = 3; }
+    }
+    // Opaque greyscale: try to shrink the depth.
+    if (c.ct == 0) {
+        let is i64 as bd with mut = 1;
+        while (bd < 8) {
+            let is i64 as step = 255 / ((1 << bd) - 1);
+            let is i64 as ok with mut = 1;
+            let is i64 as y with mut = 0;
+            while (y < h) {
+                let is i64 as x with mut = 0;
+                while (x < w) {
+                    if ((((_px8(img, x, y) >> 24) & 255) % step) != 0) { ok = 0; x = w; y = h; }
+                    x = x + 1;
+                }
+                y = y + 1;
+            }
+            if (ok == 1) { c.bd = bd; bd = 8; } else { bd = bd * 2; }
+        }
+    }
+    c.stride = (w * c.chan * c.bd + 7) / 8;
+    c.bpp = (c.chan * c.bd + 7) / 8;
+    c.raw = cast(i64, mem.core.mmap_anon(h * c.stride));
+    if (c.raw == 0) { return errno.I_OOM; }
+    mem.core.memset(cast(*u8, c.raw), cast(i32, 0), h * c.stride);
+    let is i64 as scale = 255 / ((1 << c.bd) - 1);
+    let is i64 as y2 with mut = 0;
+    while (y2 < h) {
+        let is *u8 as row = cast(*u8, c.raw + y2 * c.stride);
+        let is i64 as x2 with mut = 0;
+        while (x2 < w) {
+            let is i64 as p = _px8(img, x2, y2);
+            let is i64 as r = (p >> 24) & 255;
+            if (c.ct == 0) { _pack(row, x2, c.bd, r / scale); }
+            if (c.ct == 4) { row[x2 * 2] = cast(u8, r); row[x2 * 2 + 1] = cast(u8, p & 255); }
+            if (c.ct == 2) {
+                row[x2 * 3] = cast(u8, r);
+                row[x2 * 3 + 1] = cast(u8, (p >> 16) & 255);
+                row[x2 * 3 + 2] = cast(u8, (p >> 8) & 255);
+            }
+            if (c.ct == 6) {
+                row[x2 * 4] = cast(u8, r);
+                row[x2 * 4 + 1] = cast(u8, (p >> 16) & 255);
+                row[x2 * 4 + 2] = cast(u8, (p >> 8) & 255);
+                row[x2 * 4 + 3] = cast(u8, p & 255);
+            }
+            x2 = x2 + 1;
+        }
+        y2 = y2 + 1;
+    }
+    return 0;
+}
 
-    // Signature.
+// Build the palette candidate from a census of at most 256 colours. Entries are
+// ordered non-opaque first (so tRNS, which must be a prefix of the palette, is
+// as short as possible) and then by descending frequency (so the common indices
+// are the small ones, which the entropy coder likes).
+fn _cand_palette(img as *image.Image, c as *_Cand, col as *i64, cnt as *i64, n as i64) as i64 {
+    let is i64 as w = img.width;
+    let is i64 as h = img.height;
+    let is *i64 as ord = cast(*i64, mem.core.mmap_anon(n * 8));
+    let is i64 as i with mut = 0;
+    while (i < n) { ord[i] = i; i = i + 1; }
+    // Insertion sort: transparent before opaque, then heavier before lighter.
+    i = 1;
+    while (i < n) {
+        let is i64 as k = ord[i];
+        let is i64 as ka = col[k] & 255;
+        let is i64 as j with mut = i - 1;
+        let is i64 as done with mut = 0;
+        while (j >= 0 && done == 0) {
+            let is i64 as m = ord[j];
+            let is i64 as ma = col[m] & 255;
+            // Should m sort after k? Opaque after transparent; within a class,
+            // rarer after commoner.
+            let is i64 as after with mut = 0;
+            if (ma == 255) { if (ka != 255) { after = 1; } }
+            if (after == 0) {
+                if (ma == 255) { if (ka == 255) { if (cnt[m] < cnt[k]) { after = 1; } } }
+                else { if (ka != 255) { if (cnt[m] < cnt[k]) { after = 1; } } }
+            }
+            if (after == 0) { done = 1; }
+            else { ord[j + 1] = m; j = j - 1; }
+        }
+        ord[j + 1] = k;
+        i = i + 1;
+    }
+    c.ct = 3; c.chan = 1; c.ncol = n;
+    c.bd = _pal_depth(n);
+    c.plte = cast(i64, mem.core.mmap_anon(3 * 256));
+    c.trns = cast(i64, mem.core.mmap_anon(256));
+    if (c.plte == 0 || c.trns == 0) { mem.core.munmap(cast(*u8, ord), n * 8); return errno.I_OOM; }
+    let is *u8 as plte = cast(*u8, c.plte);
+    let is *u8 as trns = cast(*u8, c.trns);
+    // newidx[old] = position in the sorted palette.
+    let is *i64 as newidx = cast(*i64, mem.core.mmap_anon(n * 8));
+    c.ntrns = 0;
+    i = 0;
+    while (i < n) {
+        let is i64 as o = ord[i];
+        newidx[o] = i;
+        let is i64 as p = col[o];
+        plte[i * 3]     = cast(u8, (p >> 24) & 255);
+        plte[i * 3 + 1] = cast(u8, (p >> 16) & 255);
+        plte[i * 3 + 2] = cast(u8, (p >> 8) & 255);
+        trns[i] = cast(u8, p & 255);
+        if ((p & 255) != 255) { c.ntrns = i + 1; }
+        i = i + 1;
+    }
+    mem.core.munmap(cast(*u8, ord), n * 8);
+
+    c.stride = (w * c.bd + 7) / 8;
+    c.bpp = 1;
+    c.raw = cast(i64, mem.core.mmap_anon(h * c.stride));
+    if (c.raw == 0) { mem.core.munmap(cast(*u8, newidx), n * 8); return errno.I_OOM; }
+    mem.core.memset(cast(*u8, c.raw), cast(i32, 0), h * c.stride);
+    let is i64 as y with mut = 0;
+    while (y < h) {
+        let is *u8 as row = cast(*u8, c.raw + y * c.stride);
+        let is i64 as x with mut = 0;
+        while (x < w) {
+            let is i64 as p = _px8(img, x, y);
+            let is i64 as k with mut = 0;
+            while (k < n) { if (col[k] == p) { _pack(row, x, c.bd, newidx[k]); k = n; } else { k = k + 1; } }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    mem.core.munmap(cast(*u8, newidx), n * 8);
+    return 0;
+}
+
+// The 16-bit candidate: samples byte-swapped to PNG's big-endian order.
+fn _cand_16(img as *image.Image, c as *_Cand) as i64 {
+    let is i64 as w = img.width;
+    let is i64 as h = img.height;
+    c.plte = 0; c.trns = 0; c.ncol = 0; c.ntrns = 0; c.bd = 16;
+    if (img.fmt == pixfmt.FMT_GRAY16)  { c.ct = 0; c.chan = 1; }
+    if (img.fmt == pixfmt.FMT_GRAYA16) { c.ct = 4; c.chan = 2; }
+    if (img.fmt == pixfmt.FMT_RGB16)   { c.ct = 2; c.chan = 3; }
+    if (img.fmt == pixfmt.FMT_RGBA16)  { c.ct = 6; c.chan = 4; }
+    c.stride = w * c.chan * 2;
+    c.bpp = c.chan * 2;
+    c.raw = cast(i64, mem.core.mmap_anon(h * c.stride));
+    if (c.raw == 0) { return errno.I_OOM; }
+    let is *u8 as px = img.pixels;
+    let is i64 as y with mut = 0;
+    while (y < h) {
+        let is *u8 as row = cast(*u8, c.raw + y * c.stride);
+        let is i64 as srow = y * img.stride;
+        let is i64 as s with mut = 0;
+        while (s < w * c.chan) {
+            row[s * 2]     = px[srow + s * 2 + 1];      // high byte first
+            row[s * 2 + 1] = px[srow + s * 2];
+            s = s + 1;
+        }
+        y = y + 1;
+    }
+    return 0;
+}
+
+// log2(x) in 1/65536ths, for x >= 1: exact on the exponent, linear on the
+// mantissa. Only ever compared against itself, so the interpolation error is
+// harmless and it costs no floating point.
+fn _log2q(x as i64) as i64 {
+    if (x <= 1) { return 0; }
+    let is i64 as p with mut = 0;
+    while ((1 << (p + 1)) <= x) { p = p + 1; }
+    let is i64 as base = 1 << p;
+    return (p << 16) + ((x - base) << 16) / base;
+}
+
+// Filter one row into `dst` under filter type `ft`. `cur`/`prv` are the packed
+// (already byte-swapped) current and previous rows.
+fn _filter_row(dst as *u8, cur as *u8, prv as *u8, stride as i64, bpp as i64,
+               first as i64, ft as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < stride) {
+        let is i64 as x = cast(i64, cur[i]);
+        let is i64 as a with mut = 0;
+        if (i >= bpp) { a = cast(i64, cur[i - bpp]); }
+        let is i64 as b with mut = 0;
+        let is i64 as cc with mut = 0;
+        if (first == 0) {
+            b = cast(i64, prv[i]);
+            if (i >= bpp) { cc = cast(i64, prv[i - bpp]); }
+        }
+        dst[i] = cast(u8, _filt(ft, x, a, b, cc));
+        i = i + 1;
+    }
+}
+
+// Apply a whole-image filter strategy, producing the [filter byte][row] stream
+// that DEFLATE will see. For the two adaptive strategies the choice is made row
+// by row: _FS_MINSUM sums |signed filtered byte| (libpng's heuristic — a proxy
+// for "how small are the residuals"), _FS_ENTROPY sums the actual zeroth-order
+// entropy of the filtered row (a better proxy for "how well will DEFLATE do",
+// and markedly better on palette images).
+fn _filter_image(c as *_Cand, h as i64, strategy as i64, raw as *cb.Bytes) as i64 {
+    let is i64 as stride = c.stride;
+    let is *u8 as tmp = mem.core.mmap_anon(stride);
+    let is *u8 as best = mem.core.mmap_anon(stride);
+    let is *u8 as prev = mem.core.mmap_anon(stride);
+    if (tmp == 0 || best == 0 || prev == 0) { return errno.I_OOM; }
+    mem.core.memset(prev, cast(i32, 0), stride);
+    let is [256]i64 as hist;
+    let is i64 as y with mut = 0;
+    while (y < h) {
+        let is *u8 as cur = cast(*u8, c.raw + y * stride);
+        let is i64 as first with mut = 0;
+        if (y == 0) { first = 1; }
+        let is i64 as chosen with mut = strategy;
+        if (strategy < 5) {
+            _filter_row(best, cur, prev, stride, c.bpp, first, strategy);
+        } else {
+            let is i64 as best_cost with mut = 0 - 1;
+            let is i64 as ft with mut = 0;
+            while (ft < 5) {
+                _filter_row(tmp, cur, prev, stride, c.bpp, first, ft);
+                let is i64 as cost with mut = 0;
+                if (strategy == _FS_MINSUM) {
+                    let is i64 as i with mut = 0;
+                    while (i < stride) { cost = cost + _sabs(cast(i64, tmp[i])); i = i + 1; }
+                } else {
+                    let is i64 as k with mut = 0;
+                    while (k < 256) { hist[k] = 0; k = k + 1; }
+                    let is i64 as i2 with mut = 0;
+                    while (i2 < stride) {
+                        let is i64 as v = cast(i64, tmp[i2]);
+                        hist[v] = hist[v] + 1;
+                        i2 = i2 + 1;
+                    }
+                    // sum over symbols of count * log2(stride / count)
+                    let is i64 as ls = _log2q(stride);
+                    k = 0;
+                    while (k < 256) {
+                        if (hist[k] > 0) { cost = cost + hist[k] * ((ls - _log2q(hist[k])) >> 8); }
+                        k = k + 1;
+                    }
+                }
+                if (best_cost < 0 || cost < best_cost) {
+                    best_cost = cost; chosen = ft;
+                    mem.core.memcpy(best, tmp, stride);
+                }
+                ft = ft + 1;
+            }
+        }
+        cb.bytes_push(raw, cast(u8, chosen));
+        cb.bytes_append(raw, best, stride);
+        mem.core.memcpy(prev, cur, stride);
+        y = y + 1;
+    }
+    mem.core.munmap(tmp, stride);
+    mem.core.munmap(best, stride);
+    mem.core.munmap(prev, stride);
+    return 0;
+}
+
+// Serialize a candidate whose IDAT has already been compressed.
+fn _emit_png(c as *_Cand, w as i64, h as i64, idat as *cb.Bytes, out as *cb.Bytes) as void {
     cb.bytes_push(out, cast(u8, 137)); cb.bytes_push(out, cast(u8, 80));
     cb.bytes_push(out, cast(u8, 78));  cb.bytes_push(out, cast(u8, 71));
     cb.bytes_push(out, cast(u8, 13));  cb.bytes_push(out, cast(u8, 10));
     cb.bytes_push(out, cast(u8, 26));  cb.bytes_push(out, cast(u8, 10));
 
-    // IHDR.
     let is [13]u8 as ih;
     ih[0] = cast(u8, (w >> 24) & 255); ih[1] = cast(u8, (w >> 16) & 255);
     ih[2] = cast(u8, (w >> 8) & 255);  ih[3] = cast(u8, w & 255);
     ih[4] = cast(u8, (h >> 24) & 255); ih[5] = cast(u8, (h >> 16) & 255);
     ih[6] = cast(u8, (h >> 8) & 255);  ih[7] = cast(u8, h & 255);
-    ih[8] = cast(u8, bit_depth);       // bit depth (8 or 16)
-    ih[9] = cast(u8, colortype);
+    ih[8] = cast(u8, c.bd);
+    ih[9] = cast(u8, c.ct);
     ih[10] = cast(u8, 0); ih[11] = cast(u8, 0); ih[12] = cast(u8, 0);
     _png_chunk(out, "IHDR", cast(*u8, &ih), 13);
 
-    // Build filtered scanlines. PNG stores samples big-endian, so 16-bit rows
-    // are byte-swapped into `berow` (the previous BE row is kept in `beprev`)
-    // before filtering; 8-bit is a straight copy.
-    let is *u8 as px = img.pixels;
-    let is *u8 as berow = mem.core.mmap_anon(stride);
-    let is *u8 as beprev = mem.core.mmap_anon(stride);
-    mem.core.memset(beprev, cast(i32, 0), stride);
-    let is cb.Bytes as raw = cb.bytes_new(h * (1 + stride) + 16);
-    let is i64 as y with mut = 0;
-    while (y < h) {
-        let is i64 as srow = y * img.stride;
-        // Fill berow (big-endian for 16-bit).
-        if (bps == 1) {
-            mem.core.memcpy(berow, cast(*u8, cast(i64, px) + srow), stride);
-        } else {
-            let is i64 as s with mut = 0;
-            while (s < w * chan) {
-                berow[s * 2]     = px[srow + s * 2 + 1];   // high byte first
-                berow[s * 2 + 1] = px[srow + s * 2];
-                s = s + 1;
-            }
-        }
-        // Choose the filter with the smallest sum of absolute filtered bytes.
-        let is i64 as best_ft with mut = 0;
-        let is i64 as best_cost with mut = 0 - 1;
-        let is i64 as ft with mut = 0;
-        while (ft < 5) {
-            let is i64 as cost with mut = 0;
-            let is i64 as i with mut = 0;
-            while (i < stride) {
-                let is i64 as x = cast(i64, berow[i]);
-                let is i64 as a with mut = 0;
-                if (i >= bpp) { a = cast(i64, berow[i - bpp]); }
-                let is i64 as b with mut = 0;
-                if (y > 0) { b = cast(i64, beprev[i]); }
-                let is i64 as cc with mut = 0;
-                if (y > 0) { if (i >= bpp) { cc = cast(i64, beprev[i - bpp]); } }
-                cost = cost + _sabs(_filt(ft, x, a, b, cc));
-                i = i + 1;
-            }
-            if (best_cost < 0) { best_cost = cost; best_ft = ft; }
-            else { if (cost < best_cost) { best_cost = cost; best_ft = ft; } }
-            ft = ft + 1;
-        }
-        // Emit the chosen filter byte + filtered row.
-        cb.bytes_push(&raw, cast(u8, best_ft));
-        let is i64 as j with mut = 0;
-        while (j < stride) {
-            let is i64 as x = cast(i64, berow[j]);
-            let is i64 as a with mut = 0;
-            if (j >= bpp) { a = cast(i64, berow[j - bpp]); }
-            let is i64 as b with mut = 0;
-            if (y > 0) { b = cast(i64, beprev[j]); }
-            let is i64 as cc with mut = 0;
-            if (y > 0) { if (j >= bpp) { cc = cast(i64, beprev[j - bpp]); } }
-            cb.bytes_push(&raw, cast(u8, _filt(best_ft, x, a, b, cc)));
-            j = j + 1;
-        }
-        mem.core.memcpy(beprev, berow, stride);
-        y = y + 1;
+    if (c.ct == 3) {
+        _png_chunk(out, "PLTE", cast(*u8, c.plte), 3 * c.ncol);
+        if (c.ntrns > 0) { _png_chunk(out, "tRNS", cast(*u8, c.trns), c.ntrns); }
     }
-    mem.core.munmap(berow, stride);
-    mem.core.munmap(beprev, stride);
-
-    // Compress to IDAT (zlib) and emit.
-    let is cb.Bytes as idat = cb.bytes_new(raw.len / 2 + 64);
-    let is i64 as zr = zlib.zlib_compress(raw.ptr, raw.len, &idat, 2);
-    cb.bytes_free(&raw);
-    if (zr < 0) { cb.bytes_free(&idat); return errno.I_OOM; }
     _png_chunk(out, "IDAT", idat.ptr, idat.len);
-    cb.bytes_free(&idat);
-
     _png_chunk(out, "IEND", cast(*u8, 0), 0);
+}
+
+// Compress a candidate under one filter strategy; returns the zlib stream in
+// `idat`, or a negative errno.
+fn _try(c as *_Cand, h as i64, strategy as i64, level as i64, idat as *cb.Bytes) as i64 {
+    let is cb.Bytes as raw = cb.bytes_new(h * (1 + c.stride) + 16);
+    let is i64 as fr = _filter_image(c, h, strategy, &raw);
+    if (fr < 0) { cb.bytes_free(&raw); return fr; }
+    let is i64 as zr = zlib.zlib_compress(raw.ptr, raw.len, idat, level);
+    cb.bytes_free(&raw);
+    if (zr < 0) { return errno.I_OOM; }
+    return idat.len;
+}
+
+// Encode `img` as a non-interlaced PNG. See the engine notes above.
+fn png_encode_ex(img as *image.Image, out as *cb.Bytes, o as *opts.EncOpts) as i64 {
+    let is i64 as w = img.width;
+    let is i64 as h = img.height;
+    if (w <= 0 || h <= 0) { return errno.I_DIMS; }
+    let is i64 as depth = pixfmt.fmt_depth(img.fmt);
+    if (depth != 8 && depth != 16) { return errno.I_UNSUPPORTED; }
+
+    // DEFLATE effort. Level 2 is dynamic-Huffman + lazy matching; level 6 runs
+    // the iterative optimal parse, which is slow enough that ENG_BEST only pays
+    // for it once — see the two-tier search below.
+    let is i64 as level with mut = 2;
+    if (o.engine == opts.ENG_FAST) { level = 1; }
+    let is i64 as final_level with mut = level;
+    if (o.engine == opts.ENG_BEST) { final_level = 6; }
+
+    // ---- candidates ----------------------------------------------------
+    // Deep colour keeps its samples; there is one representation and no census
+    // (a 16-bit image is exactly where a 256-colour palette does not apply).
+    let is _Cand as ca;                       // direct / 16-bit
+    let is _Cand as cp;                       // palette (ncol > 0 when built)
+    ca.raw = 0; ca.plte = 0; ca.trns = 0; ca.ncol = 0;
+    cp.raw = 0; cp.plte = 0; cp.trns = 0; cp.ncol = 0;
+    let is i64 as npal with mut = 0;
+
+    if (depth == 16) {
+        if (_cand_16(img, &ca) < 0) { return errno.I_OOM; }
+    } else {
+        let is i64 as chan = pixfmt.fmt_channels(img.fmt);
+        if (chan < 1 || chan > 4) { return errno.I_UNSUPPORTED; }
+        if (o.engine == opts.ENG_FAST) {
+            // No census: keep the caller's channel layout as-is.
+            let is i64 as ha with mut = 0;
+            let is i64 as ig with mut = 0;
+            if (chan == 2 || chan == 4) { ha = 1; }
+            if (chan == 1 || chan == 2) { ig = 1; }
+            if (_cand_direct(img, &ca, ha, ig) < 0) { return errno.I_OOM; }
+        } else {
+            let is *i64 as col = cast(*i64, mem.core.mmap_anon(256 * 8));
+            let is *i64 as cnt = cast(*i64, mem.core.mmap_anon(256 * 8));
+            let is [2]i64 as flags;
+            let is i64 as n = _census(img, col, cnt, cast(*i64, &flags));
+            if (_cand_direct(img, &ca, flags[0], flags[1]) < 0) {
+                mem.core.munmap(cast(*u8, col), 256 * 8);
+                mem.core.munmap(cast(*u8, cnt), 256 * 8);
+                return errno.I_OOM;
+            }
+            // Palette is a colour-image trick. A greyscale image already has one
+            // sample per pixel, so a palette buys nothing but a PLTE chunk — and
+            // palettizing it would hand the caller back an RGB image on decode,
+            // silently changing the colour model. Depth reduction (below, in
+            // _cand_direct) is the greyscale equivalent and keeps grey grey.
+            if (n > 0 && flags[1] == 0) {
+                if (_cand_palette(img, &cp, col, cnt, n) == 0) { npal = n; }
+            }
+            mem.core.munmap(cast(*u8, col), 256 * 8);
+            mem.core.munmap(cast(*u8, cnt), 256 * 8);
+        }
+    }
+
+    // ---- strategy set --------------------------------------------------
+    // FAST and DEFAULT trust the heuristic. BEST encodes every strategy and
+    // keeps the smallest; this is the only way to know, because "which filter
+    // compresses best" depends on DEFLATE, not on the residuals.
+    let is [7]i64 as strat;
+    let is i64 as ns with mut = 1;
+    strat[0] = _FS_MINSUM;
+    if (o.engine == opts.ENG_BEST) {
+        strat[0] = 0; strat[1] = 1; strat[2] = 2; strat[3] = 3; strat[4] = 4;
+        strat[5] = _FS_MINSUM; strat[6] = _FS_ENTROPY;
+        ns = 7;
+    }
+
+    // ---- search --------------------------------------------------------
+    // Two tiers, the way zopflipng does it: rank every (representation,
+    // strategy) pair with the *cheap* DEFLATE — which is enough to tell them
+    // apart, since they are being compared to each other — and then spend the
+    // expensive optimal parse exactly once, on the winner.
+    let is cb.Bytes as best with mut = cb.bytes_new(1024);
+    let is i64 as best_cand with mut = 0 - 1;      // 0 = direct, 1 = palette
+    let is i64 as best_strat with mut = 0;
+    let is i64 as ci with mut = 0;
+    while (ci < 2) {
+        let is *_Cand as c with mut = &ca;
+        if (ci == 1) { c = &cp; }
+        if (ci == 0 || npal > 0) {
+            let is i64 as si with mut = 0;
+            while (si < ns) {
+                let is cb.Bytes as idat = cb.bytes_new(1024);
+                let is i64 as r = _try(c, h, strat[si], level, &idat);
+                if (r > 0) {
+                    if (best_cand < 0 || idat.len < best.len) {
+                        cb.bytes_free(&best);
+                        best = idat;
+                        best_cand = ci;
+                        best_strat = strat[si];
+                    } else { cb.bytes_free(&idat); }
+                } else { cb.bytes_free(&idat); }
+                si = si + 1;
+            }
+        }
+        ci = ci + 1;
+    }
+    if (best_cand < 0) {
+        cb.bytes_free(&best);
+        _cand_free(&ca, h);
+        if (npal > 0) { _cand_free(&cp, h); }
+        return errno.I_OOM;
+    }
+
+    let is *_Cand as win with mut = &ca;
+    if (best_cand == 1) { win = &cp; }
+    if (final_level != level) {
+        let is cb.Bytes as fin = cb.bytes_new(1024);
+        if (_try(win, h, best_strat, final_level, &fin) > 0) {
+            if (fin.len < best.len) { cb.bytes_free(&best); best = fin; }
+            else { cb.bytes_free(&fin); }
+        } else { cb.bytes_free(&fin); }
+    }
+    _emit_png(win, w, h, &best, out);
+    cb.bytes_free(&best);
+    _cand_free(&ca, h);
+    if (npal > 0) { _cand_free(&cp, h); }
     return out.len;
+}
+
+fn png_encode(img as *image.Image, out as *cb.Bytes) as i64 {
+    let is opts.EncOpts as o;
+    opts.enc_defaults(&o);
+    return png_encode_ex(img, out, &o);
 }
 
 // ============================ APNG =========================================

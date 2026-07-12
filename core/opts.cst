@@ -1,0 +1,98 @@
+// =======================================================
+// caustic-image/core/opts.cst
+// Engine selection and per-codec knobs, shared by every format.
+//
+// A codec here is not one algorithm but a family of them: the same PNG bytes
+// can be produced by a filter heuristic that costs one pass, or by a search
+// that encodes the whole image five times and keeps the smallest. Rather than
+// hard-coding one point on that curve, each encoder/decoder takes an engine
+// tier and reads its knobs from here.
+//
+//   ENG_FAST     speed first; give up a few percent of size, or a fraction of
+//                a dB, to finish sooner. Thumbnails, previews, hot paths.
+//   ENG_DEFAULT  what the reference implementation does out of the box
+//                (libpng's per-row filter heuristic, libjpeg's Annex-K tables,
+//                libwebp's method 4). The sane default.
+//   ENG_BEST     smallest output at any reasonable cost: brute-force filter
+//                search and optimal-parse DEFLATE (PNG), trellis quantization
+//                and optimized Huffman (JPEG), full RD search (WebP).
+//
+// The tier is a *request*, not a promise: a codec that has nothing extra to
+// offer at ENG_BEST simply does its default thing.
+// =======================================================
+
+let is i64 as ENG_FAST    with imut = 0;
+let is i64 as ENG_DEFAULT with imut = 1;
+let is i64 as ENG_BEST    with imut = 2;
+
+// Chroma subsampling (JPEG; VP8 is always 4:2:0).
+let is i64 as SUB_444 with imut = 0;
+let is i64 as SUB_422 with imut = 1;
+let is i64 as SUB_420 with imut = 2;
+
+struct EncOpts {
+    engine as i64;       // ENG_*
+    quality as i64;      // 1..100, lossy codecs only
+    lossless as i64;     // 1 = force the lossless mode where a format has both
+    subsample as i64;    // SUB_*
+    progressive as i64;  // 1 = multi-scan (JPEG)
+    effort as i64;       // 0..9; codec-specific depth (deflate iterations, RD passes)
+}
+
+// The default engine: reference behaviour, quality 90, 4:2:0, sequential.
+fn enc_defaults(o as *EncOpts) as void {
+    o.engine = ENG_DEFAULT;
+    o.quality = 90;
+    o.lossless = 0;
+    o.subsample = SUB_420;
+    o.progressive = 0;
+    o.effort = 4;
+}
+
+// Defaults, then moved to a tier. Effort and subsampling follow the tier:
+// FAST keeps chroma at 4:2:0 and stops searching; BEST searches and goes 4:4:4
+// only if the caller asks, since 4:2:0 is a size win, not a shortcut.
+fn enc_engine(o as *EncOpts, engine as i64) as void {
+    enc_defaults(o);
+    o.engine = engine;
+    if (engine == ENG_FAST) { o.effort = 0; }
+    if (engine == ENG_BEST) { o.effort = 9; }
+}
+
+// ------------------------------- decode ---------------------------------
+// Decoders vary less than encoders, but the axes that matter are real: a
+// thumbnail pipeline wants an 8x-reduced IDCT and no chroma interpolation; a
+// reference decoder wants bit-exactness. `scale_den` asks for a 1/N-sized
+// decode (1, 2, 4 or 8) — codecs that cannot do it natively ignore it and the
+// caller is expected to check the returned dimensions.
+
+let is i64 as IDCT_ISLOW with imut = 0;   // accurate (the reference)
+let is i64 as IDCT_IFAST with imut = 1;   // ~2x faster, a few LSBs of error
+
+struct DecOpts {
+    engine as i64;     // ENG_*
+    scale_den as i64;  // 1 = full size; 2/4/8 = reduced-size decode
+    fancy as i64;      // 1 = interpolating chroma upsample; 0 = replicate
+    filt as i64;       // 1 = apply the in-loop deblocking filter (VP8)
+    idct as i64;       // IDCT_*
+}
+
+fn dec_defaults(o as *DecOpts) as void {
+    o.engine = ENG_DEFAULT;
+    o.scale_den = 1;
+    o.fancy = 1;
+    o.filt = 1;
+    o.idct = IDCT_ISLOW;
+}
+
+// FAST drops the interpolating upsample and the deblocking filter — the two
+// places a decoder spends time producing a difference the eye barely sees.
+fn dec_engine(o as *DecOpts, engine as i64) as void {
+    dec_defaults(o);
+    o.engine = engine;
+    if (engine == ENG_FAST) {
+        o.fancy = 0;
+        o.filt = 0;
+        o.idct = IDCT_IFAST;
+    }
+}
