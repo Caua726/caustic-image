@@ -130,6 +130,40 @@ fn _channels(fmt as i64) as i64 {
 
 let is i64 as _QUALITY with imut = 85;
 
+// Chroma (Cb/Cr) is stored at half resolution — 4:2:0 — when there are >=3
+// channels. Y and alpha stay full resolution.
+fn _is_chroma(c as i64, ch as i64) as i64 {
+    if (ch < 3) { return 0; }
+    if (c == 1) { return 1; }
+    if (c == 2) { return 1; }
+    return 0;
+}
+fn _pw(c as i64, ch as i64, w as i64) as i64 {
+    if (_is_chroma(c, ch) == 1) { return (w + 1) / 2; }
+    return w;
+}
+fn _ph(c as i64, ch as i64, h as i64) as i64 {
+    if (_is_chroma(c, ch) == 1) { return (h + 1) / 2; }
+    return h;
+}
+// Fancy (triangle 9-3-3-1) chroma upsample at full-res pixel (x, y).
+fn _ups(p as *u8, pw as i64, ph as i64, x as i64, y as i64) as i64 {
+    let is i64 as ix with mut = x >> 1;
+    if (ix >= pw) { ix = pw - 1; }
+    let is i64 as fx with mut = ix - 1;
+    if ((x & 1) == 1) { fx = ix + 1; }
+    if (fx < 0) { fx = 0; }
+    if (fx >= pw) { fx = pw - 1; }
+    let is i64 as iy with mut = y >> 1;
+    if (iy >= ph) { iy = ph - 1; }
+    let is i64 as fy with mut = iy - 1;
+    if ((y & 1) == 1) { fy = iy + 1; }
+    if (fy < 0) { fy = 0; }
+    if (fy >= ph) { fy = ph - 1; }
+    return (9 * cast(i64, p[iy * pw + ix]) + 3 * cast(i64, p[iy * pw + fx])
+        + 3 * cast(i64, p[fy * pw + ix]) + cast(i64, p[fy * pw + fx]) + 8) >> 4;
+}
+
 fn dct_encode(img as *image.Image, out as *cb.Bytes) as i64 {
     let is i64 as ch = _channels(img.fmt);
     if (ch == 0) { return errno.I_UNSUPPORTED; }
@@ -141,8 +175,7 @@ fn dct_encode(img as *image.Image, out as *cb.Bytes) as i64 {
     _build_qc(cast(*i64, &qc)); _qscale(cast(*i64, &qc), _QUALITY, cast(*i64, &qc));
     let is [64]i64 as zz; _build_zz(cast(*i64, &zz));
 
-    // YCbCr colour transform (RGB/RGBA) on a work copy — better lossy energy
-    // compaction; gray passes through untouched.
+    // YCbCr on a work copy (gray passes through untouched).
     let is i64 as n = w * h * ch;
     let is *u8 as px with mut = img.pixels;
     let is i64 as owns with mut = 0;
@@ -154,16 +187,55 @@ fn dct_encode(img as *image.Image, out as *cb.Bytes) as i64 {
         owns = 1;
     }
 
-    let is i64 as bxn = (w + 7) / 8;
-    let is i64 as byn = (h + 7) / 8;
+    // Per-channel planes: chroma box-downsampled 2x2, others full-res.
+    let is [4]i64 as plane;
+    let is i64 as c with mut = 0;
+    while (c < ch) {
+        let is i64 as pw = _pw(c, ch, w);
+        let is i64 as ph = _ph(c, ch, h);
+        let is *u8 as pl = mem.core.mmap_anon(pw * ph + 1);
+        if (cast(i64, pl) <= 0) { return errno.I_OOM; }
+        plane[c] = cast(i64, pl);
+        if (_is_chroma(c, ch) == 1) {
+            let is i64 as cy with mut = 0;
+            while (cy < ph) {
+                let is i64 as cxx with mut = 0;
+                while (cxx < pw) {
+                    let is i64 as sum with mut = 0;
+                    let is i64 as k with mut = 0;
+                    while (k < 4) {
+                        let is i64 as sx with mut = cxx * 2 + (k & 1);
+                        let is i64 as sy with mut = cy * 2 + (k >> 1);
+                        if (sx >= w) { sx = w - 1; }
+                        if (sy >= h) { sy = h - 1; }
+                        sum = sum + cast(i64, px[(sy * w + sx) * ch + c]);
+                        k = k + 1;
+                    }
+                    pl[cy * pw + cxx] = cast(u8, (sum + 2) / 4);
+                    cxx = cxx + 1;
+                }
+                cy = cy + 1;
+            }
+        } else {
+            let is i64 as p with mut = 0;
+            while (p < w * h) { pl[p] = px[p * ch + c]; p = p + 1; }
+        }
+        c = c + 1;
+    }
+    if (owns == 1) { mem.core.munmap(px, n + 1); }
+
     let is cb.Bytes as coefb = cb.bytes_new(4096);
     let is [4]i64 as prevdc; let is i64 as pi with mut = 0; while (pi < 4) { prevdc[pi] = 0; pi = pi + 1; }
 
-    let is i64 as c with mut = 0;
+    c = 0;
     while (c < ch) {
-        // Cb/Cr use the chroma table; Y and alpha use luma.
         let is *i64 as q with mut = cast(*i64, &ql);
-        if (ch >= 3) { if (c == 1) { q = cast(*i64, &qc); } if (c == 2) { q = cast(*i64, &qc); } }
+        if (_is_chroma(c, ch) == 1) { q = cast(*i64, &qc); }
+        let is i64 as pw = _pw(c, ch, w);
+        let is i64 as ph = _ph(c, ch, h);
+        let is *u8 as pl = cast(*u8, plane[c]);
+        let is i64 as bxn = (pw + 7) / 8;
+        let is i64 as byn = (ph + 7) / 8;
         let is i64 as by with mut = 0;
         while (by < byn) {
             let is i64 as bx with mut = 0;
@@ -173,9 +245,9 @@ fn dct_encode(img as *image.Image, out as *cb.Bytes) as i64 {
                 while (yy < 8) {
                     let is i64 as xx with mut = 0;
                     while (xx < 8) {
-                        let is i64 as sx with mut = bx * 8 + xx; if (sx >= w) { sx = w - 1; }
-                        let is i64 as sy with mut = by * 8 + yy; if (sy >= h) { sy = h - 1; }
-                        blk[yy * 8 + xx] = cast(i64, px[(sy * w + sx) * ch + c]) - 128;
+                        let is i64 as sx with mut = bx * 8 + xx; if (sx >= pw) { sx = pw - 1; }
+                        let is i64 as sy with mut = by * 8 + yy; if (sy >= ph) { sy = ph - 1; }
+                        blk[yy * 8 + xx] = cast(i64, pl[sy * pw + sx]) - 128;
                         xx = xx + 1;
                     }
                     yy = yy + 1;
@@ -193,9 +265,9 @@ fn dct_encode(img as *image.Image, out as *cb.Bytes) as i64 {
             }
             by = by + 1;
         }
+        mem.core.munmap(pl, pw * ph + 1);
         c = c + 1;
     }
-    if (owns == 1) { mem.core.munmap(px, n + 1); }
 
     cb.bytes_push(out, cast(u8, _QUALITY));            // quality byte
     _w32(out, coefb.len);
@@ -222,16 +294,23 @@ fn dct_decode(src as *u8, len as i64, w as i64, h as i64, ch as i64, out as *u8)
     _build_q(cast(*i64, &ql));  _qscale(cast(*i64, &ql), quality, cast(*i64, &ql));
     _build_qc(cast(*i64, &qc)); _qscale(cast(*i64, &qc), quality, cast(*i64, &qc));
     let is [64]i64 as zz; _build_zz(cast(*i64, &zz));
-    let is i64 as bxn = (w + 7) / 8;
-    let is i64 as byn = (h + 7) / 8;
     let is [4]i64 as prevdc; let is i64 as pj with mut = 0; while (pj < 4) { prevdc[pj] = 0; pj = pj + 1; }
     let is [1]i64 as posv; posv[0] = 0;
     let is *i64 as pos = cast(*i64, &posv);
 
+    // Reconstruct each channel's plane (chroma at half resolution).
+    let is [4]i64 as plane;
     let is i64 as c with mut = 0;
     while (c < ch) {
         let is *i64 as q with mut = cast(*i64, &ql);
-        if (ch >= 3) { if (c == 1) { q = cast(*i64, &qc); } if (c == 2) { q = cast(*i64, &qc); } }
+        if (_is_chroma(c, ch) == 1) { q = cast(*i64, &qc); }
+        let is i64 as pw = _pw(c, ch, w);
+        let is i64 as ph = _ph(c, ch, h);
+        let is *u8 as pl = mem.core.mmap_anon(pw * ph + 1);
+        if (cast(i64, pl) <= 0) { mem.core.munmap(dec, sym_count + 1); return errno.I_OOM; }
+        plane[c] = cast(i64, pl);
+        let is i64 as bxn = (pw + 7) / 8;
+        let is i64 as byn = (ph + 7) / 8;
         let is i64 as by with mut = 0;
         while (by < byn) {
             let is i64 as bx with mut = 0;
@@ -249,11 +328,11 @@ fn dct_decode(src as *u8, len as i64, w as i64, h as i64, ch as i64, out as *u8)
                 let is i64 as yy with mut = 0;
                 while (yy < 8) {
                     let is i64 as dy = by * 8 + yy;
-                    if (dy < h) {
+                    if (dy < ph) {
                         let is i64 as xx with mut = 0;
                         while (xx < 8) {
                             let is i64 as dx = bx * 8 + xx;
-                            if (dx < w) { out[(dy * w + dx) * ch + c] = blk[yy * 8 + xx]; }
+                            if (dx < pw) { pl[dy * pw + dx] = blk[yy * 8 + xx]; }
                             xx = xx + 1;
                         }
                     }
@@ -266,6 +345,34 @@ fn dct_decode(src as *u8, len as i64, w as i64, h as i64, ch as i64, out as *u8)
         c = c + 1;
     }
     mem.core.munmap(dec, sym_count + 1);
+
+    // Assemble interleaved output (chroma upsampled with the triangle filter).
+    let is i64 as cpw = _pw(1, ch, w);
+    let is i64 as cph = _ph(1, ch, h);
+    let is i64 as y2 with mut = 0;
+    while (y2 < h) {
+        let is i64 as x2 with mut = 0;
+        while (x2 < w) {
+            let is i64 as o = (y2 * w + x2) * ch;
+            let is i64 as cc with mut = 0;
+            while (cc < ch) {
+                let is *u8 as pl = cast(*u8, plane[cc]);
+                if (_is_chroma(cc, ch) == 1) {
+                    out[o + cc] = cast(u8, _ups(pl, cpw, cph, x2, y2));
+                } else {
+                    out[o + cc] = pl[y2 * w + x2];
+                }
+                cc = cc + 1;
+            }
+            x2 = x2 + 1;
+        }
+        y2 = y2 + 1;
+    }
+    c = 0;
+    while (c < ch) {
+        mem.core.munmap(cast(*u8, plane[c]), _pw(c, ch, w) * _ph(c, ch, h) + 1);
+        c = c + 1;
+    }
     if (ch >= 3) { _ycc_to_rgb(out, w, h, ch); }
     return 0;
 }

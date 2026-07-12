@@ -38,7 +38,7 @@ ILIM resource limits, IHDR geometry, ICOL/CICP colour with "Unspecified" banned)
 | RAW (0)     | lossless | identity (8/16-bit) |
 | QOI (1)     | lossless | the QOI op-stream as a tile codec (8-bit) |
 | MODULAR (2) | lossless | subtract-green + MED predictor, then best of DEFLATE / rANS / context-rANS (8/16-bit, deep colour) |
-| DCT (3)     | lossy    | YCbCr + forward DCT + quality-scaled quant (luma/chroma) + rANS; ~42 dB PSNR (8-bit) |
+| DCT (3)     | lossy    | YCbCr 4:2:0 + forward DCT + quality-scaled quant (luma/chroma) + rANS; ~42 dB PSNR, beats our JPEG on photos (8-bit) |
 
 Tiled images (ICOD tile grid + TIDX per-tile index with CRC and byte ranges) decode each tile
 independently — the scalability substrate for partial/parallel decode. Decode is fail-loud: bad
