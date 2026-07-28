@@ -32,8 +32,8 @@ fn encode_ex(img as *image.Image, fmt as i64, out as *cb.Bytes, o as *opts.EncOp
     if (fmt == sniff.SNIFF_PNM)  { return pnm.pnm_encode(img, out); }
     if (fmt == sniff.SNIFF_TGA)  { return tga.tga_encode(img, out); }
     if (fmt == sniff.SNIFF_GIF)  { return gif.gif_encode(img, out); }
-    if (fmt == sniff.SNIFF_JPEG) { return jpeg.jpeg_encode(img, out); }
-    if (fmt == sniff.SNIFF_WEBP) { return webp.webp_encode(img, out); }
+    if (fmt == sniff.SNIFF_JPEG) { return jpeg.jpeg_encode_ex(img, out, o); }
+    if (fmt == sniff.SNIFF_WEBP) { return webp.webp_encode_ex(img, out, o); }
     if (fmt == sniff.SNIFF_CSIF) { return csif.csif_encode_ex(img, out, 2); }
     return errno.I_UNSUPPORTED;
 }

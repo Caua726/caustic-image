@@ -13,6 +13,7 @@ use "std/mem.cst" only bins, core as mem;
 use "../core/errno.cst"  as errno;
 use "../core/image.cst"  as image;
 use "../core/pixfmt.cst" as pixfmt;
+use "../core/opts.cst"   as opts;
 use "caustic-compact/core/bitreader.cst" as br;
 use "vp8.cst" as vp8;
 
@@ -347,6 +348,38 @@ fn _addpx(a as i64, bb as i64) as i64 {
 fn _s8(v as i64) as i64 { if (v >= 128) { return v - 256; } return v; }
 fn _ctdelta(t as i64, c as i64) as i64 { return (_s8(t) * _s8(c)) >> 5; }
 
+// The fourteen VP8L spatial predictors, on packed ARGB. Shared by the decoder's
+// inverse transform and the encoder's forward one, so the two cannot drift.
+// Modes 11-13 are the ones that matter for smooth content: 12 predicts
+// L + T - TL per channel, which is *exact* on a linear gradient and collapses
+// its residual to zero.
+fn _pred_px(mode as i64, l as i64, t as i64, tl as i64, tr as i64) as i64 {
+    if (mode == 0)  { return 255 << 24; }
+    if (mode == 1)  { return l; }
+    if (mode == 2)  { return t; }
+    if (mode == 3)  { return tr; }
+    if (mode == 4)  { return tl; }
+    if (mode == 5)  { return _avg2(_avg2(l, tr), t); }
+    if (mode == 6)  { return _avg2(l, tl); }
+    if (mode == 7)  { return _avg2(l, t); }
+    if (mode == 8)  { return _avg2(tl, t); }
+    if (mode == 9)  { return _avg2(t, tr); }
+    if (mode == 10) { return _avg2(_avg2(l, tl), _avg2(t, tr)); }
+    if (mode == 11) { return _select(t, l, tl); }
+    if (mode == 12) { return _cas_full(l, t, tl); }
+    return _cas_half(l, t, tl);
+}
+
+// The prediction at p under the spec's border rules: the very first pixel
+// predicts opaque black, the top row predicts from the left, the left column
+// predicts from above, and only the interior consults `mode`.
+fn _pred_at(buf as *i64, w as i64, p as i64, x as i64, y as i64, mode as i64) as i64 {
+    if (p == 0) { return 255 << 24; }
+    if (y == 0) { return buf[p - 1]; }
+    if (x == 0) { return buf[p - w]; }
+    return _pred_px(mode, buf[p - 1], buf[p - w], buf[p - w - 1], buf[p - w + 1]);
+}
+
 fn _inv_predictor(buf as *i64, w as i64, h as i64, data as *i64, bits as i64) as void {
     let is i64 as tw = _sub(w, bits);
     let is i64 as p with mut = 0;
@@ -354,32 +387,11 @@ fn _inv_predictor(buf as *i64, w as i64, h as i64, data as *i64, bits as i64) as
     while (y < h) {
         let is i64 as x with mut = 0;
         while (x < w) {
-            let is i64 as pred with mut = 0;
-            if (p == 0) { pred = 255 << 24; }
-            else { if (y == 0) { pred = buf[p - 1]; }
-            else { if (x == 0) { pred = buf[p - w]; }
-            else {
-                let is i64 as mode = (data[(y >> bits) * tw + (x >> bits)] >> 8) & 255;
-                let is i64 as l = buf[p - 1];
-                let is i64 as t = buf[p - w];
-                let is i64 as tl = buf[p - w - 1];
-                let is i64 as tr = buf[p - w + 1];
-                if (mode == 0) { pred = 255 << 24; }
-                else { if (mode == 1) { pred = l; }
-                else { if (mode == 2) { pred = t; }
-                else { if (mode == 3) { pred = tr; }
-                else { if (mode == 4) { pred = tl; }
-                else { if (mode == 5) { pred = _avg2(_avg2(l, tr), t); }
-                else { if (mode == 6) { pred = _avg2(l, tl); }
-                else { if (mode == 7) { pred = _avg2(l, t); }
-                else { if (mode == 8) { pred = _avg2(tl, t); }
-                else { if (mode == 9) { pred = _avg2(t, tr); }
-                else { if (mode == 10) { pred = _avg2(_avg2(l, tl), _avg2(t, tr)); }
-                else { if (mode == 11) { pred = _select(t, l, tl); }
-                else { if (mode == 12) { pred = _cas_full(l, t, tl); }
-                else { pred = _cas_half(l, t, tl); } }}}}}}}}}}}}
-            } } }
-            buf[p] = _addpx(buf[p], pred);
+            let is i64 as mode with mut = 0;
+            if (p > 0 && y > 0 && x > 0) {
+                mode = (data[(y >> bits) * tw + (x >> bits)] >> 8) & 255;
+            }
+            buf[p] = _addpx(buf[p], _pred_at(buf, w, p, x, y, mode));
             p = p + 1;
             x = x + 1;
         }
@@ -1081,172 +1093,308 @@ fn _predc(mode as i64, l as i64, t as i64, tl as i64, tr as i64) as i64 {
     return (l + t) >> 1;
 }
 
-fn webp_encode(img as *image.Image, out as *cbb.Bytes) as i64 {
-    let is i64 as ch with mut = 0;
-    if (img.fmt == pixfmt.FMT_RGB8)  { ch = 3; }
-    if (img.fmt == pixfmt.FMT_RGBA8) { ch = 4; }
-    if (ch == 0) { return errno.I_UNSUPPORTED; }
-    let is i64 as w = img.width;
-    let is i64 as h = img.height;
-    let is i64 as npx = w * h;
-    let is *u8 as px = img.pixels;
+// ---- LZ77 backward references -------------------------------------------
+// This is what was missing, and it was the whole ballgame. A predictor plus a
+// Huffman coder can only exploit *local* correlation; it has no way to say
+// "these 300 pixels are the row above, again". On a UI screenshot that is
+// almost all the redundancy there is, and its absence cost us a factor of 90
+// against libwebp. LZ77 over the transformed pixel array supplies it.
 
-    // channel streams with subtract-green applied
-    let is *u8 as gs = mem.core.mmap_anon(npx);
-    let is *u8 as rs = mem.core.mmap_anon(npx);
-    let is *u8 as bs = mem.core.mmap_anon(npx);
-    let is *u8 as as2 = mem.core.mmap_anon(npx);
-    if (cast(i64, as2) <= 0) { return errno.I_OOM; }
-    let is i64 as alpha_used with mut = 0;
+let is i64 as _HB     with imut = 15;      // hash bits
+let is i64 as _MINLEN with imut = 3;       // shorter copies lose to literals
+let is i64 as _MAXLEN with imut = 4096;    // VP8L's ceiling
+
+fn _hash3(argb as *i64, p as i64) as i64 {
+    let is i64 as h = (argb[p] * 31 + argb[p + 1]) * 31 + argb[p + 2];
+    return ((h >> 9) ^ (h >> 21)) & ((1 << _HB) - 1);
+}
+
+// Longest match at p. out[0] = length (0 if none worth taking), out[1] =
+// distance. Does not touch the chain.
+//
+// The hash chain alone is not enough for image data. The distance that matters
+// most in a picture is one row — and on a flat or gradient image every position
+// hashes into the same handful of buckets, so a bounded chain walk only ever
+// reaches the nearest few pixels and never gets back far enough to see the row
+// above. So probe that distance directly, before the chain. It costs one
+// comparison and it is the difference between compressing a gradient and not.
+fn _lz_find(argb as *i64, npx as i64, p as i64, xsize as i64, maxchain as i64,
+            head as *i64, prev as *i64, out as *i64) as void {
+    out[0] = 0; out[1] = 0;
+    if (p + _MINLEN > npx) { return; }
+    let is i64 as maxl with mut = npx - p;
+    if (maxl > _MAXLEN) { maxl = _MAXLEN; }
+    let is i64 as blen with mut = 0;
+    let is i64 as bdist with mut = 0;
+
+    // The neighbourhood above, column by column. A gradient's residual repeats
+    // the previous row *shifted by a column*, not the previous row itself, so
+    // probing only `xsize` finds nothing; the useful distances are xsize +/- a
+    // few. This is precisely the set VP8L's 2D distance codes are built to name
+    // cheaply, which is the format telling us where to look.
+    let is i64 as k with mut = 0 - 2;
+    while (k <= 2) {
+        let is i64 as d with mut = xsize + k;
+        if (d >= 1 && d <= p) {
+            let is i64 as l with mut = 0;
+            while (l < maxl && argb[p - d + l] == argb[p + l]) { l = l + 1; }
+            if (l > blen) { blen = l; bdist = d; }
+        }
+        d = 2 * xsize + k;
+        if (d >= 1 && d <= p) {
+            let is i64 as l2 with mut = 0;
+            while (l2 < maxl && argb[p - d + l2] == argb[p + l2]) { l2 = l2 + 1; }
+            if (l2 > blen) { blen = l2; bdist = d; }
+        }
+        k = k + 1;
+    }
+
+    let is i64 as hh = _hash3(argb, p);
+    let is i64 as cand with mut = head[hh];
+    let is i64 as chain with mut = 0;
+    while (cand >= 0 && chain < maxchain && blen < maxl) {
+        let is i64 as l with mut = 0;
+        while (l < maxl && argb[cand + l] == argb[p + l]) { l = l + 1; }
+        if (l > blen) { blen = l; bdist = p - cand; }
+        cand = prev[cand];
+        chain = chain + 1;
+    }
+    if (blen >= _MINLEN) { out[0] = blen; out[1] = bdist; }
+}
+
+fn _lz_insert(argb as *i64, npx as i64, p as i64, head as *i64, prev as *i64) as void {
+    if (p + _MINLEN > npx) { return; }
+    let is i64 as hh = _hash3(argb, p);
+    prev[p] = head[hh];
+    head[hh] = p;
+}
+
+// Parse the pixel array into tokens.
+//   tk = 0 -> literal, ta = pixel index
+//   tk = 1 -> copy,    ta = length, tb = distance
+//   tk = 2 -> colour-cache hit, tb = cache index   (added later, by _apply_cache)
+// Returns the token count.
+fn _lz77(argb as *i64, npx as i64, xsize as i64, maxchain as i64, lazy as i64,
+         tk as *u8, ta as *i64, tb as *i64) as i64 {
+    let is i64 as HS = 1 << _HB;
+    let is *i64 as head = cast(*i64, mem.core.mmap_anon(HS * 8));
+    let is *i64 as prev = cast(*i64, mem.core.mmap_anon((npx + 1) * 8));
+    if (cast(i64, prev) <= 0) { return 0 - 1; }
+    mem.core.memset(cast(*u8, head), cast(i32, 0xFF), HS * 8);
+    let is [2]i64 as m0;
+    let is [2]i64 as m1;
+    let is i64 as ntok with mut = 0;
     let is i64 as p with mut = 0;
     while (p < npx) {
-        let is i64 as r = cast(i64, px[p * ch]);
-        let is i64 as g = cast(i64, px[p * ch + 1]);
-        let is i64 as bl = cast(i64, px[p * ch + 2]);
-        let is i64 as a with mut = 255;
-        if (ch == 4) { a = cast(i64, px[p * ch + 3]); }
-        if (a != 255) { alpha_used = 1; }
-        gs[p] = cast(u8, g);
-        rs[p] = cast(u8, (r - g) & 255);
-        bs[p] = cast(u8, (bl - g) & 255);
-        as2[p] = cast(u8, a);
-        p = p + 1;
-    }
-
-    // ---- predictor transform (16x16 tiles, best of modes 0..10 per tile) ----
-    let is i64 as pbits = 4;
-    let is i64 as ptw = _sub(w, pbits);
-    let is i64 as pth = _sub(h, pbits);
-    let is *u8 as modes = mem.core.mmap_anon(ptw * pth + 1);
-    let is *u8 as res_g = mem.core.mmap_anon(npx);
-    let is *u8 as res_r = mem.core.mmap_anon(npx);
-    let is *u8 as res_b = mem.core.mmap_anon(npx);
-    let is *u8 as res_a = mem.core.mmap_anon(npx);
-    if (cast(i64, res_a) <= 0) { return errno.I_OOM; }
-
-    let is i64 as ty with mut = 0;
-    while (ty < pth) {
-        let is i64 as tx with mut = 0;
-        while (tx < ptw) {
-            // pick the mode with the smallest wrap-aware residual magnitude
-            let is i64 as best with mut = 0;
-            let is i64 as bestcost with mut = 0 - 1;
-            let is i64 as m with mut = 0;
-            while (m <= 10) {
-                let is i64 as cost with mut = 0;
-                let is i64 as y with mut = ty << pbits;
-                while (y < ((ty + 1) << pbits)) {
-                    if (y < h) {
-                        let is i64 as x with mut = tx << pbits;
-                        while (x < ((tx + 1) << pbits)) {
-                            if (x < w) {
-                                let is i64 as q = y * w + x;
-                                let is i64 as c2 with mut = 0;
-                                while (c2 < 4) {
-                                    let is *u8 as chp with mut = gs;
-                                    if (c2 == 1) { chp = rs; }
-                                    if (c2 == 2) { chp = bs; }
-                                    if (c2 == 3) { chp = as2; }
-                                    let is i64 as cur = cast(i64, chp[q]);
-                                    let is i64 as pred with mut = 0;
-                                    if (q == 0) { if (c2 == 3) { pred = 255; } }
-                                    else { if (y == 0) { pred = cast(i64, chp[q - 1]); }
-                                    else { if (x == 0) { pred = cast(i64, chp[q - w]); }
-                                    else {
-                                        pred = _predc(m,
-                                            cast(i64, chp[q - 1]), cast(i64, chp[q - w]),
-                                            cast(i64, chp[q - w - 1]), cast(i64, chp[q - w + 1]));
-                                        if (m == 0) { if (c2 == 3) { pred = 255; } }
-                                    } } }
-                                    let is i64 as d with mut = (cur - pred) & 255;
-                                    if (d > 128) { d = 256 - d; }
-                                    cost = cost + d;
-                                    c2 = c2 + 1;
-                                }
-                            }
-                            x = x + 1;
-                        }
-                    }
-                    y = y + 1;
-                }
-                if (bestcost < 0) { bestcost = cost; best = m; }
-                else { if (cost < bestcost) { bestcost = cost; best = m; } }
-                m = m + 1;
+        _lz_find(argb, npx, p, xsize, maxchain, head, prev, cast(*i64, &m0));
+        _lz_insert(argb, npx, p, head, prev);
+        let is i64 as take with mut = 0;
+        if (m0[0] >= _MINLEN) {
+            take = 1;
+            // Lazy matching: a longer match one pixel later can be worth
+            // spending a literal to reach.
+            if (lazy == 1 && p + 1 < npx) {
+                _lz_find(argb, npx, p + 1, xsize, maxchain, head, prev, cast(*i64, &m1));
+                if (m1[0] > m0[0]) { take = 0; }
             }
-            modes[ty * ptw + tx] = cast(u8, best);
-            tx = tx + 1;
         }
-        ty = ty + 1;
+        if (take == 1) {
+            tk[ntok] = cast(u8, 1); ta[ntok] = m0[0]; tb[ntok] = m0[1];
+            ntok = ntok + 1;
+            let is i64 as k with mut = p + 1;
+            while (k < p + m0[0]) { _lz_insert(argb, npx, k, head, prev); k = k + 1; }
+            p = p + m0[0];
+        } else {
+            tk[ntok] = cast(u8, 0); ta[ntok] = p; tb[ntok] = 0;
+            ntok = ntok + 1;
+            p = p + 1;
+        }
     }
-    // residuals under the chosen per-tile modes (border rules fixed by spec)
-    let is i64 as y2 with mut = 0;
-    while (y2 < h) {
-        let is i64 as x2 with mut = 0;
-        while (x2 < w) {
-            let is i64 as q = y2 * w + x2;
-            let is i64 as m = cast(i64, modes[(y2 >> pbits) * ptw + (x2 >> pbits)]);
-            let is i64 as c2 with mut = 0;
-            while (c2 < 4) {
-                let is *u8 as chp with mut = gs;
-                let is *u8 as rp with mut = res_g;
-                if (c2 == 1) { chp = rs; rp = res_r; }
-                if (c2 == 2) { chp = bs; rp = res_b; }
-                if (c2 == 3) { chp = as2; rp = res_a; }
-                let is i64 as cur = cast(i64, chp[q]);
-                let is i64 as pred with mut = 0;
-                if (q == 0) { if (c2 == 3) { pred = 255; } }
-                else { if (y2 == 0) { pred = cast(i64, chp[q - 1]); }
-                else { if (x2 == 0) { pred = cast(i64, chp[q - w]); }
-                else {
-                    pred = _predc(m,
-                        cast(i64, chp[q - 1]), cast(i64, chp[q - w]),
-                        cast(i64, chp[q - w - 1]), cast(i64, chp[q - w + 1]));
-                    if (m == 0) { if (c2 == 3) { pred = 255; } }
-                } } }
-                rp[q] = cast(u8, (cur - pred) & 255);
-                c2 = c2 + 1;
+    mem.core.munmap(cast(*u8, head), HS * 8);
+    mem.core.munmap(cast(*u8, prev), (npx + 1) * 8);
+    return ntok;
+}
+
+// Turn literals into colour-cache references wherever the cache already holds
+// the pixel. The cache must be driven exactly as the decoder drives it — every
+// emitted pixel is inserted, including each pixel of a copy and the hit itself
+// — or the two sides diverge. Both start zeroed, so a run of transparent black
+// at the top of the image legitimately hits an entry nobody wrote.
+fn _apply_cache(argb as *i64, tk as *u8, ta as *i64, tb as *i64, ntok as i64,
+                cachebits as i64) as void {
+    if (cachebits == 0) { return; }
+    let is i64 as csz = 1 << cachebits;
+    let is *i64 as cache = cast(*i64, mem.core.mmap_anon(csz * 8));
+    let is i64 as cshift = 32 - cachebits;
+    let is i64 as p with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < ntok) {
+        if (cast(i64, tk[i]) == 0) {
+            let is i64 as v = argb[p];
+            let is i64 as hh = ((v * 506832829) & 0xFFFFFFFF) >> cshift;
+            if (cache[hh] == v) { tk[i] = cast(u8, 2); tb[i] = hh; }
+            cache[hh] = v;
+            p = p + 1;
+        } else {
+            let is i64 as k with mut = 0;
+            while (k < ta[i]) {
+                let is i64 as v = argb[p + k];
+                cache[((v * 506832829) & 0xFFFFFFFF) >> cshift] = v;
+                k = k + 1;
             }
-            x2 = x2 + 1;
+            p = p + ta[i];
         }
-        y2 = y2 + 1;
+        i = i + 1;
+    }
+    mem.core.munmap(cast(*u8, cache), csz * 8);
+}
+
+// VP8L prefix code for a 1-based value: out[0] = symbol, out[1] = extra bit
+// count, out[2] = extra value. The exact inverse of the decoder's _prefix_val.
+fn _prefix_enc(v as i64, out as *i64) as void {
+    if (v <= 4) { out[0] = v - 1; out[1] = 0; out[2] = 0; return; }
+    let is i64 as u = v - 1;
+    let is i64 as m with mut = 0;
+    while ((1 << (m + 1)) <= u) { m = m + 1; }        // floor(log2(u)), >= 2
+    let is i64 as half = 1 << (m - 1);
+    let is i64 as three = 3 * half;
+    if (u < three) { out[0] = 2 * m;     out[1] = m - 1; out[2] = u - (1 << m); }
+    else           { out[0] = 2 * m + 1; out[1] = m - 1; out[2] = u - three; }
+}
+
+// Pixel distance -> VP8L distance code. Codes 1..120 name a small 2D
+// neighbourhood (so "one row up" is cheap regardless of width); anything else
+// is the raw distance plus 120. The decoder owns that mapping in _plane_dist,
+// so rather than carry a second table that could drift out of sync, invert it:
+// take the smallest code that reproduces this exact distance.
+fn _dist_code(dist as i64, w as i64) as i64 {
+    let is i64 as c with mut = 1;
+    while (c <= 120) {
+        if (_plane_dist(c, w) == dist) { return c; }
+        c = c + 1;
+    }
+    return dist + 120;
+}
+
+// Write one LZ77-coded image stream: five prefix codes, then the tokens.
+// The caller has already written the colour-cache and meta-prefix headers.
+fn _enc_lz_stream(b as *bw.BitWriter, argb as *i64, npx as i64, xsize as i64,
+                  cachebits as i64, maxchain as i64, lazy as i64) as i64 {
+    let is i64 as csz with mut = 0;
+    if (cachebits > 0) { csz = 1 << cachebits; }
+    let is i64 as gsz = 280 + csz;
+
+    let is *u8 as tk = mem.core.mmap_anon(npx + 1);
+    let is *i64 as ta = cast(*i64, mem.core.mmap_anon((npx + 1) * 8));
+    let is *i64 as tb = cast(*i64, mem.core.mmap_anon((npx + 1) * 8));
+    if (cast(i64, tb) <= 0) { return errno.I_OOM; }
+    let is i64 as ntok = _lz77(argb, npx, xsize, maxchain, lazy, tk, ta, tb);
+    if (ntok < 0) { return errno.I_OOM; }
+    _apply_cache(argb, tk, ta, tb, ntok, cachebits);
+
+    let is *i64 as gf = cast(*i64, mem.core.mmap_anon(gsz * 8));
+    let is [256]i64 as rf;
+    let is [256]i64 as bf;
+    let is [256]i64 as af;
+    let is [40]i64 as df;
+    let is i64 as i with mut = 0;
+    while (i < 256) { rf[i] = 0; bf[i] = 0; af[i] = 0; i = i + 1; }
+    i = 0; while (i < 40) { df[i] = 0; i = i + 1; }
+
+    let is [3]i64 as pe;
+    i = 0;
+    while (i < ntok) {
+        let is i64 as t = cast(i64, tk[i]);
+        if (t == 0) {
+            let is i64 as v = argb[ta[i]];
+            let is i64 as g = (v >> 8) & 255;
+            gf[g] = gf[g] + 1;
+            rf[(v >> 16) & 255] = rf[(v >> 16) & 255] + 1;
+            bf[v & 255] = bf[v & 255] + 1;
+            af[(v >> 24) & 255] = af[(v >> 24) & 255] + 1;
+        } else {
+            if (t == 1) {
+                _prefix_enc(ta[i], cast(*i64, &pe));
+                gf[256 + pe[0]] = gf[256 + pe[0]] + 1;
+                _prefix_enc(_dist_code(tb[i], xsize), cast(*i64, &pe));
+                df[pe[0]] = df[pe[0]] + 1;
+            } else {
+                gf[280 + tb[i]] = gf[280 + tb[i]] + 1;
+            }
+        }
+        i = i + 1;
     }
 
-    // ---- VP8L payload ----
-    let is cbb.Bytes as pay = cbb.bytes_new(npx + 4096);
-    cbb.bytes_push(&pay, cast(u8, 47));            // 0x2f signature
-    let is bw.BitWriter as b;
-    bw.bw_init(&b, &pay);
-    bw.bw_bits(&b, w - 1, 14);
-    bw.bw_bits(&b, h - 1, 14);
-    bw.bw_bits(&b, alpha_used, 1);
-    bw.bw_bits(&b, 0, 3);                          // version
-    bw.bw_bits(&b, 1, 1);                          // transform present
-    bw.bw_bits(&b, 2, 2);                          // SUBTRACT_GREEN
-    bw.bw_bits(&b, 1, 1);                          // another transform
-    bw.bw_bits(&b, 0, 2);                          // PREDICTOR
-    bw.bw_bits(&b, pbits - 2, 3);                  // size_bits
-    // predictor image substream: green = mode, other channels constant
-    let is i64 as pn = ptw * pth;
-    let is *u8 as z0 = mem.core.mmap_anon(pn + 1);
-    let is *u8 as z255 = mem.core.mmap_anon(pn + 1);
-    if (cast(i64, z255) <= 0) { return errno.I_OOM; }
-    mem.core.memset(z0, cast(i32, 0), pn);
-    mem.core.memset(z255, cast(i32, 255), pn);
-    bw.bw_bits(&b, 0, 1);                          // aux: no colour cache
-    _enc_literal_stream(&b, modes, z0, z0, z255, pn);
-    bw.bw_bits(&b, 0, 1);                          // no more transforms
-    bw.bw_bits(&b, 0, 1);                          // no colour cache
-    bw.bw_bits(&b, 0, 1);                          // no meta-Huffman
-    _enc_literal_stream(&b, res_g, res_r, res_b, res_a, npx);
-    bw.bw_align(&b);
-    mem.core.munmap(gs, npx); mem.core.munmap(rs, npx);
-    mem.core.munmap(bs, npx); mem.core.munmap(as2, npx);
-    mem.core.munmap(res_g, npx); mem.core.munmap(res_r, npx);
-    mem.core.munmap(res_b, npx); mem.core.munmap(res_a, npx);
-    mem.core.munmap(modes, pn + 1);
-    mem.core.munmap(z0, pn + 1); mem.core.munmap(z255, pn + 1);
+    let is *i64 as gl = cast(*i64, mem.core.mmap_anon(gsz * 8));
+    let is *i64 as gc = cast(*i64, mem.core.mmap_anon(gsz * 8));
+    let is [256]i64 as rl; let is [256]i64 as rc;
+    let is [256]i64 as bl2; let is [256]i64 as bc;
+    let is [256]i64 as al; let is [256]i64 as ac;
+    let is [40]i64 as dl; let is [40]i64 as dc;
+    let is i64 as gu = _hlens(gf, gsz, 15, gl);
+    let is i64 as ru = _hlens(cast(*i64, &rf), 256, 15, cast(*i64, &rl));
+    let is i64 as bu = _hlens(cast(*i64, &bf), 256, 15, cast(*i64, &bl2));
+    let is i64 as au = _hlens(cast(*i64, &af), 256, 15, cast(*i64, &al));
+    let is i64 as du = _hlens(cast(*i64, &df), 40, 15, cast(*i64, &dl));
+    // A one-symbol tree costs zero bits per symbol, so its emission lengths
+    // must be cleared or the writer would spend real bits on a certainty.
+    if (gu == 1) { i = 0; while (i < gsz) { gl[i] = 0; i = i + 1; } }
+    if (ru == 1) { i = 0; while (i < 256) { rl[i] = 0; i = i + 1; } }
+    if (bu == 1) { i = 0; while (i < 256) { bl2[i] = 0; i = i + 1; } }
+    if (au == 1) { i = 0; while (i < 256) { al[i] = 0; i = i + 1; } }
+    if (du == 1) { i = 0; while (i < 40) { dl[i] = 0; i = i + 1; } }
+    _canon(gl, gsz, gc);
+    _canon(cast(*i64, &rl), 256, cast(*i64, &rc));
+    _canon(cast(*i64, &bl2), 256, cast(*i64, &bc));
+    _canon(cast(*i64, &al), 256, cast(*i64, &ac));
+    _canon(cast(*i64, &dl), 40, cast(*i64, &dc));
 
-    // ---- RIFF container ----
+    _write_htree(b, gl, gsz, gu, gf);
+    _write_htree(b, cast(*i64, &rl), 256, ru, cast(*i64, &rf));
+    _write_htree(b, cast(*i64, &bl2), 256, bu, cast(*i64, &bf));
+    _write_htree(b, cast(*i64, &al), 256, au, cast(*i64, &af));
+    _write_htree(b, cast(*i64, &dl), 40, du, cast(*i64, &df));
+
+    i = 0;
+    while (i < ntok) {
+        let is i64 as t = cast(i64, tk[i]);
+        if (t == 0) {
+            let is i64 as v = argb[ta[i]];
+            let is i64 as g = (v >> 8) & 255;
+            let is i64 as r = (v >> 16) & 255;
+            let is i64 as bl = v & 255;
+            let is i64 as a = (v >> 24) & 255;
+            bw.bw_huff(b, gc[g], gl[g]);
+            bw.bw_huff(b, rc[r], rl[r]);
+            bw.bw_huff(b, bc[bl], bl2[bl]);
+            bw.bw_huff(b, ac[a], al[a]);
+        } else {
+            if (t == 1) {
+                _prefix_enc(ta[i], cast(*i64, &pe));
+                let is i64 as gs2 = 256 + pe[0];
+                bw.bw_huff(b, gc[gs2], gl[gs2]);
+                if (pe[1] > 0) { bw.bw_bits(b, pe[2], pe[1]); }
+                _prefix_enc(_dist_code(tb[i], xsize), cast(*i64, &pe));
+                bw.bw_huff(b, dc[pe[0]], dl[pe[0]]);
+                if (pe[1] > 0) { bw.bw_bits(b, pe[2], pe[1]); }
+            } else {
+                let is i64 as cs = 280 + tb[i];
+                bw.bw_huff(b, gc[cs], gl[cs]);
+            }
+        }
+        i = i + 1;
+    }
+
+    mem.core.munmap(tk, npx + 1);
+    mem.core.munmap(cast(*u8, ta), (npx + 1) * 8);
+    mem.core.munmap(cast(*u8, tb), (npx + 1) * 8);
+    mem.core.munmap(cast(*u8, gf), gsz * 8);
+    mem.core.munmap(cast(*u8, gl), gsz * 8);
+    mem.core.munmap(cast(*u8, gc), gsz * 8);
+    return 0;
+}
+
+fn _webp_riff(pay as *cbb.Bytes, out as *cbb.Bytes) as i64 {
     let is i64 as vlen = pay.len;
     let is i64 as riff_size = 4 + 8 + vlen + (vlen & 1);
     cbb.bytes_push(out, cast(u8, 82)); cbb.bytes_push(out, cast(u8, 73));
@@ -1265,6 +1413,381 @@ fn webp_encode(img as *image.Image, out as *cbb.Bytes) as i64 {
     cbb.bytes_push(out, cast(u8, (vlen >> 24) & 255));
     cbb.bytes_append(out, pay.ptr, pay.len);
     if ((vlen & 1) == 1) { cbb.bytes_push(out, cast(u8, 0)); }
-    cbb.bytes_free(&pay);
     return out.len;
+}
+
+fn _vp8l_hdr(b as *bw.BitWriter, w as i64, h as i64, alpha_used as i64) as void {
+    bw.bw_bits(b, w - 1, 14);
+    bw.bw_bits(b, h - 1, 14);
+    bw.bw_bits(b, alpha_used, 1);
+    bw.bw_bits(b, 0, 3);                           // version
+}
+// The general configuration: subtract-green, then a per-tile spatial predictor,
+// then LZ77 + colour cache + Huffman over the residuals. This is what wins on
+// photographs and anything with more than 256 colours.
+fn _std_payload(img as *image.Image, cachebits as i64, maxchain as i64,
+                lazy as i64, out as *cbb.Bytes) as i64 {
+    let is i64 as ch with mut = 0;
+    if (img.fmt == pixfmt.FMT_RGB8)  { ch = 3; }
+    if (img.fmt == pixfmt.FMT_RGBA8) { ch = 4; }
+    if (ch == 0) { return errno.I_UNSUPPORTED; }
+    let is i64 as w = img.width;
+    let is i64 as h = img.height;
+    let is i64 as npx = w * h;
+    let is *u8 as px = img.pixels;
+
+    // Subtract-green, on packed ARGB. The predictor then runs over whole pixels
+    // rather than four independent channels, which is what lets modes 11-13
+    // exist at all: Select compares the *pixel* distances to its neighbours.
+    let is *i64 as sg = cast(*i64, mem.core.mmap_anon(npx * 8));
+    if (cast(i64, sg) <= 0) { return errno.I_OOM; }
+    let is i64 as alpha_used with mut = 0;
+    let is i64 as y0 with mut = 0;
+    while (y0 < h) {
+        let is i64 as o = y0 * img.stride;
+        let is i64 as x0 with mut = 0;
+        while (x0 < w) {
+            let is i64 as r = cast(i64, px[o + x0 * ch]);
+            let is i64 as g = cast(i64, px[o + x0 * ch + 1]);
+            let is i64 as bl = cast(i64, px[o + x0 * ch + 2]);
+            let is i64 as a with mut = 255;
+            if (ch == 4) { a = cast(i64, px[o + x0 * ch + 3]); }
+            if (a != 255) { alpha_used = 1; }
+            sg[y0 * w + x0] = (a << 24) | (((r - g) & 255) << 16) | (g << 8) | ((bl - g) & 255);
+            x0 = x0 + 1;
+        }
+        y0 = y0 + 1;
+    }
+
+    // ---- predictor transform: best of the 14 modes per 16x16 tile ----
+    let is i64 as pbits = 4;
+    let is i64 as ptw = _sub(w, pbits);
+    let is i64 as pth = _sub(h, pbits);
+    let is i64 as pn = ptw * pth;
+    let is *u8 as modes = mem.core.mmap_anon(pn + 1);
+    let is *i64 as targb = cast(*i64, mem.core.mmap_anon(npx * 8));
+    if (cast(i64, targb) <= 0) { return errno.I_OOM; }
+
+    let is i64 as ty with mut = 0;
+    while (ty < pth) {
+        let is i64 as tx with mut = 0;
+        while (tx < ptw) {
+            let is i64 as best with mut = 0;
+            let is i64 as bestcost with mut = 0 - 1;
+            let is i64 as m with mut = 0;
+            while (m < 14) {
+                let is i64 as cost with mut = 0;
+                let is i64 as y with mut = ty << pbits;
+                while (y < ((ty + 1) << pbits) && y < h) {
+                    let is i64 as x with mut = tx << pbits;
+                    while (x < ((tx + 1) << pbits) && x < w) {
+                        let is i64 as p = y * w + x;
+                        let is i64 as pr = _pred_at(sg, w, p, x, y, m);
+                        let is i64 as s with mut = 0;
+                        while (s < 32) {
+                            let is i64 as d with mut = (((sg[p] >> s) & 255) - ((pr >> s) & 255)) & 255;
+                            if (d > 128) { d = 256 - d; }
+                            cost = cost + d;
+                            s = s + 8;
+                        }
+                        x = x + 1;
+                    }
+                    y = y + 1;
+                }
+                if (bestcost < 0 || cost < bestcost) { bestcost = cost; best = m; }
+                m = m + 1;
+            }
+            modes[ty * ptw + tx] = cast(u8, best);
+            tx = tx + 1;
+        }
+        ty = ty + 1;
+    }
+
+    let is i64 as y2 with mut = 0;
+    while (y2 < h) {
+        let is i64 as x2 with mut = 0;
+        while (x2 < w) {
+            let is i64 as p = y2 * w + x2;
+            let is i64 as m = cast(i64, modes[(y2 >> pbits) * ptw + (x2 >> pbits)]);
+            let is i64 as pr = _pred_at(sg, w, p, x2, y2, m);
+            let is i64 as v with mut = 0;
+            let is i64 as s with mut = 0;
+            while (s < 32) {
+                v = v | (((((sg[p] >> s) & 255) - ((pr >> s) & 255)) & 255) << s);
+                s = s + 8;
+            }
+            targb[p] = v;
+            x2 = x2 + 1;
+        }
+        y2 = y2 + 1;
+    }
+
+    // ---- VP8L payload ----
+    let is cbb.Bytes as pay = cbb.bytes_new(npx + 4096);
+    cbb.bytes_push(&pay, cast(u8, 47));            // 0x2f signature
+    let is bw.BitWriter as b;
+    bw.bw_init(&b, &pay);
+    _vp8l_hdr(&b, w, h, alpha_used);
+    bw.bw_bits(&b, 1, 1);                          // transform present
+    bw.bw_bits(&b, 2, 2);                          // SUBTRACT_GREEN
+    bw.bw_bits(&b, 1, 1);                          // another transform
+    bw.bw_bits(&b, 0, 2);                          // PREDICTOR
+    bw.bw_bits(&b, pbits - 2, 3);                  // size_bits
+    // predictor image substream: the mode rides in the green channel
+    let is *u8 as z0 = mem.core.mmap_anon(pn + 1);
+    let is *u8 as z255 = mem.core.mmap_anon(pn + 1);
+    if (cast(i64, z255) <= 0) { return errno.I_OOM; }
+    mem.core.memset(z0, cast(i32, 0), pn);
+    mem.core.memset(z255, cast(i32, 255), pn);
+    bw.bw_bits(&b, 0, 1);                          // aux: no colour cache
+    _enc_literal_stream(&b, modes, z0, z0, z255, pn);
+    bw.bw_bits(&b, 0, 1);                          // no more transforms
+    if (cachebits > 0) { bw.bw_bits(&b, 1, 1); bw.bw_bits(&b, cachebits, 4); }
+    else { bw.bw_bits(&b, 0, 1); }
+    bw.bw_bits(&b, 0, 1);                          // no meta-Huffman
+    _enc_lz_stream(&b, targb, npx, w, cachebits, maxchain, lazy);
+    bw.bw_align(&b);
+
+    mem.core.munmap(cast(*u8, sg), npx * 8);
+    mem.core.munmap(cast(*u8, targb), npx * 8);
+    mem.core.munmap(modes, pn + 1);
+    mem.core.munmap(z0, pn + 1); mem.core.munmap(z255, pn + 1);
+
+    let is i64 as r2 = _webp_riff(&pay, out);
+    cbb.bytes_free(&pay);
+    return r2;
+}
+
+
+// ---- palette (colour-indexing) configuration -----------------------------
+// The other half of the UI/icon story. An eight-colour screenshot coded as
+// full ARGB asks the entropy coder to rediscover, pixel by pixel, that only
+// eight values ever occur. Naming them once and coding indices instead — and
+// then packing 2, 4 or 8 indices into a pixel when the palette is small enough
+// — is the single biggest lever VP8L has on synthetic images.
+
+// Distinct colours, or -1 past 256. Fills pal[] with what it found.
+fn _webp_palette(img as *image.Image, pal as *i64) as i64 {
+    let is i64 as ch with mut = 3;
+    if (img.fmt == pixfmt.FMT_RGBA8) { ch = 4; }
+    let is *u8 as px = img.pixels;
+    let is i64 as HN with imut = 1024;
+    let is *i64 as slot = cast(*i64, mem.core.mmap_anon(HN * 8));
+    mem.core.memset(cast(*u8, slot), cast(i32, 0), HN * 8);
+    let is i64 as n with mut = 0;
+    let is i64 as y with mut = 0;
+    while (y < img.height) {
+        let is i64 as o = y * img.stride;
+        let is i64 as x with mut = 0;
+        while (x < img.width) {
+            let is i64 as a with mut = 255;
+            if (ch == 4) { a = cast(i64, px[o + x * ch + 3]); }
+            let is i64 as v = (a << 24) | (cast(i64, px[o + x * ch]) << 16)
+                            | (cast(i64, px[o + x * ch + 1]) << 8)
+                            | cast(i64, px[o + x * ch + 2]);
+            let is i64 as hh with mut = ((v * 2654435761) >> 12) & (HN - 1);
+            let is i64 as placed with mut = 0;
+            while (placed == 0) {
+                let is i64 as s = slot[hh];
+                if (s == 0) {
+                    if (n >= 256) {
+                        mem.core.munmap(cast(*u8, slot), HN * 8);
+                        return 0 - 1;
+                    }
+                    pal[n] = v; slot[hh] = n + 1; n = n + 1; placed = 1;
+                } else {
+                    if (pal[s - 1] == v) { placed = 1; }
+                    else { hh = (hh + 1) & (HN - 1); }
+                }
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    mem.core.munmap(cast(*u8, slot), HN * 8);
+    return n;
+}
+
+// The palette is stored delta-coded, entry to entry, so its order is not free:
+// reordering it to minimise consecutive deltas shrinks the stored palette. This
+// is libwebp's greedy nearest-neighbour walk, with RGB weighted over alpha.
+fn _pal_dist(c1 as i64, c2 as i64) as i64 {
+    let is i64 as s with mut = 0;
+    let is i64 as k with mut = 0;
+    while (k < 3) {
+        let is i64 as d with mut = ((c1 >> (k * 8)) - (c2 >> (k * 8))) & 255;
+        if (d > 128) { d = 256 - d; }
+        s = s + d;
+        k = k + 1;
+    }
+    s = s * 9;
+    let is i64 as da with mut = ((c1 >> 24) - (c2 >> 24)) & 255;
+    if (da > 128) { da = 256 - da; }
+    return s + da;
+}
+
+fn _pal_sort(pal as *i64, n as i64) as void {
+    let is i64 as predict with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is i64 as bi with mut = i;
+        let is i64 as bs with mut = 0 - 1;
+        let is i64 as k with mut = i;
+        while (k < n) {
+            let is i64 as s = _pal_dist(pal[k], predict);
+            if (bs < 0 || s < bs) { bs = s; bi = k; }
+            k = k + 1;
+        }
+        let is i64 as t = pal[bi]; pal[bi] = pal[i]; pal[i] = t;
+        predict = pal[i];
+        i = i + 1;
+    }
+}
+
+fn _pal_payload(img as *image.Image, pal as *i64, n as i64, cachebits as i64,
+                maxchain as i64, lazy as i64, out as *cbb.Bytes) as i64 {
+    let is i64 as w = img.width;
+    let is i64 as h = img.height;
+    let is i64 as ch with mut = 3;
+    if (img.fmt == pixfmt.FMT_RGBA8) { ch = 4; }
+
+    // Small palettes let several indices share one coded pixel.
+    let is i64 as xbits with mut = 0;
+    if (n <= 2)      { xbits = 3; }
+    else if (n <= 4) { xbits = 2; }
+    else if (n <= 16){ xbits = 1; }
+    let is i64 as cw = _sub(w, xbits);
+    let is i64 as cn = cw * h;
+
+    let is i64 as alpha_used with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < n) { if (((pal[i] >> 24) & 255) != 255) { alpha_used = 1; } i = i + 1; }
+
+    let is *i64 as idx = cast(*i64, mem.core.mmap_anon(cn * 8));
+    if (cast(i64, idx) <= 0) { return errno.I_OOM; }
+    let is *u8 as px = img.pixels;
+    let is i64 as bitdepth = 1 << (3 - xbits);
+    let is i64 as mask = (1 << xbits) - 1;
+    let is i64 as y with mut = 0;
+    while (y < h) {
+        let is i64 as o = y * img.stride;
+        let is i64 as code with mut = 4278190080;          // 0xff000000
+        let is i64 as x with mut = 0;
+        while (x < w) {
+            let is i64 as a with mut = 255;
+            if (ch == 4) { a = cast(i64, px[o + x * ch + 3]); }
+            let is i64 as v = (a << 24) | (cast(i64, px[o + x * ch]) << 16)
+                            | (cast(i64, px[o + x * ch + 1]) << 8)
+                            | cast(i64, px[o + x * ch + 2]);
+            let is i64 as k with mut = 0;
+            while (k < n) { if (pal[k] == v) { k = k + 1024; } else { k = k + 1; } }
+            let is i64 as id = k - 1024;                   // index we settled on
+            let is i64 as xsub = x & mask;
+            if (xsub == 0) { code = 4278190080; }
+            code = code | (id << (8 + bitdepth * xsub));
+            idx[y * cw + (x >> xbits)] = code;
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+
+    let is cbb.Bytes as pay = cbb.bytes_new(cn + 4096);
+    cbb.bytes_push(&pay, cast(u8, 47));
+    let is bw.BitWriter as b;
+    bw.bw_init(&b, &pay);
+    _vp8l_hdr(&b, w, h, alpha_used);
+    bw.bw_bits(&b, 1, 1);                          // transform present
+    bw.bw_bits(&b, 3, 2);                          // COLOR_INDEXING
+    bw.bw_bits(&b, n - 1, 8);
+    // The palette itself is an n x 1 sub-image, delta-coded entry to entry.
+    let is *u8 as pg = mem.core.mmap_anon(n + 1);
+    let is *u8 as pr = mem.core.mmap_anon(n + 1);
+    let is *u8 as pb = mem.core.mmap_anon(n + 1);
+    let is *u8 as pa = mem.core.mmap_anon(n + 1);
+    if (cast(i64, pa) <= 0) { return errno.I_OOM; }
+    i = 0;
+    while (i < n) {
+        let is i64 as cur = pal[i];
+        let is i64 as pv with mut = 0;
+        if (i > 0) { pv = pal[i - 1]; }
+        pg[i] = cast(u8, ((cur >> 8) - (pv >> 8)) & 255);
+        pr[i] = cast(u8, ((cur >> 16) - (pv >> 16)) & 255);
+        pb[i] = cast(u8, (cur - pv) & 255);
+        pa[i] = cast(u8, ((cur >> 24) - (pv >> 24)) & 255);
+        i = i + 1;
+    }
+    bw.bw_bits(&b, 0, 1);                          // palette sub-image: no cache
+    _enc_literal_stream(&b, pg, pr, pb, pa, n);
+    bw.bw_bits(&b, 0, 1);                          // no more transforms
+    if (cachebits > 0) { bw.bw_bits(&b, 1, 1); bw.bw_bits(&b, cachebits, 4); }
+    else { bw.bw_bits(&b, 0, 1); }
+    bw.bw_bits(&b, 0, 1);                          // no meta-Huffman
+    _enc_lz_stream(&b, idx, cn, cw, cachebits, maxchain, lazy);
+    bw.bw_align(&b);
+
+    mem.core.munmap(pg, n + 1); mem.core.munmap(pr, n + 1);
+    mem.core.munmap(pb, n + 1); mem.core.munmap(pa, n + 1);
+    mem.core.munmap(cast(*u8, idx), cn * 8);
+    let is i64 as r = _webp_riff(&pay, out);
+    cbb.bytes_free(&pay);
+    return r;
+}
+
+// Encode a lossless WebP. The engine decides how hard we look: FAST takes the
+// first plausible configuration, DEFAULT and BEST encode several and keep the
+// smallest — because which of "palette" and "predictor + subtract-green" wins
+// is a property of the image, not something a heuristic can be trusted to call.
+fn webp_encode_ex(img as *image.Image, out as *cbb.Bytes, o as *opts.EncOpts) as i64 {
+    if (img.fmt != pixfmt.FMT_RGB8 && img.fmt != pixfmt.FMT_RGBA8) {
+        return errno.I_UNSUPPORTED;
+    }
+    let is i64 as maxchain with mut = 32;
+    let is i64 as lazy with mut = 1;
+    if (o.engine == opts.ENG_FAST) { maxchain = 8; lazy = 0; }
+    if (o.engine == opts.ENG_BEST) { maxchain = 192; }
+
+    // Colour-cache sizes worth trying. The cache turns a repeated pixel into a
+    // single small symbol, so it pays on images with a modest palette and
+    // nothing at all on photographs; the only honest way to pick is to try.
+    let is [5]i64 as cbs;
+    let is i64 as ncb with mut = 1;
+    cbs[0] = 0;
+    if (o.engine != opts.ENG_FAST) {
+        cbs[1] = 4; cbs[2] = 6; cbs[3] = 8; cbs[4] = 10;
+        ncb = 5;
+    }
+
+    let is *i64 as pal = cast(*i64, mem.core.mmap_anon(256 * 8));
+    let is i64 as npal = _webp_palette(img, pal);
+    if (npal > 0) { _pal_sort(pal, npal); }
+
+    let is cbb.Bytes as best with mut = cbb.bytes_new(1024);
+    let is i64 as have with mut = 0;
+    let is i64 as ci with mut = 0;
+    while (ci < ncb) {
+        let is cbb.Bytes as t1 = cbb.bytes_new(1024);
+        if (_std_payload(img, cbs[ci], maxchain, lazy, &t1) > 0) {
+            if (have == 0 || t1.len < best.len) { cbb.bytes_free(&best); best = t1; have = 1; }
+            else { cbb.bytes_free(&t1); }
+        } else { cbb.bytes_free(&t1); }
+        if (npal > 0) {
+            let is cbb.Bytes as t2 = cbb.bytes_new(1024);
+            if (_pal_payload(img, pal, npal, cbs[ci], maxchain, lazy, &t2) > 0) {
+                if (have == 0 || t2.len < best.len) { cbb.bytes_free(&best); best = t2; have = 1; }
+                else { cbb.bytes_free(&t2); }
+            } else { cbb.bytes_free(&t2); }
+        }
+        ci = ci + 1;
+    }
+    mem.core.munmap(cast(*u8, pal), 256 * 8);
+    if (have == 0) { cbb.bytes_free(&best); return errno.I_OOM; }
+    cbb.bytes_append(out, best.ptr, best.len);
+    cbb.bytes_free(&best);
+    return out.len;
+}
+
+fn webp_encode(img as *image.Image, out as *cbb.Bytes) as i64 {
+    let is opts.EncOpts as o;
+    opts.enc_defaults(&o);
+    return webp_encode_ex(img, out, &o);
 }
