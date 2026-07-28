@@ -1,16 +1,71 @@
 name "caustic-image"
-version "0.0.1"
-author "Caua"
+version "0.1.0"
+author "Cauã Alvarenga Neves"
 
-// caustic-image depends on the sibling caustic-compact (DEFLATE/zlib/CRC, and
-// later the CSIF entropy substrate). Cross-repo modules resolve only when the
-// workspace root is on the module search path (caustic --path <root>), so the
-// canonical build/test entry point is tests/run.sh, which computes that path.
+// caustic-image — build and test surface.
+//
+//   caustic-mk run test            every suite
+//   caustic-mk run test-opt        the same, through the optimizing backend
+//   caustic-mk build cimg          the CLI
+//   caustic-mk run clean           build artifacts
+//   caustic-mk run distclean       generated assembly and objects too
+//
+// The one dependency is caustic-compact, which supplies the entropy layer:
+// DEFLATE and zlib for PNG, CRC-32, LZW for GIF, and the rANS coder the CSIF
+// modular path is built on. It is declared below, so caustic-mk clones it into
+// .caustic/deps pinned to a tag, and a clone of THIS repository alone builds
+// and tests.
+//
+// It did not use to. The dependency was a relative path into a sibling
+// directory, resolved by passing the parent of both repositories to the
+// compiler as --path, which a shell script computed at run time. That made the
+// build a property of where the two repositories happened to sit on disk: the
+// tests passed here and could not pass anywhere else, and nothing said so.
+// There is no shell in the build any more, and no assumption about the layout
+// of the machine.
 
+env_default "OPT" "-O1"
+
+// ── Targets ──────────────────────────────────────────────────────────
+
+// The runner. Declaring the dependency on the target that builds it is what
+// makes caustic-mk clone caustic-compact before the suite needs it; the runner
+// then passes the same .caustic/deps to each case it compiles.
+target "run" {
+    src "tests/run.cst"
+    out "build/run"
+    depend "caustic-compact" in "https://github.com/Caua726/caustic-compact" tag "v0.1.0"
+}
+
+// ── Scripts ──────────────────────────────────────────────────────────
+
+// `build run` rather than a bare `caustic`: the dependency is resolved by the
+// build system, not by the script, so the clone happens exactly once and the
+// tag pin is honoured.
 script "test" {
-    "bash tests/run.sh"
+    "caustic-mk build run"
+    "./build/run"
+}
+
+// The same suite through the optimizing backend. Kept apart from `test` so the
+// two are reported separately — "passes at -O0, fails at -O1" names a compiler
+// regression rather than an image bug.
+script "test-opt" {
+    "caustic-mk build run"
+    "./build/run ${OPT}"
 }
 
 script "clean" {
     "rm -rf .caustic build tests/runtests"
+    "echo 'clean: build artifacts and resolved dependencies removed'"
+}
+
+// Deep clean: also the compiler output that no build regenerates. The
+// discriminator is exact — `caustic -c foo.cst` always emits `foo.cst.s`, so
+// that suffix names compiler output and only compiler output.
+script "distclean" {
+    "caustic-mk run clean"
+    "find . -name '*.cst.s' -delete"
+    "find . -name '*.cst.s.o' -delete"
+    "echo 'distclean: generated assembly and objects removed too'"
 }
