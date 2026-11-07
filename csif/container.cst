@@ -311,7 +311,10 @@ fn csif_encode_tiled(img as *image.Image, out as *cb.Bytes, codec_id as i64,
         }
     }
     _emit_chunk(&c4, "IDAT", 51, p.ptr, p.len);
-    cb.bytes_reset(&p); _w64(&p, 0);           _emit_chunk(&c5, "IEND", 11, p.ptr, p.len);
+    // IEND's 24 bytes: the file's checksum (filled once the file is laid out,
+    // _seal_iend), the directory's tail offset, a reserved word, the passes
+    // marker — all 0 until then.
+    cb.bytes_reset(&p); _w64(&p, 0); _w64(&p, 0); _w64(&p, 0); _emit_chunk(&c5, "IEND", 11, p.ptr, p.len);
 
     // Lay out offsets (8-byte aligned) after header + directory.
     let is i64 as o0 = 64 + nchunks * 32;
@@ -353,6 +356,7 @@ fn csif_encode_tiled(img as *image.Image, out as *cb.Bytes, codec_id as i64,
         o5 = _align8(otx + ctx.len);
     }
     let is i64 as file_size = _align8(o5 + c5.len);
+    let is i64 as base = out.len;
 
     // Header (64 bytes).
     cb.bytes_push(out, cast(u8, 67)); cb.bytes_push(out, cast(u8, 83));
@@ -399,6 +403,7 @@ fn csif_encode_tiled(img as *image.Image, out as *cb.Bytes, codec_id as i64,
         cb.bytes_append(out, c4.ptr, c4.len); _wz(out, o5 - (o4 + c4.len));
     }
     cb.bytes_append(out, c5.ptr, c5.len); _wz(out, file_size - (o5 + c5.len));
+    _seal_iend(out, base, o5);
 
     if (tiled == 1) {
         mem.core.munmap(cast(*u8, trel), ntiles * 8);
@@ -410,6 +415,25 @@ fn csif_encode_tiled(img as *image.Image, out as *cb.Bytes, codec_id as i64,
     cb.bytes_free(&c3); cb.bytes_free(&c4); cb.bytes_free(&c5);
     cb.bytes_free(&ctx);
     return out.len;
+}
+
+// The IEND chunk at file offset iend (the file starting base bytes into out)
+// sealed (§1.19): whole_file_checksum, the CRC-32 of every byte before IEND's
+// payload, into its first four bytes, and the chunk's own CRC made again.
+fn _seal_iend(out as *cb.Bytes, base as i64, iend as i64) as void {
+    let is *u8 as f = cast(*u8, cast(i64, out.ptr) + base);
+    let is i64 as whole = checksum.crc32(f, iend + 16);
+    let is i64 as k with mut = 0;
+    while (k < 4) {
+        f[iend + 16 + k] = cast(u8, (whole >> (k * 8)) & 255);
+        k = k + 1;
+    }
+    let is i64 as c = checksum.crc32(cast(*u8, cast(i64, f) + iend), 16 + 24);
+    k = 0;
+    while (k < 4) {
+        f[iend + 40 + k] = cast(u8, (c >> (k * 8)) & 255);
+        k = k + 1;
+    }
 }
 
 fn _emit_dir(out as *cb.Bytes, typ as *u8, flags as i64, off as i64, len as i64, seq as i64) as void {
@@ -846,7 +870,7 @@ fn csif_encode_anim(anim as *CsifAnim, out as *cb.Bytes, codec_id as i64) as i64
         f = f + 1;
     }
 
-    cb.bytes_reset(&p); _w64(&p, 0);
+    cb.bytes_reset(&p); _w64(&p, 0); _w64(&p, 0); _w64(&p, 0);
     ctyp[ci] = 7; cflg[ci] = 11; cst[ci] = _emit_chunk_into(&stage, _tstr(7), 11, p.ptr, p.len);
     clen[ci] = stage.len - cst[ci]; ci = ci + 1;
 
@@ -861,6 +885,7 @@ fn csif_encode_anim(anim as *CsifAnim, out as *cb.Bytes, codec_id as i64) as i64
         i = i + 1;
     }
     let is i64 as file_size = cur;
+    let is i64 as base = out.len;
 
     // Header (64 bytes) — header_flags bit2 = HAS_ANIMATION.
     cb.bytes_push(out, cast(u8, 67)); cb.bytes_push(out, cast(u8, 83));
@@ -891,6 +916,7 @@ fn csif_encode_anim(anim as *CsifAnim, out as *cb.Bytes, codec_id as i64) as i64
         _wz(out, nxt - (coff[i] + clen[i]));
         i = i + 1;
     }
+    _seal_iend(out, base, coff[nchunks - 1]);
 
     cb.bytes_free(&p); cb.bytes_free(&stage);
     mem.core.munmap(cast(*u8, ctyp), nchunks * 8);
