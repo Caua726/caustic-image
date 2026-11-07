@@ -262,9 +262,9 @@ fn csif_encode_tiled(img as *image.Image, out as *cb.Bytes, codec_id as i64,
     let is cb.Bytes as ctx = cb.bytes_new(64);
     let is cb.Bytes as c5 = cb.bytes_new(64);
     cb.bytes_reset(&p); _pl_ilim(&p);          _emit_chunk(&c0, "ILIM", 11, p.ptr, p.len);
-    cb.bytes_reset(&p); _pl_ihdr(&p, img, cm, ch); _emit_chunk(&c1, "IHDR", 19, p.ptr, p.len);
-    cb.bytes_reset(&p); _pl_icol(&p);          _emit_chunk(&c2, "ICOL", 19, p.ptr, p.len);
-    cb.bytes_reset(&p); _pl_icod(&p, codec_id, ch, tw, th, ntx, nty); _emit_chunk(&c3, "ICOD", 19, p.ptr, p.len);
+    cb.bytes_reset(&p); _pl_ihdr(&p, img, cm, ch); _emit_chunk(&c1, "IHDR", 27, p.ptr, p.len);
+    cb.bytes_reset(&p); _pl_icol(&p);          _emit_chunk(&c2, "ICOL", 27, p.ptr, p.len);
+    cb.bytes_reset(&p); _pl_icod(&p, codec_id, ch, tw, th, ntx, nty); _emit_chunk(&c3, "ICOD", 27, p.ptr, p.len);
 
     // IDAT payload: 32-byte head + tile streams (one stream when untiled).
     let is *i64 as trel with mut = cast(*i64, 0);
@@ -376,9 +376,9 @@ fn csif_encode_tiled(img as *image.Image, out as *cb.Bytes, codec_id as i64,
 
     // Directory (6 × 32B): type, flags, offset, length, seq, reserved.
     _emit_dir(out, "ILIM", 11, o0, c0.len, 0);
-    _emit_dir(out, "IHDR", 19, o1, c1.len, 1);
-    _emit_dir(out, "ICOL", 19, o2, c2.len, 2);
-    _emit_dir(out, "ICOD", 19, o3, c3.len, 3);
+    _emit_dir(out, "IHDR", 27, o1, c1.len, 1);
+    _emit_dir(out, "ICOL", 27, o2, c2.len, 2);
+    _emit_dir(out, "ICOD", 27, o3, c3.len, 3);
     _emit_dir(out, "IDAT", 51, o4, c4.len, 4);
     if (tiled == 1) {
         _emit_dir(out, "TIDX", 27, otx, ctx.len, 5);
@@ -801,15 +801,15 @@ fn csif_encode_anim(anim as *CsifAnim, out as *cb.Bytes, codec_id as i64) as i64
     clen[ci] = stage.len - cst[ci]; ci = ci + 1;
 
     cb.bytes_reset(&p); _pl_ihdr(&p, &canvas, 3, ch);
-    ctyp[ci] = 1; cflg[ci] = 19; cst[ci] = _emit_chunk_into(&stage, _tstr(1), 19, p.ptr, p.len);
+    ctyp[ci] = 1; cflg[ci] = 27; cst[ci] = _emit_chunk_into(&stage, _tstr(1), 27, p.ptr, p.len);
     clen[ci] = stage.len - cst[ci]; ci = ci + 1;
 
     cb.bytes_reset(&p); _pl_icol(&p);
-    ctyp[ci] = 2; cflg[ci] = 19; cst[ci] = _emit_chunk_into(&stage, _tstr(2), 19, p.ptr, p.len);
+    ctyp[ci] = 2; cflg[ci] = 27; cst[ci] = _emit_chunk_into(&stage, _tstr(2), 27, p.ptr, p.len);
     clen[ci] = stage.len - cst[ci]; ci = ci + 1;
 
     cb.bytes_reset(&p); _pl_icod(&p, codec_id, ch, 0, 0, 1, 1);
-    ctyp[ci] = 3; cflg[ci] = 19; cst[ci] = _emit_chunk_into(&stage, _tstr(3), 19, p.ptr, p.len);
+    ctyp[ci] = 3; cflg[ci] = 27; cst[ci] = _emit_chunk_into(&stage, _tstr(3), 27, p.ptr, p.len);
     clen[ci] = stage.len - cst[ci]; ci = ci + 1;
 
     // IANI + IFRM are non-critical (a still reader skips them, §9.5.4).
