@@ -312,8 +312,6 @@ fn png_decode(src as *u8, src_len as i64, out as *image.Image) as i64 {
 
     let is i64 as rc = image.image_init(out, w, h, fmt);
     if (rc < 0) { cb.bytes_free(&raw); return rc; }
-    let is *u8 as dst = out.pixels;
-    let is i64 as obpp = pixfmt.fmt_bpp(fmt);
     let is *u8 as rp = raw.ptr;
 
     let is i64 as roff with mut = 0;
