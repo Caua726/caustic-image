@@ -1,0 +1,243 @@
+// test_progressive — decoding as the bytes arrive (progressive.cst): every
+// state and row against decode() of the same bytes, cut short, corrupt,
+// absurd, and closed at every point.
+use "std/mem.cst" only bins, core as mem;
+use "std/io.cst" as io;
+use "../core/errno.cst"  as errno;
+use "../core/image.cst"  as image;
+use "../core/pixfmt.cst" as pixfmt;
+use "../decode.cst"      as dec;
+use "../progressive.cst" as pg;
+use "../formats/png.cst" as png;
+use "../formats/jpeg.cst" as jpeg;
+use "../formats/gif.cst" as gif;
+use "../formats/bmp.cst" as bmp;
+use "../formats/qoi.cst" as qoi;
+use "caustic-compact/core/bytes.cst"    as cb;
+use "caustic-compact/core/checksum.cst" as checksum;
+
+let is i64 as _seed with mut = 12345;
+fn rnd() as i64 {
+    _seed = (_seed * 6364136223846793005 + 1442695040888963407);
+    return (_seed >> 33) & 255;
+}
+
+// w by h of fmt: kind 0 a gradient with alpha, 1 two colours, 2 noise.
+fn make(img as *image.Image, w as i64, h as i64, fmt as i64, kind as i64) as void {
+    image.image_init(img, w, h, fmt);
+    let is i64 as bpp = pixfmt.fmt_bpp(fmt);
+    let is i64 as y with mut = 0;
+    while (y < h) {
+        let is i64 as x with mut = 0;
+        while (x < w) {
+            let is i64 as k with mut = 0;
+            while (k < bpp) {
+                let is i64 as v with mut = 0;
+                if (kind == 0) { v = (x * 4 + y * 3 * k + k * 40) & 255; if (k == 3) { v = 128 + (x & 127); } }
+                if (kind == 1) { v = 0; if (((x / 3) + (y / 2)) % 2 == 1) { v = 255; } }
+                if (kind == 2) { v = rnd(); }
+                img.pixels[y * img.stride + x * bpp + k] = cast(u8, v);
+                k = k + 1;
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+}
+
+fn rows_same(a as *image.Image, b as *image.Image, n as i64) as i32 {
+    if (n == 0) { return 1; }
+    if (a.stride != b.stride || a.fmt != b.fmt) { return 0; }
+    return cast(i32, mem.core.memcmp(a.pixels, b.pixels, n * a.stride) == 0);
+}
+
+// src fed chunk bytes at a time: the states in order, each row shown the
+// final one, then finish exactly decode(). 0, or where it went wrong.
+fn through(src as *u8, n as i64, chunk as i64, want_rows as i32) as i64 {
+    let is image.Image as ref;
+    if (dec.decode(src, n, &ref) != 0) { return 1; }
+    let is pg.Progressive as p = pg.progressive();
+    let is i64 as last with mut = pg.NEED;
+    let is i64 as most_rows with mut = 0;
+    let is i64 as at with mut = 0;
+    while (at < n) {
+        let is i64 as k with mut = chunk;
+        if (at + k > n) { k = n - at; }
+        let is i64 as st = pg.feed(&p, cast(*u8, cast(i64, src) + at), k);
+        at = at + k;
+        if (st < 0) { return 2; }
+        if (st < last) { return 3; }
+        last = st;
+        if (st >= pg.HEADER && (pg.width(&p) != ref.width || pg.height(&p) != ref.height)) { return 4; }
+        if (pg.rows(&p) > 0) {
+            if (rows_same(pg.image_of(&p), &ref, pg.rows(&p)) == 0) { return 5; }
+            if (pg.rows(&p) > most_rows) { most_rows = pg.rows(&p); }
+        }
+    }
+    if (want_rows == 1 && (most_rows == 0 || most_rows >= ref.height)) { return 6; }
+    if (pg.finish(&p) != pg.DONE) { return 7; }
+    let is *image.Image as got = pg.image_of(&p);
+    if (got.width != ref.width || got.height != ref.height || got.fmt != ref.fmt || pg.rows(&p) != ref.height) { return 8; }
+    if (rows_same(got, &ref, ref.height) == 0) { return 9; }
+    // Done: more bytes change nothing.
+    if (pg.feed(&p, src, 4) != pg.DONE || pg.finish(&p) != pg.DONE) { return 10; }
+    pg.close(&p);
+    pg.close(&p);
+    image.image_free(&ref);
+    return 0;
+}
+
+fn encoded(img as *image.Image, which as i64, out as *cb.Bytes) as i64 {
+    *out = cb.bytes_new(1024);
+    if (which == 0) { return png.png_encode(img, out); }
+    if (which == 1) { return jpeg.jpeg_encode(img, out); }
+    if (which == 2) { return gif.gif_encode(img, out); }
+    if (which == 3) { return bmp.bmp_encode(img, out); }
+    return qoi.qoi_encode(img, out);
+}
+
+// A PNG of one IHDR (w by h, 8-bit RGBA), CRC right: the 33 bytes before any IDAT.
+fn ihdr(buf as *u8, w as i64, h as i64) as void {
+    let is *u8 as sig = "\x89PNG\r\n\x1a\n";
+    let is i64 as i with mut = 0;
+    while (i < 8) { buf[i] = sig[i]; i = i + 1; }
+    buf[8] = 0; buf[9] = 0; buf[10] = 0; buf[11] = 13;
+    buf[12] = 73; buf[13] = 72; buf[14] = 68; buf[15] = 82;
+    buf[16] = cast(u8, (w >> 24) & 255); buf[17] = cast(u8, (w >> 16) & 255);
+    buf[18] = cast(u8, (w >> 8) & 255);  buf[19] = cast(u8, w & 255);
+    buf[20] = cast(u8, (h >> 24) & 255); buf[21] = cast(u8, (h >> 16) & 255);
+    buf[22] = cast(u8, (h >> 8) & 255);  buf[23] = cast(u8, h & 255);
+    buf[24] = 8; buf[25] = 6; buf[26] = 0; buf[27] = 0; buf[28] = 0;
+    let is i64 as crc = checksum.crc32(cast(*u8, cast(i64, buf) + 12), 17);
+    buf[29] = cast(u8, (crc >> 24) & 255); buf[30] = cast(u8, (crc >> 16) & 255);
+    buf[31] = cast(u8, (crc >> 8) & 255);  buf[32] = cast(u8, crc & 255);
+}
+
+fn main() as i64 {
+    let is i64 as r = run();
+    if (r != 0) { io.printf("test_progressive: failed at %d\n", r); return 1; }
+    return 0;
+}
+
+fn run() as i64 {
+    // PNGs of every kind the encoder makes, in pieces of 1, 7 and 1000.
+    let is [4]i64 as fmts;
+    fmts[0] = pixfmt.FMT_RGBA8; fmts[1] = pixfmt.FMT_RGB8; fmts[2] = pixfmt.FMT_GRAY8; fmts[3] = pixfmt.FMT_RGBA16;
+    let is i64 as fi with mut = 0;
+    while (fi < 4) {
+        let is i64 as kind with mut = 0;
+        while (kind < 3) {
+            let is image.Image as img;
+            make(&img, 37, 23, fmts[fi], kind);
+            let is cb.Bytes as b;
+            if (encoded(&img, 0, &b) < 0) { return 100 + fi * 10 + kind; }
+            let is i64 as r1 = through(b.ptr, b.len, 1, 0);
+            if (r1 != 0) { return 200 + fi * 30 + kind * 10 + r1; }
+            let is i64 as r7 = through(b.ptr, b.len, 7, 0);
+            if (r7 != 0) { return 300 + fi * 30 + kind * 10 + r7; }
+            let is i64 as rk = through(b.ptr, b.len, 1000, 0);
+            if (rk != 0) { return 400 + fi * 30 + kind * 10 + rk; }
+            cb.bytes_free(&b);
+            image.image_free(&img);
+            kind = kind + 1;
+        }
+        fi = fi + 1;
+    }
+
+    // A large one: rows before the end, its header first.
+    let is image.Image as big;
+    make(&big, 300, 300, pixfmt.FMT_RGB8, 2);
+    let is cb.Bytes as bb;
+    if (encoded(&big, 0, &bb) < 0) { return 500; }
+    let is i64 as rb = through(bb.ptr, bb.len, 4096, 1);
+    if (rb != 0) { return 510 + rb; }
+    let is pg.Progressive as h = pg.progressive();
+    if (pg.feed(&h, bb.ptr, 33) != pg.HEADER || pg.width(&h) != 300 || pg.height(&h) != 300) { return 530; }
+    if (pg.rows(&h) != 0) { return 531; }
+    // Closed with rows shown: cancelled.
+    pg.feed(&h, cast(*u8, cast(i64, bb.ptr) + 33), bb.len * 6 / 10);
+    if (pg.state(&h) != pg.ROWS || pg.rows(&h) == 0) { return 532; }
+    pg.close(&h);
+    if (pg.feed(&h, bb.ptr, 1) != errno.I_BADPARAM || pg.finish(&h) != errno.I_BADPARAM) { return 533; }
+
+    // Cut short: refused at finish, the rows that came kept, and right.
+    let is image.Image as ref;
+    dec.decode(bb.ptr, bb.len, &ref);
+    let is pg.Progressive as t = pg.progressive();
+    pg.feed(&t, bb.ptr, bb.len * 7 / 10);
+    let is i64 as shown = pg.rows(&t);
+    if (pg.finish(&t) >= 0) { return 540; }
+    if (shown == 0 || pg.rows(&t) != shown || rows_same(pg.image_of(&t), &ref, shown) == 0) { return 541; }
+    if (pg.feed(&t, bb.ptr, 10) >= 0) { return 542; }
+    pg.close(&t);
+
+    // A chunk's CRC wrong: refused when it comes, the rows before it kept.
+    let is cb.Bytes as bad = cb.bytes_new(bb.len);
+    cb.bytes_append(&bad, bb.ptr, bb.len);
+    bad.ptr[bb.len / 2] = cast(u8, cast(i64, bad.ptr[bb.len / 2]) ^ 85);
+    let is pg.Progressive as c = pg.progressive();
+    let is i64 as cst = pg.feed(&c, bad.ptr, bad.len);
+    if (cst != errno.I_CORRUPT) { return 550; }
+    if (rows_same(pg.image_of(&c), &ref, pg.rows(&c)) == 0) { return 551; }
+    pg.close(&c);
+    cb.bytes_free(&bad);
+
+    // Noise after the magic: refused, nothing read past the bytes.
+    let is [400]u8 as noise;
+    let is i64 as i with mut = 0;
+    while (i < 400) { noise[i] = cast(u8, rnd()); i = i + 1; }
+    let is *u8 as sig = "\x89PNG\r\n\x1a\n";
+    i = 0;
+    while (i < 8) { noise[i] = sig[i]; i = i + 1; }
+    let is pg.Progressive as nz = pg.progressive();
+    let is i64 as nst with mut = pg.feed(&nz, cast(*u8, &noise), 400);
+    if (nst >= 0) { nst = pg.finish(&nz); }
+    if (nst >= 0) { return 560; }
+    pg.close(&nz);
+
+    // A header no image may have: refused at once, nothing made.
+    let is [33]u8 as huge;
+    ihdr(cast(*u8, &huge), 16777217, 16);
+    let is pg.Progressive as hg = pg.progressive();
+    if (pg.feed(&hg, cast(*u8, &huge), 33) != errno.I_DIMS) { return 570; }
+    if (cast(i64, pg.image_of(&hg).pixels) != 0) { return 571; }
+    pg.close(&hg);
+    ihdr(cast(*u8, &huge), 65536, 65536);
+    let is pg.Progressive as hg2 = pg.progressive();
+    if (pg.feed(&hg2, cast(*u8, &huge), 33) != errno.I_DIMS) { return 572; }
+    pg.close(&hg2);
+
+    // Other formats: their size before their pixels, then decode()'s image.
+    let is image.Image as rgb;
+    make(&rgb, 40, 30, pixfmt.FMT_RGB8, 1);   // two colours: a palette a GIF can hold
+    let is i64 as w with mut = 1;
+    while (w <= 4) {
+        let is cb.Bytes as e;
+        if (encoded(&rgb, w, &e) < 0) { return 600 + w; }
+        let is i64 as r = through(e.ptr, e.len, 7, 0);
+        if (r != 0) { return 610 + w * 20 + r; }
+        let is pg.Progressive as o = pg.progressive();
+        pg.feed(&o, e.ptr, e.len - 1);
+        if (pg.state(&o) != pg.HEADER || pg.width(&o) != 40 || pg.height(&o) != 30) { return 700 + w; }
+        pg.close(&o);
+        cb.bytes_free(&e);
+        w = w + 1;
+    }
+
+    // Taken when done: the caller's, the Progressive's no more.
+    let is pg.Progressive as tk = pg.progressive();
+    pg.feed(&tk, bb.ptr, bb.len);
+    let is image.Image as mine;
+    if (pg.take(&tk, &mine) != errno.I_BADPARAM) { return 800; }
+    pg.finish(&tk);
+    if (pg.take(&tk, &mine) != 0 || rows_same(&mine, &ref, 300) == 0) { return 801; }
+    pg.close(&tk);
+    if (mine.pixels[0] != ref.pixels[0]) { return 802; }
+    image.image_free(&mine);
+    // Nothing fed: finish says so.
+    let is pg.Progressive as none = pg.progressive();
+    if (pg.finish(&none) != errno.I_EOF) { return 810; }
+    pg.close(&none);
+    image.image_free(&ref);
+    return 0;
+}
