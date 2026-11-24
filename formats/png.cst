@@ -65,6 +65,99 @@ fn _pass_dim(total as i64, start as i64, step as i64) as i64 {
     return (total - start + step - 1) / step;
 }
 
+// One scanline of filter type ft reconstructed in place: cur holds its
+// stride filtered bytes, prv the row above already reconstructed (none: the
+// first row of its pass), bpp the bytes to the left that a pixel's filter
+// looks at.
+fn png_unfilter_row(ft8 as u8, cur as *u8, prv as *u8, stride as i64, bpp as i64) as void {
+    let is i64 as ft = cast(i64, ft8);
+    let is i64 as up = cast(i64, prv);
+    let is i64 as i with mut = 0;
+    while (i < stride) {
+        let is i64 as xv = cast(i64, cur[i]);
+        let is i64 as a with mut = 0; if (i >= bpp) { a = cast(i64, cur[i - bpp]); }
+        let is i64 as b with mut = 0; if (up != 0) { b = cast(i64, prv[i]); }
+        let is i64 as c with mut = 0; if (up != 0) { if (i >= bpp) { c = cast(i64, prv[i - bpp]); } }
+        let is i64 as recon with mut = xv;
+        if (ft == 1) { recon = xv + a; }
+        else { if (ft == 2) { recon = xv + b; }
+        else { if (ft == 3) { recon = xv + ((a + b) >> 1); }
+        else { if (ft == 4) { recon = xv + _paeth(a, b, c); } } } }
+        cur[i] = cast(u8, recon & 255);
+        i = i + 1;
+    }
+}
+
+// What a reconstructed scanline means: its samples and their palette.
+struct PngRows {
+    bitdepth   as i64;
+    colortype  as i64;
+    bps        as i64;   // bytes a sample (2 for 16-bit)
+    bpp        as i64;   // bytes a pixel, at least 1
+    chan       as i64;
+    plte       as *u8;
+    plte_count as i64;
+    trns       as *u8;
+    trns_len   as i64;
+}
+
+// A reconstructed scanline's pw pixels into out's row iy, from column x0,
+// every xstep (1, or an Adam7 pass's step).
+fn png_emit_row(pr as *PngRows, row as *u8, pw as i64, iy as i64, x0 as i64, xstep as i64, out as *image.Image) as void {
+    let is *u8 as dst = out.pixels;
+    let is i64 as obpp = pixfmt.fmt_bpp(out.fmt);
+    let is i64 as bitdepth = pr.bitdepth;
+    let is i64 as sx with mut = 0;
+    while (sx < pw) {
+        let is i64 as ix = x0 + sx * xstep;
+        let is i64 as sb = sx * pr.bpp;
+        let is i64 as di = iy * out.stride + ix * obpp;
+        // sub-byte sample (1/2/4-bit gray or palette index), MSB-first
+        let is i64 as subv with mut = 0;
+        if (bitdepth < 8) {
+            let is i64 as bitpos = sx * bitdepth;
+            subv = (cast(i64, row[bitpos / 8]) >> (8 - bitdepth - (bitpos & 7))) & ((1 << bitdepth) - 1);
+        }
+        if (pr.colortype == 3) {
+            let is i64 as idx with mut = cast(i64, row[sb]);
+            if (bitdepth < 8) { idx = subv; }
+            let is i64 as r with mut = 0; let is i64 as g with mut = 0; let is i64 as b with mut = 0;
+            if (idx < pr.plte_count) {
+                r = cast(i64, pr.plte[idx * 3]);
+                g = cast(i64, pr.plte[idx * 3 + 1]);
+                b = cast(i64, pr.plte[idx * 3 + 2]);
+            }
+            dst[di] = cast(u8, r); dst[di + 1] = cast(u8, g); dst[di + 2] = cast(u8, b);
+            if (obpp == 4) {
+                let is i64 as al with mut = 255;
+                if (idx < pr.trns_len) { al = cast(i64, pr.trns[idx]); }
+                dst[di + 3] = cast(u8, al);
+            }
+        } else {
+            if (bitdepth < 8) {
+                // 1/2/4-bit gray scaled to 8-bit (x 255/(2^d - 1))
+                let is i64 as scale with mut = 255;
+                if (bitdepth == 2) { scale = 85; }
+                if (bitdepth == 4) { scale = 17; }
+                dst[di] = cast(u8, subv * scale);
+            } else {
+                if (pr.bps == 1) {
+                    let is i64 as k with mut = 0;
+                    while (k < pr.bpp) { dst[di + k] = row[sb + k]; k = k + 1; }
+                } else {
+                    let is i64 as k with mut = 0;
+                    while (k < pr.chan) {
+                        dst[di + k * 2]     = row[sb + k * 2 + 1];   // 16-bit BE -> native LE
+                        dst[di + k * 2 + 1] = row[sb + k * 2];
+                        k = k + 1;
+                    }
+                }
+            }
+        }
+        sx = sx + 1;
+    }
+}
+
 fn png_decode(src as *u8, src_len as i64, out as *image.Image) as i64 {
     let is buf.Buf as bf;
     buf.buf_init(&bf, src, src_len);
@@ -234,81 +327,20 @@ fn png_decode(src as *u8, src_len as i64, out as *image.Image) as i64 {
             // unfilter this pass in place (row refs already-reconstructed bytes)
             let is i64 as ry with mut = 0;
             while (ry < ph) {
-                let is i64 as rowstart = roff + ry * full;
-                let is i64 as ft = cast(i64, rp[rowstart]);
-                let is i64 as cur = rowstart + 1;
-                let is i64 as prev = cur - full;
-                let is i64 as i with mut = 0;
-                while (i < stride) {
-                    let is i64 as xv = cast(i64, rp[cur + i]);
-                    let is i64 as a with mut = 0; if (i >= bpp) { a = cast(i64, rp[cur + i - bpp]); }
-                    let is i64 as b with mut = 0; if (ry > 0) { b = cast(i64, rp[prev + i]); }
-                    let is i64 as c with mut = 0; if (ry > 0) { if (i >= bpp) { c = cast(i64, rp[prev + i - bpp]); } }
-                    let is i64 as recon with mut = xv;
-                    if (ft == 1) { recon = xv + a; }
-                    else { if (ft == 2) { recon = xv + b; }
-                    else { if (ft == 3) { recon = xv + ((a + b) >> 1); }
-                    else { if (ft == 4) { recon = xv + _paeth(a, b, c); } } } }
-                    rp[cur + i] = cast(u8, recon & 255);
-                    i = i + 1;
-                }
+                let is i64 as cur = roff + ry * full + 1;
+                let is *u8 as prv with mut = cast(*u8, 0);
+                if (ry > 0) { prv = cast(*u8, cast(i64, rp) + cur - full); }
+                png_unfilter_row(rp[cur - 1], cast(*u8, cast(i64, rp) + cur), prv, stride, bpp);
                 ry = ry + 1;
             }
             // scatter the pass's pixels to their interlaced positions
+            let is PngRows as pr;
+            pr.bitdepth = bitdepth; pr.colortype = colortype; pr.bps = bps; pr.bpp = bpp; pr.chan = chan;
+            pr.plte = plte_ptr; pr.plte_count = plte_count; pr.trns = trns_ptr; pr.trns_len = trns_len;
             let is i64 as sy with mut = 0;
             while (sy < ph) {
-                let is i64 as iy = pys[pass] + sy * pystep[pass];
-                let is i64 as srow = roff + sy * full + 1;
-                let is i64 as sx with mut = 0;
-                while (sx < pw) {
-                    let is i64 as ix = pxs[pass] + sx * pxstep[pass];
-                    let is i64 as sb = srow + sx * bpp;
-                    let is i64 as di = iy * out.stride + ix * obpp;
-                    // sub-byte sample (1/2/4-bit gray or palette index), MSB-first
-                    let is i64 as subv with mut = 0;
-                    if (bitdepth < 8) {
-                        let is i64 as bitpos = sx * bitdepth;
-                        subv = (cast(i64, rp[srow + bitpos / 8]) >> (8 - bitdepth - (bitpos & 7)))
-                             & ((1 << bitdepth) - 1);
-                    }
-                    if (colortype == 3) {
-                        let is i64 as idx with mut = cast(i64, rp[sb]);
-                        if (bitdepth < 8) { idx = subv; }
-                        let is i64 as r with mut = 0; let is i64 as g with mut = 0; let is i64 as b with mut = 0;
-                        if (idx < plte_count) {
-                            r = cast(i64, plte_ptr[idx * 3]);
-                            g = cast(i64, plte_ptr[idx * 3 + 1]);
-                            b = cast(i64, plte_ptr[idx * 3 + 2]);
-                        }
-                        dst[di] = cast(u8, r); dst[di + 1] = cast(u8, g); dst[di + 2] = cast(u8, b);
-                        if (obpp == 4) {
-                            let is i64 as al with mut = 255;
-                            if (idx < trns_len) { al = cast(i64, trns_ptr[idx]); }
-                            dst[di + 3] = cast(u8, al);
-                        }
-                    } else {
-                        if (bitdepth < 8) {
-                            // 1/2/4-bit gray scaled to 8-bit (× 255/(2^d − 1))
-                            let is i64 as scale with mut = 255;
-                            if (bitdepth == 2) { scale = 85; }
-                            if (bitdepth == 4) { scale = 17; }
-                            dst[di] = cast(u8, subv * scale);
-                        } else {
-                            if (bps == 1) {
-                                let is i64 as k with mut = 0;
-                                while (k < bpp) { dst[di + k] = rp[sb + k]; k = k + 1; }
-                            } else {
-                                let is i64 as k with mut = 0;
-                                while (k < chan) {
-                                    dst[di + k * 2]     = rp[sb + k * 2 + 1];   // 16-bit BE -> native LE
-                                    dst[di + k * 2 + 1] = rp[sb + k * 2];
-                                    k = k + 1;
-                                }
-                            }
-                        }
-                    }
-                    sx = sx + 1;
-                }
+                png_emit_row(&pr, cast(*u8, cast(i64, rp) + roff + sy * full + 1), pw,
+                             pys[pass] + sy * pystep[pass], pxs[pass], pxstep[pass], out);
                 sy = sy + 1;
             }
             roff = roff + ph * full;
