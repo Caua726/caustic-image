@@ -1,0 +1,51 @@
+use "std/io.cst" as io;
+use "../core/image.cst" as image;
+use "../formats/png.cst" as png;
+use "caustic-compact/core/bytes.cst" as cb;
+use "caustic-compact/core/checksum.cst" as checksum;
+use "caustic-compact/formats/zlib.cst" as zlib;
+// Regression: before core/zsteps.cst, png_decode on this never returned
+// (caustic-compact's inflate read zero bits past the cut forever).
+// A PNG whose chunks are all whole and their CRCs right, but whose IDAT holds
+// only the first 1000 bytes of the zlib stream: png_decode on it.
+fn be32(b as *cb.Bytes, v as i64) as void {
+    cb.bytes_push(b, cast(u8, (v >> 24) & 255)); cb.bytes_push(b, cast(u8, (v >> 16) & 255));
+    cb.bytes_push(b, cast(u8, (v >> 8) & 255)); cb.bytes_push(b, cast(u8, v & 255));
+}
+fn chunk(b as *cb.Bytes, typ as *u8, data as *u8, n as i64) as void {
+    be32(b, n);
+    let is i64 as at = b.len;
+    cb.bytes_append(b, typ, 4);
+    cb.bytes_append(b, data, n);
+    be32(b, checksum.crc32(cast(*u8, cast(i64, b.ptr) + at), 4 + n));
+}
+fn main() as i64 {
+    // 256 x 256 gray, filter 0 rows: half noise, half gradient.
+    let is cb.Bytes as raw = cb.bytes_new(70000);
+    let is i64 as s with mut = 99;
+    let is i64 as y with mut = 0;
+    while (y < 256) {
+        cb.bytes_push(&raw, 0);
+        let is i64 as x with mut = 0;
+        while (x < 256) {
+            s = s * 6364136223846793005 + 1442695040888963407;
+            if (y % 2 == 0) { cb.bytes_push(&raw, cast(u8, (s >> 33) & 255)); } else { cb.bytes_push(&raw, cast(u8, x)); }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    let is cb.Bytes as z = cb.bytes_new(1024);
+    zlib.zlib_compress(raw.ptr, raw.len, &z, 6);
+    let is cb.Bytes as f = cb.bytes_new(4096);
+    cb.bytes_append(&f, "\x89PNG\r\n\x1a\n", 8);
+    let is [13]u8 as ih;
+    ih[0] = 0; ih[1] = 0; ih[2] = 1; ih[3] = 0; ih[4] = 0; ih[5] = 0; ih[6] = 1; ih[7] = 0;
+    ih[8] = 8; ih[9] = 0; ih[10] = 0; ih[11] = 0; ih[12] = 0;
+    chunk(&f, "IHDR", cast(*u8, &ih), 13);
+    chunk(&f, "IDAT", z.ptr, 1000);
+    chunk(&f, "IEND", z.ptr, 0);
+    let is image.Image as img;
+    let is i64 as r = png.png_decode(f.ptr, f.len, &img);
+    if (r >= 0) { io.printf("png_decode took a cut stream: %d\n", r); return 1; }
+    return 0;
+}

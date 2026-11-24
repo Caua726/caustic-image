@@ -1,0 +1,129 @@
+// test_zsteps — a DEFLATE stream inflated as it arrives (core/zsteps.cst):
+// cut anywhere, it gives a prefix of what the whole gives, and nothing made
+// up; grown a piece at a time, all of it; bounded; bad streams refused.
+use "std/io.cst" as io;
+use "../core/zsteps.cst" as zs;
+use "../core/errno.cst" as errno;
+use "caustic-compact/core/bytes.cst" as cb;
+use "caustic-compact/formats/zlib.cst" as zlib;
+
+let is i64 as _s with mut = 7;
+fn rnd() as i64 {
+    _s = _s * 6364136223846793005 + 1442695040888963407;
+    return (_s >> 33) & 255;
+}
+
+// n bytes: text-like runs and noise, so every block kind turns up.
+fn sample(b as *cb.Bytes, n as i64, noise as i64) as void {
+    *b = cb.bytes_new(n);
+    let is *u8 as words = "the quick brown fox jumps over the lazy dog ";
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is i64 as v with mut = cast(i64, words[i % 44]);
+        if (noise == 1 && (i / 512) % 3 == 0) { v = rnd(); }
+        cb.bytes_push(b, cast(u8, v));
+        i = i + 1;
+    }
+}
+
+fn prefix(a as *u8, b as *u8, n as i64) as i32 {
+    let is i64 as i with mut = 0;
+    while (i < n) { if (a[i] != b[i]) { return 0; } i = i + 1; }
+    return 1;
+}
+
+fn check(data as *cb.Bytes, level as i64) as i64 {
+    let is cb.Bytes as zc = cb.bytes_new(1024);
+    if (zlib.zlib_compress(data.ptr, data.len, &zc, level) < 0) { return 1; }
+    let is *u8 as body = cast(*u8, cast(i64, zc.ptr) + 2);
+    let is i64 as blen = zc.len - 6;
+    // Cut anywhere: a prefix, never more than the whole.
+    let is i64 as step with mut = blen / 97;
+    if (step < 1) { step = 1; }
+    let is i64 as k with mut = 0;
+    while (k <= blen) {
+        // The bytes that came, then junk where the rest would be.
+        let is cb.Bytes as cut = cb.bytes_new(k + 64);
+        cb.bytes_append(&cut, body, k);
+        let is i64 as j with mut = 0;
+        while (j < 64) { cb.bytes_push(&cut, cast(u8, 165)); j = j + 1; }
+        let is zs.ZSteps as z = zs.zsteps(data.len);
+        let is i64 as r = zs.zsteps_run(&z, cut.ptr, k);
+        cb.bytes_free(&cut);
+        if (r < 0) { return 2; }
+        if (z.out.len > data.len || prefix(z.out.ptr, data.ptr, z.out.len) == 0) { return 3; }
+        if (k == blen && (r != 1 || z.out.len != data.len)) { return 4; }
+        zs.zsteps_free(&z);
+        k = k + step;
+    }
+    // Grown a piece at a time: every run a prefix, the last the whole.
+    let is zs.ZSteps as g = zs.zsteps(data.len);
+    k = 0;
+    let is i64 as was with mut = 0;
+    while (k < blen) {
+        k = k + 1 + blen / 50;
+        if (k > blen) { k = blen; }
+        let is i64 as r = zs.zsteps_run(&g, body, k);
+        if (r < 0) { return 5; }
+        if (prefix(g.out.ptr, data.ptr, g.out.len) == 0) { return 6; }
+        if (g.out.len < was) { return 7; }
+        was = g.out.len;
+    }
+    if (g.done != 1 || g.out.len != data.len) { return 8; }
+    if (zs.zsteps_run(&g, body, blen) != 1) { return 9; }
+    zs.zsteps_free(&g);
+    // Less room than the stream makes: refused, never past it.
+    let is zs.ZSteps as small = zs.zsteps(data.len / 2);
+    if (zs.zsteps_run(&small, body, blen) != errno.I_CORRUPT || small.out.len > data.len / 2) { return 10; }
+    zs.zsteps_free(&small);
+    cb.bytes_free(&zc);
+    return 0;
+}
+
+fn run() as i64 {
+    let is cb.Bytes as text;
+    sample(&text, 30000, 0);
+    let is cb.Bytes as mixed;
+    sample(&mixed, 40000, 1);
+    let is i64 as lv with mut = 0;
+    while (lv <= 9) {
+        let is i64 as r1 = check(&text, lv);
+        if (r1 != 0) { return 100 + lv * 20 + r1; }
+        let is i64 as r2 = check(&mixed, lv);
+        if (r2 != 0) { return 300 + lv * 20 + r2; }
+        lv = lv + 3;
+    }
+    // Garbage: refused or waiting for more, never made into more than room.
+    let is [4096]u8 as junk;
+    let is i64 as t with mut = 0;
+    while (t < 200) {
+        let is i64 as i with mut = 0;
+        while (i < 4096) { junk[i] = cast(u8, rnd()); i = i + 1; }
+        let is zs.ZSteps as z = zs.zsteps(100000);
+        zs.zsteps_run(&z, cast(*u8, &junk), 4096);
+        if (z.out.len > 100000) { return 500; }
+        zs.zsteps_free(&z);
+        t = t + 1;
+    }
+    // A stored block that says it is longer than what came: what came.
+    let is [8]u8 as st;
+    st[0] = 1; st[1] = 10; st[2] = 0; st[3] = 245; st[4] = 255;
+    st[5] = 65; st[6] = 66; st[7] = 67;
+    let is zs.ZSteps as sz = zs.zsteps(100);
+    if (zs.zsteps_run(&sz, cast(*u8, &st), 8) != 0 || sz.out.len != 3 || sz.out.ptr[2] != 67) { return 510; }
+    // Its length and complement disagreeing: refused.
+    st[3] = 0;
+    let is zs.ZSteps as bz = zs.zsteps(100);
+    if (zs.zsteps_run(&bz, cast(*u8, &st), 8) != errno.I_CORRUPT) { return 511; }
+    // Block type 3: refused.
+    st[0] = 7;
+    let is zs.ZSteps as tz = zs.zsteps(100);
+    if (zs.zsteps_run(&tz, cast(*u8, &st), 8) != errno.I_CORRUPT) { return 512; }
+    return 0;
+}
+
+fn main() as i64 {
+    let is i64 as r = run();
+    if (r != 0) { io.printf("test_zsteps: failed at %d\n", r); return 1; }
+    return 0;
+}
