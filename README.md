@@ -134,6 +134,28 @@ use "caustic-image/encode.cst" as encode;
 format id. Take a single format directly (`caustic-image/formats/png.cst`) when
 you know what you have and want none of the rest linked in.
 
+### While the bytes arrive
+
+```cst
+use "caustic-image/progressive.cst" as pg;
+
+let is pg.Progressive as p = pg.progressive();
+pg.feed(&p, chunk, n);          // per arrival: NEED, HEADER, ROWS, DONE or <0
+pg.width(&p); pg.rows(&p);      // size from the header; finished top rows
+pg.finish(&p);                  // no more bytes: decode()'s image, or its error
+pg.take(&p, &image);            // the image is yours
+pg.close(&p);                   // any time; also the cancel
+```
+
+Width and height are known from the header (PNG, JPEG, GIF, BMP, QOI). A
+non-interlaced PNG shows its finished rows as its stream inflates
+(caustic-compact's `inflate_stream`, never decoding a byte twice), and when it
+arrived whole `finish` keeps them. Everything else is decoded at `finish`. The
+final image, or the refusal, is always the one `decode()` gives for the same
+bytes. A Progressive owns its state; separate ones on separate threads are
+independent (finishing JPEG/WebP on two threads at once needs the lock
+`decode()` needs).
+
 ## Correctness
 
 A format is not considered done because it round-trips against itself — that only

@@ -3,6 +3,7 @@
 //
 //   use "caustic-image/caustic_image.cst" as img;
 //   img.decode.decode(src, len, &image);   img.image.image_free(&image);
+//   img.progressive: the same, fed as the bytes arrive (progressive.cst)
 //
 // Compile-check the whole tree (needs the workspace root on the module path
 // for the caustic-compact dependency):
@@ -33,4 +34,5 @@ use "ops/ops.cst"      as ops;
 use "csif/errno.cst"     as csif_errno;
 use "csif/container.cst" as csif;
 use "decode.cst"       as decode;
+use "progressive.cst"  as progressive;
 use "encode.cst"       as encode;
