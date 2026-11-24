@@ -4,8 +4,8 @@ use "../formats/png.cst" as png;
 use "caustic-compact/core/bytes.cst" as cb;
 use "caustic-compact/core/checksum.cst" as checksum;
 use "caustic-compact/formats/zlib.cst" as zlib;
-// Regression: before core/zsteps.cst, png_decode on this never returned
-// (caustic-compact's inflate read zero bits past the cut forever).
+// Regression: with caustic-compact before v0.2.0, png_decode on this never
+// returned (its inflate decoded the zero bits past the cut without end).
 // A PNG whose chunks are all whole and their CRCs right, but whose IDAT holds
 // only the first 1000 bytes of the zlib stream: png_decode on it.
 fn be32(b as *cb.Bytes, v as i64) as void {

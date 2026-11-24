@@ -184,7 +184,6 @@ fn main(argc as i64, argv as *u8) as i32 {
     fail = fail + cast(i64, run_case(ccp, "test_rans",          "tests/test_rans.cst"));
     fail = fail + cast(i64, run_case(ccp, "test_dispatch",      "tests/test_dispatch.cst"));
     fail = fail + cast(i64, run_case(ccp, "test_progressive",   "tests/test_progressive.cst"));
-    fail = fail + cast(i64, run_case(ccp, "test_zsteps",        "tests/test_zsteps.cst"));
     fail = fail + cast(i64, run_case(ccp, "repro_png_cut",      "tests/repro_png_cut.cst"));
 
     // ── JPEG family ───────────────────────────────────────────────

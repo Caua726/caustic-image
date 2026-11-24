@@ -22,7 +22,6 @@ use "../core/image.cst"  as image;
 use "../core/pixfmt.cst" as pixfmt;
 use "caustic-compact/entropy/rans.cst"  as rans;
 use "caustic-compact/formats/zlib.cst"  as zlib;
-use "../core/zsteps.cst" as zsteps;
 use "caustic-compact/core/bytes.cst"    as cb;
 
 fn _med(a as i64, b as i64, c as i64) as i64 {
@@ -253,7 +252,7 @@ fn modular_decode(src as *u8, len as i64, w as i64, h as i64, ch as i64, bps as 
     if (cast(i64, rbuf) <= 0) { return errno.I_OOM; }
     if (method == 0) {
         let is cb.Bytes as ob = cb.bytes_new(rn + 64);
-        if (zsteps.zlib_whole(pay, plen, &ob, rn * 2 + 65536) < 0) { cb.bytes_free(&ob); mem.core.munmap(rbuf, rn + 1); return errno.I_CORRUPT; }
+        if (zlib.zlib_decompress(pay, plen, &ob) < 0) { cb.bytes_free(&ob); mem.core.munmap(rbuf, rn + 1); return errno.I_CORRUPT; }
         if (ob.len < rn) { cb.bytes_free(&ob); mem.core.munmap(rbuf, rn + 1); return errno.I_CORRUPT; }
         mem.core.memcpy(rbuf, ob.ptr, rn);
         cb.bytes_free(&ob);

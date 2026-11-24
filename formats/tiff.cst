@@ -17,7 +17,6 @@ use "../core/image.cst"  as image;
 use "../core/pixfmt.cst" as pixfmt;
 use "caustic-compact/core/bytes.cst"   as cb;
 use "caustic-compact/formats/zlib.cst" as zlib;
-use "../core/zsteps.cst" as zsteps;
 use "caustic-compact/formats/lzw.cst"  as lzw;
 
 fn _r16(p as *u8, o as i64, le as i64) as i64 {
@@ -168,7 +167,7 @@ fn tiff_decode(src as *u8, src_len as i64, out as *image.Image) as i64 {
                 let is cb.Bytes as ob = cb.bytes_new(need + 64);
                 let is i64 as zr with mut = 0;
                 if (comp == 5) { zr = lzw.lzw_tiff_decode(cast(*u8, cast(i64, src) + soff), scnt, &ob); }
-                else { zr = zsteps.zlib_whole(cast(*u8, cast(i64, src) + soff), scnt, &ob, need * 2 + 65536); }
+                else { zr = zlib.zlib_decompress(cast(*u8, cast(i64, src) + soff), scnt, &ob); }
                 if (zr < 0) { cb.bytes_free(&ob); return errno.I_CORRUPT; }
                 let is i64 as ncopy with mut = ob.len; if (ncopy > need) { ncopy = need; }
                 let is i64 as k with mut = 0;

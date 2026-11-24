@@ -15,6 +15,7 @@ use "../formats/bmp.cst" as bmp;
 use "../formats/qoi.cst" as qoi;
 use "caustic-compact/core/bytes.cst"    as cb;
 use "caustic-compact/core/checksum.cst" as checksum;
+use "caustic-compact/formats/zlib.cst"   as zlib;
 
 let is i64 as _seed with mut = 12345;
 fn rnd() as i64 {
@@ -54,11 +55,17 @@ fn rows_same(a as *image.Image, b as *image.Image, n as i64) as i32 {
 // src fed chunk bytes at a time: the states in order, each row shown the
 // final one, then finish exactly decode(). 0, or where it went wrong.
 fn through(src as *u8, n as i64, chunk as i64, want_rows as i32) as i64 {
+    return through_k(src, n, chunk, want_rows, 0 - 1);
+}
+
+// want_kept: 1 finish must keep the rows, 0 must decode again, -1 either.
+fn through_k(src as *u8, n as i64, chunk as i64, want_rows as i32, want_kept as i64) as i64 {
     let is image.Image as ref;
     if (dec.decode(src, n, &ref) != 0) { return 1; }
     let is pg.Progressive as p = pg.progressive();
     let is i64 as last with mut = pg.NEED;
     let is i64 as most_rows with mut = 0;
+    let is i64 as mid_rows with mut = 0;   // rows shown with half the bytes
     let is i64 as at with mut = 0;
     while (at < n) {
         let is i64 as k with mut = chunk;
@@ -72,13 +79,15 @@ fn through(src as *u8, n as i64, chunk as i64, want_rows as i32) as i64 {
         if (pg.rows(&p) > 0) {
             if (rows_same(pg.image_of(&p), &ref, pg.rows(&p)) == 0) { return 5; }
             if (pg.rows(&p) > most_rows) { most_rows = pg.rows(&p); }
+            if (at <= n / 2) { mid_rows = pg.rows(&p); }
         }
     }
-    if (want_rows == 1 && (most_rows == 0 || most_rows >= ref.height)) { return 6; }
+    if (want_rows == 1 && (mid_rows == 0 || mid_rows >= ref.height)) { return 6; }
     if (pg.finish(&p) != pg.DONE) { return 7; }
     let is *image.Image as got = pg.image_of(&p);
     if (got.width != ref.width || got.height != ref.height || got.fmt != ref.fmt || pg.rows(&p) != ref.height) { return 8; }
     if (rows_same(got, &ref, ref.height) == 0) { return 9; }
+    if (want_kept >= 0 && cast(i64, pg.kept(&p)) != want_kept) { return 11; }
     // Done: more bytes change nothing.
     if (pg.feed(&p, src, 4) != pg.DONE || pg.finish(&p) != pg.DONE) { return 10; }
     pg.close(&p);
@@ -113,6 +122,20 @@ fn ihdr(buf as *u8, w as i64, h as i64) as void {
     buf[31] = cast(u8, (crc >> 8) & 255);  buf[32] = cast(u8, crc & 255);
 }
 
+fn be32(b as *cb.Bytes, v as i64) as void {
+    cb.bytes_push(b, cast(u8, (v >> 24) & 255)); cb.bytes_push(b, cast(u8, (v >> 16) & 255));
+    cb.bytes_push(b, cast(u8, (v >> 8) & 255)); cb.bytes_push(b, cast(u8, v & 255));
+}
+
+// A PNG chunk, its CRC right.
+fn chunk(b as *cb.Bytes, typ as *u8, data as *u8, n as i64) as void {
+    be32(b, n);
+    let is i64 as at = b.len;
+    cb.bytes_append(b, typ, 4);
+    cb.bytes_append(b, data, n);
+    be32(b, checksum.crc32(cast(*u8, cast(i64, b.ptr) + at), 4 + n));
+}
+
 fn main() as i64 {
     let is i64 as r = run();
     if (r != 0) { io.printf("test_progressive: failed at %d\n", r); return 1; }
@@ -131,11 +154,11 @@ fn run() as i64 {
             make(&img, 37, 23, fmts[fi], kind);
             let is cb.Bytes as b;
             if (encoded(&img, 0, &b) < 0) { return 100 + fi * 10 + kind; }
-            let is i64 as r1 = through(b.ptr, b.len, 1, 0);
+            let is i64 as r1 = through_k(b.ptr, b.len, 1, 0, 1);
             if (r1 != 0) { return 200 + fi * 30 + kind * 10 + r1; }
             let is i64 as r7 = through(b.ptr, b.len, 7, 0);
             if (r7 != 0) { return 300 + fi * 30 + kind * 10 + r7; }
-            let is i64 as rk = through(b.ptr, b.len, 1000, 0);
+            let is i64 as rk = through_k(b.ptr, b.len, 1000, 0, 1);
             if (rk != 0) { return 400 + fi * 30 + kind * 10 + rk; }
             cb.bytes_free(&b);
             image.image_free(&img);
@@ -149,7 +172,7 @@ fn run() as i64 {
     make(&big, 300, 300, pixfmt.FMT_RGB8, 2);
     let is cb.Bytes as bb;
     if (encoded(&big, 0, &bb) < 0) { return 500; }
-    let is i64 as rb = through(bb.ptr, bb.len, 4096, 1);
+    let is i64 as rb = through_k(bb.ptr, bb.len, 4096, 1, 1);
     if (rb != 0) { return 510 + rb; }
     let is pg.Progressive as h = pg.progressive();
     if (pg.feed(&h, bb.ptr, 33) != pg.HEADER || pg.width(&h) != 300 || pg.height(&h) != 300) { return 530; }
@@ -207,6 +230,107 @@ fn run() as i64 {
     if (pg.feed(&hg2, cast(*u8, &huge), 33) != errno.I_DIMS) { return 572; }
     pg.close(&hg2);
 
+    // Bytes after IEND: png_decode stops at IEND, and so does this.
+    let is cb.Bytes as tail = cb.bytes_new(bb.len + 64);
+    cb.bytes_append(&tail, bb.ptr, bb.len);
+    i = 0;
+    // a whole chunk whose CRC is wrong, then noise: not read
+    let is [12]u8 as junkc;
+    junkc[0] = 0; junkc[1] = 0; junkc[2] = 0; junkc[3] = 0;
+    junkc[4] = 106; junkc[5] = 117; junkc[6] = 110; junkc[7] = 107;
+    junkc[8] = 1; junkc[9] = 2; junkc[10] = 3; junkc[11] = 4;
+    cb.bytes_append(&tail, cast(*u8, &junkc), 12);
+    while (i < 64) { cb.bytes_push(&tail, cast(u8, rnd())); i = i + 1; }
+    let is i64 as rt = through_k(tail.ptr, tail.len, 3000, 0, 1);
+    if (rt != 0) { return 580 + rt; }
+    cb.bytes_free(&tail);
+
+    // Chunks png_decode reads otherwise than in order — a second IHDR, a
+    // PLTE after the IDATs — and a damaged Adler-32: no shortcut, finish is
+    // decode()'s, image or refusal.
+    let is image.Image as small;
+    make(&small, 37, 23, pixfmt.FMT_RGB8, 0);
+    let is cb.Bytes as sp;
+    encoded(&small, 0, &sp);
+    // [sig][IHDR 25 bytes][...]: the IHDR again right after itself.
+    let is cb.Bytes as two = cb.bytes_new(sp.len + 25);
+    cb.bytes_append(&two, sp.ptr, 33);
+    cb.bytes_append(&two, cast(*u8, cast(i64, sp.ptr) + 8), 25);
+    cb.bytes_append(&two, cast(*u8, cast(i64, sp.ptr) + 33), sp.len - 33);
+    let is i64 as r2 = through_k(two.ptr, two.len, 7, 0, 0);
+    if (r2 != 0) { return 900 + r2; }
+    cb.bytes_free(&two);
+    // A PLTE (one entry, CRC right) before IEND, after the IDATs.
+    let is cb.Bytes as pl = cb.bytes_new(sp.len + 15);
+    cb.bytes_append(&pl, sp.ptr, sp.len - 12);
+    let is [15]u8 as plc;
+    plc[0] = 0; plc[1] = 0; plc[2] = 0; plc[3] = 3;
+    plc[4] = 80; plc[5] = 76; plc[6] = 84; plc[7] = 69;
+    plc[8] = 1; plc[9] = 2; plc[10] = 3;
+    let is i64 as pcrc = checksum.crc32(cast(*u8, cast(i64, &plc) + 4), 7);
+    plc[11] = cast(u8, (pcrc >> 24) & 255); plc[12] = cast(u8, (pcrc >> 16) & 255);
+    plc[13] = cast(u8, (pcrc >> 8) & 255);  plc[14] = cast(u8, pcrc & 255);
+    cb.bytes_append(&pl, cast(*u8, &plc), 15);
+    cb.bytes_append(&pl, cast(*u8, cast(i64, sp.ptr) + sp.len - 12), 12);
+    let is i64 as r3 = through_k(pl.ptr, pl.len, 7, 0, 0);
+    if (r3 != 0) { return 920 + r3; }
+    cb.bytes_free(&pl);
+    // The Adler-32 (the IDAT's last 4 bytes) wrong, the CRC made right:
+    // decode() refuses it, and so does finish, the rows shown kept.
+    let is cb.Bytes as ad = cb.bytes_new(sp.len);
+    cb.bytes_append(&ad, sp.ptr, sp.len);
+    let is i64 as iend_at = ad.len - 12;       // IEND chunk
+    let is i64 as crc_at = iend_at - 4;         // the IDAT's CRC
+    let is i64 as adl = crc_at - 1;             // last byte of its Adler-32
+    ad.ptr[adl] = cast(u8, cast(i64, ad.ptr[adl]) ^ 1);
+    // the IDAT is the chunk before IEND: its type starts at crc_at - len - 4
+    let is i64 as scan with mut = 8;
+    let is i64 as idat_at with mut = 0;
+    while (scan < iend_at) {
+        let is i64 as cl = (cast(i64, ad.ptr[scan]) << 24) | (cast(i64, ad.ptr[scan + 1]) << 16) | (cast(i64, ad.ptr[scan + 2]) << 8) | cast(i64, ad.ptr[scan + 3]);
+        if (ad.ptr[scan + 4] == 73 && ad.ptr[scan + 5] == 68) { idat_at = scan; }
+        scan = scan + 12 + cl;
+    }
+    let is i64 as icl = (cast(i64, ad.ptr[idat_at]) << 24) | (cast(i64, ad.ptr[idat_at + 1]) << 16) | (cast(i64, ad.ptr[idat_at + 2]) << 8) | cast(i64, ad.ptr[idat_at + 3]);
+    let is i64 as icrc = checksum.crc32(cast(*u8, cast(i64, ad.ptr) + idat_at + 4), 4 + icl);
+    let is i64 as ic = idat_at + 8 + icl;
+    ad.ptr[ic] = cast(u8, (icrc >> 24) & 255); ad.ptr[ic + 1] = cast(u8, (icrc >> 16) & 255);
+    ad.ptr[ic + 2] = cast(u8, (icrc >> 8) & 255); ad.ptr[ic + 3] = cast(u8, icrc & 255);
+    let is image.Image as nope;
+    if (dec.decode(ad.ptr, ad.len, &nope) >= 0) { return 940; }
+    let is pg.Progressive as pa = pg.progressive();
+    if (pg.feed(&pa, ad.ptr, ad.len) != pg.ROWS || pg.rows(&pa) != 23) { return 941; }
+    if (pg.finish(&pa) >= 0) { return 942; }
+    pg.close(&pa);
+    cb.bytes_free(&ad);
+    cb.bytes_free(&sp);
+    image.image_free(&small);
+
+    // A whole, valid stream that holds 10 rows of a 23-row image: decode()
+    // refuses it (too little data), and so does finish.
+    let is cb.Bytes as rawr = cb.bytes_new(2048);
+    i = 0;
+    while (i < 10 * (1 + 37 * 4)) { cb.bytes_push(&rawr, cast(u8, (i * 7) & 255)); i = i + 1; }
+    i = 0;
+    while (i < 10) { rawr.ptr[i * (1 + 37 * 4)] = 0; i = i + 1; }
+    let is cb.Bytes as zz = cb.bytes_new(1024);
+    zlib.zlib_compress(rawr.ptr, rawr.len, &zz, 6);
+    let is cb.Bytes as shortp = cb.bytes_new(4096);
+    let is [33]u8 as hd;
+    ihdr(cast(*u8, &hd), 37, 23);
+    cb.bytes_append(&shortp, cast(*u8, &hd), 33);
+    chunk(&shortp, "IDAT", zz.ptr, zz.len);
+    chunk(&shortp, "IEND", zz.ptr, 0);
+    let is image.Image as nope2;
+    if (dec.decode(shortp.ptr, shortp.len, &nope2) >= 0) { return 950; }
+    let is pg.Progressive as ps = pg.progressive();
+    if (pg.feed(&ps, shortp.ptr, shortp.len) != pg.ROWS || pg.rows(&ps) != 10) { return 951; }
+    if (pg.finish(&ps) >= 0) { return 952; }
+    pg.close(&ps);
+    cb.bytes_free(&shortp);
+    cb.bytes_free(&zz);
+    cb.bytes_free(&rawr);
+
     // Other formats: their size before their pixels, then decode()'s image.
     let is image.Image as rgb;
     make(&rgb, 40, 30, pixfmt.FMT_RGB8, 1);   // two colours: a palette a GIF can hold
@@ -214,7 +338,7 @@ fn run() as i64 {
     while (w <= 4) {
         let is cb.Bytes as e;
         if (encoded(&rgb, w, &e) < 0) { return 600 + w; }
-        let is i64 as r = through(e.ptr, e.len, 7, 0);
+        let is i64 as r = through_k(e.ptr, e.len, 7, 0, 0);
         if (r != 0) { return 610 + w * 20 + r; }
         let is pg.Progressive as o = pg.progressive();
         pg.feed(&o, e.ptr, e.len - 1);

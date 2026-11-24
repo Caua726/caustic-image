@@ -5,6 +5,7 @@
 //   let is Progressive as p = progressive();
 //   feed(&p, chunk, n)   as often as bytes come; returns the state
 //   finish(&p)           no more bytes: the whole image, or why not
+//   take(&p, &img)       after DONE: the image is the caller's
 //   close(&p)            at any point, also to give up (cancel)
 //
 // The state goes NEED -> HEADER -> ROWS -> DONE, or to a negative errno:
@@ -18,22 +19,25 @@
 // A negative state keeps the rows decoded before it — a truncated file
 // still shows what came — and feed and finish change nothing after it.
 //
-// finish() decodes the whole file with decode(), whatever came before: the
-// image it leaves is decode()'s, bit for bit, and a file that turns out
-// corrupt is refused as decode() refuses it. Rows shown before that are
-// those decode() makes of the same bytes (an IDAT stream inflated as far as
-// it goes, its scanlines reconstructed by the same png_unfilter_row and
-// png_emit_row).
+// A PNG's compressed stream is inflated as it comes by caustic-compact's
+// inflate_stream, which goes on from where it stopped: rows cost one inflate
+// of the file in all, and each scanline is reconstructed once, by the same
+// png_unfilter_row and png_emit_row png_decode uses. When the whole file
+// has come that way — IEND, the stream ended inside its IDATs with the
+// Adler-32 png_decode checks, every row made, no chunk after the first IDAT
+// that would change them — finish() keeps that image: it is the one
+// png_decode makes, and nothing is decoded again. Any other file
+// (interlaced, other formats, anything odd) is decoded by decode() at
+// finish(), so the final image, or the refusal, is always decode()'s.
 //
-// A PNG's compressed stream is inflated as it comes, every 16 KB more of it,
-// by core/zsteps.cst: the blocks it has finished are kept, and only the one
-// it was in the middle of is made again. (caustic-compact's inflate takes
-// the whole input at once, and a stream cut inside a Huffman block makes it
-// go on reading zero bits: see zsteps.cst.)
+// Refused while arriving: a PNG chunk whose CRC is wrong, a header whose
+// size no image may have (I_DIMS, before anything is allocated). A stream
+// error stops the rows; finish() then says what decode() says.
 //
 // A Progressive owns everything it uses and shares nothing; two on two
-// threads are independent. (caustic-compact's inflate fills its constant
-// tables the first time it runs, every thread writing the same values.)
+// threads are independent. finish() may call decode(), so where decoders
+// keep module state (caustic-image's JPEG and WebP), finishes on two
+// threads at once need the same lock decode() does.
 // =======================================================
 
 use "std/mem.cst" only bins, core as mem;
@@ -44,18 +48,17 @@ use "core/sniff.cst"  as sniff;
 use "formats/png.cst" as png;
 use "decode.cst"      as dec;
 
-use "caustic-compact/core/bytes.cst"     as cb;
-use "caustic-compact/core/checksum.cst"  as checksum;
-use "core/zsteps.cst" as zs;
+use "caustic-compact/core/bytes.cst"             as cb;
+use "caustic-compact/core/checksum.cst"          as checksum;
+use "caustic-compact/formats/inflate_stream.cst" as istream;
 
 let is i64 as NEED   with imut = 0;
 let is i64 as HEADER with imut = 1;
 let is i64 as ROWS   with imut = 2;
 let is i64 as DONE   with imut = 3;
 
-// More of a PNG's compressed stream before it is inflated again: this many
-// bytes, or a quarter of what was inflated last, whichever is more.
-let is i64 as REINFLATE_MIN with imut = 16384;
+// Bytes more of a PNG's stream that make it worth running the inflater.
+let is i64 as STEP with imut = 8192;
 
 struct Progressive {
     data      as cb.Bytes;     // every byte fed
@@ -63,7 +66,6 @@ struct Progressive {
     format    as i64;          // sniff.SNIFF_*, SNIFF_UNKNOWN until known
     width     as i64;
     height    as i64;
-    fmt       as i64;          // pixfmt.FMT_*: a PNG's from its header, others' when DONE
     img       as image.Image;  // pixels 0 until there are rows or DONE
     rows      as i64;
     // A PNG's walk.
@@ -75,13 +77,16 @@ struct Progressive {
     plte_n    as i64;
     trns_off  as i64;
     trns_n    as i64;
-    idat      as cb.Bytes;     // the compressed stream so far
-    tried     as i64;          // the stream's length when last inflated
-    z         as zs.ZSteps;    // its inflation so far
+    idat      as cb.Bytes;     // the zlib stream so far
+    tried     as i64;          // idat.len + part when last inflated
+    seen_idat as i32;
+    iend      as i32;          // IEND reached: the walk is over
+    odd       as i32;          // png_decode would read it otherwise: no more rows, decode() at finish
     z_on      as i32;
-    _pad_z    as i32;
+    z         as istream.InflateStream;
     line      as cb.Bytes;     // two scanlines: the one being made, the one above
-    closed    as i64;
+    closed    as i32;
+    kept      as i32;          // DONE with the rows made as it came: nothing decoded again
 }
 
 fn progressive() as Progressive {
@@ -93,7 +98,6 @@ fn progressive() as Progressive {
     p.format = sniff.SNIFF_UNKNOWN;
     p.width = 0;
     p.height = 0;
-    p.fmt = pixfmt.FMT_NONE;
     p.img.pixels = cast(*u8, 0);
     p.img.owned = 0;
     p.img.width = 0;
@@ -110,8 +114,12 @@ fn progressive() as Progressive {
     p.trns_off = 0;
     p.trns_n = 0;
     p.tried = 0;
+    p.seen_idat = 0;
+    p.iend = 0;
+    p.odd = 0;
     p.z_on = 0;
     p.closed = 0;
+    p.kept = 0;
     return p;
 }
 
@@ -120,6 +128,9 @@ fn width(p as *Progressive) as i64 { return p.width; }
 fn height(p as *Progressive) as i64 { return p.height; }
 fn rows(p as *Progressive) as i64 { return p.rows; }
 fn image_of(p as *Progressive) as *image.Image { return &p.img; }
+// 1 when finish() kept the rows decoded as the bytes came, 0 when it decoded
+// the file again with decode().
+fn kept(p as *Progressive) as i32 { return p.kept; }
 
 fn _u8(p as *Progressive, i as i64) as i64 { return cast(i64, p.data.ptr[i]); }
 fn _be16(p as *Progressive, i as i64) as i64 { return (_u8(p, i) << 8) | _u8(p, i + 1); }
@@ -133,8 +144,8 @@ fn _fail(p as *Progressive, e as i64) as i64 {
 }
 
 // Width and height known: HEADER, or refused when no image may be that large.
-fn _sized(p as *Progressive, w as i64, h as i64, fmt as i64) as i64 {
-    let is i64 as chk = image.image_check_dims(w, h, fmt);
+fn _sized(p as *Progressive, w as i64, h as i64) as i64 {
+    let is i64 as chk = image.image_check_dims(w, h, pixfmt.FMT_GRAY8);
     if (chk < 0) { return _fail(p, chk); }
     p.width = w;
     p.height = h;
@@ -142,34 +153,35 @@ fn _sized(p as *Progressive, w as i64, h as i64, fmt as i64) as i64 {
     return p.state;
 }
 
-// The header of a format other than PNG, as far as the bytes go.
+// The header of a format other than PNG, as far as the bytes go. What it
+// cannot read it leaves to finish().
 fn _header(p as *Progressive) as i64 {
     let is i64 as n = p.data.len;
     let is i64 as f = p.format;
-    // The largest pixel a decoder may give: a bound, not the format.
-    let is i64 as big = pixfmt.FMT_RGBA16;
-    if (f == sniff.SNIFF_GIF && n >= 10) { return _sized(p, _le16(p, 6), _le16(p, 8), big); }
-    if (f == sniff.SNIFF_QOI && n >= 12) { return _sized(p, _be32(p, 4), _be32(p, 8), big); }
+    if (f == sniff.SNIFF_GIF && n >= 10) { return _sized(p, _le16(p, 6), _le16(p, 8)); }
+    if (f == sniff.SNIFF_QOI && n >= 12) { return _sized(p, _be32(p, 4), _be32(p, 8)); }
     if (f == sniff.SNIFF_BMP && n >= 26) {
         let is i64 as hh with mut = _le32(p, 22);
         if (hh >= 2147483648) { hh = 4294967296 - hh; }   // top-down: a negative height
-        return _sized(p, _le32(p, 18), hh, big);
+        return _sized(p, _le32(p, 18), hh);
     }
     if (f == sniff.SNIFF_JPEG) {
         // Markers from after SOI to the first frame header.
         let is i64 as i with mut = 2;
         while (i + 4 <= n) {
-            if (_u8(p, i) != 255) { return _fail(p, errno.I_CORRUPT); }
+            if (_u8(p, i) != 255) { return p.state; }
             let is i64 as m = _u8(p, i + 1);
             if (m == 255) { i = i + 1; }
             else if (m == 1 || (m >= 208 && m <= 217)) { i = i + 2; }
             else {
                 let is i64 as len = _be16(p, i + 2);
-                if (len < 2) { return _fail(p, errno.I_CORRUPT); }
+                if (len < 2) { return p.state; }
                 let is i32 as sof = cast(i32, m >= 192 && m <= 207 && m != 196 && m != 200 && m != 204);
                 if (sof == 1) {
                     if (i + 9 > n) { return p.state; }
-                    return _sized(p, _be16(p, i + 7), _be16(p, i + 5), big);
+                    let is i64 as jh = _be16(p, i + 5);
+                    if (jh == 0) { return p.state; }   // the height is in a DNL marker: finish() decides
+                    return _sized(p, _be16(p, i + 7), jh);
                 }
                 i = i + 2 + len;
             }
@@ -209,143 +221,174 @@ fn _png_chan(ct as i64) as i64 {
     return 1;
 }
 
-// Every whole chunk not yet looked at: checked, and what it says kept. Rows
-// made when enough of the stream has come.
+fn _is(p as *Progressive, at as i64, a as i64, b as i64, c as i64, d as i64) as i32 {
+    return cast(i32, _u8(p, at) == a && _u8(p, at + 1) == b && _u8(p, at + 2) == c && _u8(p, at + 3) == d);
+}
+
+// Every whole chunk not yet looked at, to IEND: checked, and what it says
+// kept. Rows made when enough of the stream has come.
 fn _png(p as *Progressive) as i64 {
-    while (p.scan + 12 <= p.data.len && p.state >= 0) {
+    while (p.iend == 0 && p.scan + 12 <= p.data.len && p.state >= 0) {
         let is i64 as clen = _be32(p, p.scan);
         if (clen >= 2147483648) { return _fail(p, errno.I_CORRUPT); }
         if (p.scan + 12 + clen > p.data.len) { break; }
         let is i64 as at = p.scan + 8;   // the chunk's data
         let is *u8 as typ = cast(*u8, cast(i64, p.data.ptr) + p.scan + 4);
         if (checksum.crc32(typ, 4 + clen) != _be32(p, at + clen)) { return _fail(p, errno.I_CORRUPT); }
-        let is i64 as t0 = _u8(p, p.scan + 4);
-        let is i64 as t1 = _u8(p, p.scan + 5);
-        let is i64 as t2 = _u8(p, p.scan + 6);
-        let is i64 as t3 = _u8(p, p.scan + 7);
-        if (t0 == 73 && t1 == 72 && t2 == 68 && t3 == 82) {          // IHDR
-            if (clen != 13 || p.width != 0) { return _fail(p, errno.I_CORRUPT); }
-            p.bitdepth = _u8(p, at + 8);
-            p.colortype = _u8(p, at + 9);
-            p.interlace = _u8(p, at + 12);
-            if (_sized(p, _be32(p, at), _be32(p, at + 4), pixfmt.FMT_RGBA16) < 0) { return p.state; }
-        } else if (t0 == 80 && t1 == 76 && t2 == 84 && t3 == 69) {   // PLTE
+        let is i64 as t = p.scan + 4;
+        if (_is(p, t, 73, 72, 68, 82) == 1) {            // IHDR
+            if (clen != 13) { return _fail(p, errno.I_CORRUPT); }
+            if (p.width != 0) {
+                p.odd = 1;                                 // png_decode takes the last
+            } else {
+                p.bitdepth = _u8(p, at + 8);
+                p.colortype = _u8(p, at + 9);
+                p.interlace = _u8(p, at + 12);
+                if (_sized(p, _be32(p, at), _be32(p, at + 4)) < 0) { return p.state; }
+            }
+        } else if (_is(p, t, 80, 76, 84, 69) == 1) {     // PLTE
+            if (p.plte_n > 0 || p.seen_idat == 1) { p.odd = 1; }
             p.plte_off = at;
             p.plte_n = clen / 3;
-        } else if (t0 == 116 && t1 == 82 && t2 == 78 && t3 == 83) {  // tRNS
+        } else if (_is(p, t, 116, 82, 78, 83) == 1) {    // tRNS
+            if (p.trns_n > 0 || p.seen_idat == 1 || clen == 0) { p.odd = 1; }
             p.trns_off = at;
             p.trns_n = clen;
-        } else if (t0 == 73 && t1 == 68 && t2 == 65 && t3 == 84) {   // IDAT
+        } else if (_is(p, t, 73, 68, 65, 84) == 1) {     // IDAT
+            p.seen_idat = 1;
             if (cb.bytes_append(&p.idat, cast(*u8, cast(i64, p.data.ptr) + at), clen) < 0) {
                 return _fail(p, errno.I_OOM);
             }
+        } else if (_is(p, t, 73, 69, 78, 68) == 1) {     // IEND
+            p.iend = 1;
         }
         p.scan = p.scan + 12 + clen;
     }
-    if (p.state < 0 || p.width == 0 || p.interlace != 0) { return p.state; }
+    if (p.state < 0 || p.width == 0 || p.interlace != 0 || p.odd == 1) { return p.state; }
     // An IDAT still arriving: its bytes so far count too — its CRC is
     // checked when the rest comes, and fails the whole if they were wrong.
     let is i64 as part with mut = 0;
-    if (p.scan + 8 <= p.data.len && _u8(p, p.scan + 4) == 73 && _u8(p, p.scan + 5) == 68 &&
-        _u8(p, p.scan + 6) == 65 && _u8(p, p.scan + 7) == 84) {
+    if (p.iend == 0 && p.scan + 8 <= p.data.len && _is(p, p.scan + 4, 73, 68, 65, 84) == 1) {
         part = p.data.len - (p.scan + 8);
         let is i64 as clen = _be32(p, p.scan);
         if (part > clen) { part = clen; }
     }
-    if (p.idat.len + part - p.tried >= REINFLATE_MIN) { _png_rows(p, part); }
+    if (p.idat.len + part - p.tried >= STEP || (p.iend == 1 && p.idat.len > p.tried)) { _png_rows(p, part); }
     return p.state;
 }
 
-// The compressed stream inflated as far as it goes, and the scanlines it
-// completes past rows() made into pixels.
+// The stream so far — the IDATs whole and part bytes of the one arriving —
+// inflated on from where it stopped, and the scanlines it completes past
+// rows() made into pixels.
 fn _png_rows(p as *Progressive, part as i64) as void {
     p.tried = p.idat.len + part;
-    // The stream: the IDATs whole, and part bytes of the one arriving.
-    let is cb.Bytes as z with mut = p.idat;
-    let is i32 as copied with mut = 0;
+    // The bytes the inflater reads: the IDATs, then the arriving one's part.
+    let is cb.Bytes as zin with mut = p.idat;
+    let is i32 as joined with mut = 0;
     if (part > 0) {
-        z = cb.bytes_new(p.idat.len + part);
-        if (cb.bytes_append(&z, p.idat.ptr, p.idat.len) < 0 ||
-            cb.bytes_append(&z, cast(*u8, cast(i64, p.data.ptr) + p.scan + 8), part) < 0) {
-            cb.bytes_free(&z);
+        zin = cb.bytes_new(p.idat.len + part);
+        if (cb.bytes_append(&zin, p.idat.ptr, p.idat.len) < 0 ||
+            cb.bytes_append(&zin, cast(*u8, cast(i64, p.data.ptr) + p.scan + 8), part) < 0) {
+            cb.bytes_free(&zin);
             _fail(p, errno.I_OOM);
             return;
         }
-        copied = 1;
+        joined = 1;
     }
-    _png_inflated(p, &z);
-    if (copied == 1) { cb.bytes_free(&z); }
+    _png_inflated(p, &zin);
+    if (joined == 1) { cb.bytes_free(&zin); }
 }
 
-fn _png_inflated(p as *Progressive, z as *cb.Bytes) as void {
-    if (z.len < 3) { return; }
-    let is i64 as cmf = cast(i64, z.ptr[0]);
-    let is i64 as flg = cast(i64, z.ptr[1]);
+fn _png_inflated(p as *Progressive, zin as *cb.Bytes) as void {
+    if (zin.len < 3) { return; }
+    // The zlib header: what zlib_decompress refuses stops the rows here,
+    // and finish() refuses it.
+    let is i64 as cmf = cast(i64, zin.ptr[0]);
+    let is i64 as flg = cast(i64, zin.ptr[1]);
     if ((cmf & 15) != 8 || ((cmf * 256 + flg) % 31) != 0 || (flg & 32) != 0) {
-        _fail(p, errno.I_CORRUPT);
+        p.odd = 1;
         return;
     }
     let is i64 as trns with mut = 0;
     if (p.trns_n > 0) { trns = 1; }
     let is i64 as fmt = _png_fmt(p.bitdepth, p.colortype, trns);
-    if (fmt == pixfmt.FMT_NONE) { return; }   // finish() says why
-    if (p.colortype == 3 && p.plte_n < 1) { return; }
+    if (fmt == pixfmt.FMT_NONE || (p.colortype == 3 && p.plte_n < 1)) {
+        p.odd = 1;
+        return;
+    }
     let is i64 as bits = _png_chan(p.colortype) * p.bitdepth;
     let is i64 as stride = (p.width * bits + 7) / 8;
     let is i64 as full = 1 + stride;
     let is i64 as bpp with mut = bits / 8;
     if (bpp < 1) { bpp = 1; }
     if (p.z_on == 0) {
-        p.z = zs.zsteps(full * p.height);
+        // Room for the rows, and for a stream that runs on past them (as
+        // png_decode allows), within a bound.
+        p.z = istream.inflate_stream(full * p.height * 2 + 65536);
         p.z_on = 1;
     }
-    let is i64 as zr = zs.zsteps_run(&p.z, cast(*u8, cast(i64, z.ptr) + 2), z.len - 2);
+    let is i64 as zr = istream.inflate_stream_run(&p.z, cast(*u8, cast(i64, zin.ptr) + 2), zin.len - 2);
     if (zr < 0) {
-        _fail(p, zr);
+        p.odd = 1;   // finish() says why
         return;
     }
-    let is cb.Bytes as raw = p.z.out;
-    let is i64 as done with mut = raw.len / full;
+    let is i64 as done with mut = p.z.out.len / full;
     if (done > p.height) { done = p.height; }
-    if (done > p.rows) {
-        if (cast(i64, p.img.pixels) == 0) {
-            let is i64 as rc = image.image_init(&p.img, p.width, p.height, fmt);
-            if (rc < 0) {
-                _fail(p, rc);
-                return;
-            }
-            p.fmt = fmt;
-        }
-        if (cb.bytes_reserve(&p.line, 2 * stride) < 0) {
-            _fail(p, errno.I_OOM);
+    if (done <= p.rows) { return; }
+    if (cast(i64, p.img.pixels) == 0) {
+        let is i64 as rc = image.image_init(&p.img, p.width, p.height, fmt);
+        if (rc < 0) {
+            _fail(p, rc);
             return;
         }
-        let is png.PngRows as pr;
-        pr.bitdepth = p.bitdepth;
-        pr.colortype = p.colortype;
-        pr.bps = 1;
-        if (p.bitdepth == 16) { pr.bps = 2; }
-        pr.bpp = bpp;
-        pr.chan = _png_chan(p.colortype);
-        pr.plte = cast(*u8, cast(i64, p.data.ptr) + p.plte_off);
-        pr.plte_count = p.plte_n;
-        pr.trns = cast(*u8, cast(i64, p.data.ptr) + p.trns_off);
-        pr.trns_len = p.trns_n;
-        let is *u8 as cur = p.line.ptr;
-        let is *u8 as above = cast(*u8, cast(i64, p.line.ptr) + stride);
-        let is i64 as y with mut = p.rows;
-        while (y < done) {
-            mem.core.memcpy(cur, cast(*u8, cast(i64, raw.ptr) + y * full + 1), stride);
-            let is *u8 as prv with mut = cast(*u8, 0);
-            if (y > 0) { prv = above; }
-            png.png_unfilter_row(raw.ptr[y * full], cur, prv, stride, bpp);
-            png.png_emit_row(&pr, cur, p.width, y, 0, 1, &p.img);
-            mem.core.memcpy(above, cur, stride);
-            y = y + 1;
-        }
-        p.rows = done;
-        if (p.state == HEADER) { p.state = ROWS; }
     }
+    if (cb.bytes_reserve(&p.line, 2 * stride) < 0) {
+        _fail(p, errno.I_OOM);
+        return;
+    }
+    let is png.PngRows as pr;
+    pr.bitdepth = p.bitdepth;
+    pr.colortype = p.colortype;
+    pr.bps = 1;
+    if (p.bitdepth == 16) { pr.bps = 2; }
+    pr.bpp = bpp;
+    pr.chan = _png_chan(p.colortype);
+    pr.plte = cast(*u8, cast(i64, p.data.ptr) + p.plte_off);
+    pr.plte_count = p.plte_n;
+    pr.trns = cast(*u8, cast(i64, p.data.ptr) + p.trns_off);
+    pr.trns_len = p.trns_n;
+    let is *u8 as cur = p.line.ptr;
+    let is *u8 as above = cast(*u8, cast(i64, p.line.ptr) + stride);
+    let is *u8 as raw = p.z.out.ptr;
+    let is i64 as y with mut = p.rows;
+    while (y < done) {
+        mem.core.memcpy(cur, cast(*u8, cast(i64, raw) + y * full + 1), stride);
+        let is *u8 as prv with mut = cast(*u8, 0);
+        if (y > 0) { prv = above; }
+        png.png_unfilter_row(raw[y * full], cur, prv, stride, bpp);
+        png.png_emit_row(&pr, cur, p.width, y, 0, 1, &p.img);
+        mem.core.memcpy(above, cur, stride);
+        y = y + 1;
+    }
+    p.rows = done;
+    if (p.state == HEADER) { p.state = ROWS; }
+}
+
+// Whether the rows made as the PNG came are png_decode's whole image: the
+// walk reached IEND, every row is made, and the stream ended inside the
+// IDATs' bytes before their last four, whose Adler-32 matches — what
+// zlib_decompress reads.
+fn _png_whole(p as *Progressive) as i32 {
+    if (p.format != sniff.SNIFF_PNG || p.iend == 0 || p.odd == 1 || p.interlace != 0) { return 0; }
+    if (p.z_on == 0 || p.rows != p.height || p.state != ROWS) { return 0; }
+    if (p.z.where != istream.AT_END) { return 0; }
+    let is i64 as body = p.idat.len - 6;
+    if (body < 0 || p.z.end_bit > body * 8) { return 0; }
+    let is i64 as at = p.idat.len - 4;
+    let is i64 as want = (cast(i64, p.idat.ptr[at]) << 24) | (cast(i64, p.idat.ptr[at + 1]) << 16) |
+                         (cast(i64, p.idat.ptr[at + 2]) << 8) | cast(i64, p.idat.ptr[at + 3]);
+    if (checksum.adler32(p.z.out.ptr, p.z.out.len) != want) { return 0; }
+    return 1;
 }
 
 // n more bytes from src. The state after them.
@@ -362,11 +405,24 @@ fn feed(p as *Progressive, src as *u8, n as i64) as i64 {
     return p.state;
 }
 
-// No more bytes: the whole image decoded, DONE, or the error decode() gives.
+fn _z_done(p as *Progressive) as void {
+    if (p.z_on == 1) { istream.inflate_stream_free(&p.z); }
+    p.z_on = 0;
+    cb.bytes_free(&p.idat);
+    cb.bytes_free(&p.line);
+}
+
+// No more bytes: the whole image, DONE, or the error decode() gives.
 fn finish(p as *Progressive) as i64 {
     if (p.closed == 1) { return errno.I_BADPARAM; }
     if (p.state < 0 || p.state == DONE) { return p.state; }
     if (p.data.len == 0) { return _fail(p, errno.I_EOF); }
+    if (_png_whole(p) == 1) {
+        _z_done(p);
+        p.kept = 1;
+        p.state = DONE;
+        return DONE;
+    }
     let is image.Image as whole;
     let is i64 as rc = dec.decode(p.data.ptr, p.data.len, &whole);
     if (rc < 0) { return _fail(p, rc); }
@@ -374,9 +430,9 @@ fn finish(p as *Progressive) as i64 {
     p.img = whole;
     p.width = whole.width;
     p.height = whole.height;
-    p.fmt = whole.fmt;
     p.rows = whole.height;
     p.state = DONE;
+    _z_done(p);
     return DONE;
 }
 
@@ -394,10 +450,7 @@ fn take(p as *Progressive, out as *image.Image) as i64 {
 fn close(p as *Progressive) as void {
     if (p.closed == 1) { return; }
     cb.bytes_free(&p.data);
-    cb.bytes_free(&p.idat);
-    cb.bytes_free(&p.line);
-    if (p.z_on == 1) { zs.zsteps_free(&p.z); }
-    p.z_on = 0;
+    _z_done(p);
     image.image_free(&p.img);
     p.rows = 0;
     p.closed = 1;
